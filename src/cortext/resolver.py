@@ -6,9 +6,11 @@ from dataclasses import dataclass
 
 from cortext.db import DatabaseManager
 from cortext.session import SessionDelta, SessionLedger
+from cortext.stopwords import is_stop_word
 
 MAX_HOPS_LIMIT = 2
 _HEADER = "## Cortext Memory"
+ESTABLISHED_CONFIDENCE = 0.8  # facts at or above this are presented as established
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +19,8 @@ class Entity:
     name: str
     archetype: str
     summary: str
+    origin: str = "user_explicit"
+    confidence: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +29,8 @@ class Edge:
     source_id: int
     target_id: int
     relation: str
+    origin: str = "user_explicit"
+    confidence: float = 1.0
 
 
 def _is_word_char(char: str) -> bool:
@@ -70,7 +76,14 @@ def _clean(text: object) -> str:
     return " ".join(str(text or "").split())
 
 
-def _format_delta(entities: Iterable[Entity], edges: Iterable[Edge], delta: SessionDelta) -> str:
+def _marker(confidence: float) -> str:
+    """Provisional-fact indicator for the downstream LLM; empty for established facts."""
+    if confidence >= ESTABLISHED_CONFIDENCE:
+        return ""
+    return f" [inferred, confidence: {confidence:.2f}]"
+
+
+def format_context_delta(entities: Iterable[Entity], edges: Iterable[Edge], delta: SessionDelta) -> str:
     entities = list(entities)
     names = {e.id: _clean(e.name) for e in entities}
     new_entities = set(delta.entity_ids)
@@ -82,10 +95,12 @@ def _format_delta(entities: Iterable[Entity], edges: Iterable[Edge], delta: Sess
             continue
         line = f"- {names[entity.id]} ({_clean(entity.archetype)})"
         summary = _clean(entity.summary)
-        entity_lines.append(f"{line}: {summary}" if summary else line)
+        line = f"{line}: {summary}" if summary else line
+        entity_lines.append(line + _marker(entity.confidence))
 
     edge_lines = [
         f"- {names[edge.source_id]} -{_clean(edge.relation)}-> {names[edge.target_id]}"
+        f"{_marker(edge.confidence)}"
         for edge in edges
         if edge.id in new_edges
     ]
@@ -96,6 +111,9 @@ def _format_delta(entities: Iterable[Entity], edges: Iterable[Edge], delta: Sess
     if edge_lines:
         lines += ["Relations:", *edge_lines]
     return "\n".join(lines)
+
+
+_format_delta = format_context_delta
 
 
 class ContextResolver:
@@ -129,16 +147,22 @@ class ContextResolver:
         if not haystack.strip():
             return []
         async with self.db.conn.execute(
-            "SELECT id, name, archetype, summary, metadata FROM entities ORDER BY id"
+            "SELECT id, name, archetype, summary, metadata, origin, confidence FROM entities ORDER BY id"
         ) as cur:
             rows = await cur.fetchall()
 
         hits: list[tuple[int, int, Entity]] = []
         for row in rows:
-            terms = (t.strip().casefold() for t in (row["name"], *_aliases(row["metadata"])))
+            terms = (
+                t.strip().casefold()
+                for t in (row["name"], *_aliases(row["metadata"]))
+                if not (row["archetype"] == "concept" and len(t.split()) == 1 and is_stop_word(t))
+            )
             positions = [p for t in terms if t and (p := _first_match(haystack, t)) >= 0]
             if positions:
-                entity = Entity(row["id"], row["name"], row["archetype"], row["summary"] or "")
+                entity = Entity(
+                    row["id"], row["name"], row["archetype"], row["summary"] or "", row["origin"], row["confidence"]
+                )
                 hits.append((min(positions), entity.id, entity))
         hits.sort(key=lambda hit: hit[:2])
         return [entity for _, _, entity in hits[: self.max_entities]]
@@ -155,7 +179,14 @@ class ContextResolver:
             for row in rows:
                 edges.setdefault(
                     row["edge_id"],
-                    Edge(row["edge_id"], row["source_id"], row["target_id"], row["relation"]),
+                    Edge(
+                        row["edge_id"],
+                        row["source_id"],
+                        row["target_id"],
+                        row["relation"],
+                        row["origin"],
+                        row["confidence"],
+                    ),
                 )
                 for side in ("source", "target"):
                     entity_id = row[f"{side}_id"]
@@ -165,6 +196,8 @@ class ContextResolver:
                             row[f"{side}_name"],
                             row[f"{side}_archetype"],
                             row[f"{side}_summary"] or "",
+                            row[f"{side}_origin"],
+                            row[f"{side}_confidence"],
                         )
         return list(entities.values()), list(edges.values())
 

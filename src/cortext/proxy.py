@@ -1,5 +1,6 @@
 """OpenAI-compatible streaming proxy that injects novel graph context into the system prompt."""
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -10,6 +11,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .config import Config
+from .distill import DistillationEngine
 from .resolver import ContextResolver
 
 DEFAULT_SESSION_ID = "default"
@@ -51,6 +53,34 @@ def _inject_delta(messages: list[Any], delta: str) -> list[Any]:
     return [{"role": "system", "content": delta}, *out]
 
 
+def _completion_text(body: bytes) -> str:
+    """Assistant text from a non-streaming chat completion body ('' if unparseable)."""
+    try:
+        data = json.loads(body)
+        return _text_of(data["choices"][0]["message"]["content"])
+    except (ValueError, KeyError, IndexError, TypeError):
+        return ""
+
+
+def _stream_text(raw: bytes) -> str:
+    """Concatenate delta content from a collected SSE stream."""
+    parts: list[str] = []
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            delta = json.loads(data)["choices"][0]["delta"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            continue
+        if isinstance(delta, str):
+            parts.append(delta)
+    return "".join(parts)
+
+
 def _error(status: int, message: str, kind: str) -> JSONResponse:
     return JSONResponse({"error": {"message": message, "type": kind}}, status_code=status)
 
@@ -59,10 +89,21 @@ def create_app(
     config: Config,
     resolver: ContextResolver,
     client: httpx.AsyncClient | None = None,
+    distill_engine: DistillationEngine | None = None,
 ) -> FastAPI:
     """Build the proxy app. The lifespan connects/closes the resolver's DB and the HTTP client."""
     http = client if client is not None else httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
     chat_url = config.upstream_url.rstrip("/") + "/chat/completions"
+    engine = distill_engine if distill_engine is not None else DistillationEngine(resolver.db)
+    background_tasks: set[asyncio.Task[Any]] = set()
+
+    def schedule_distillation(session_id: str, query: str, response: str) -> None:
+        """Fire-and-forget; process_exchange swallows its own errors."""
+        if not query or not response:
+            return
+        task = asyncio.create_task(engine.process_exchange(session_id, query, response))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -70,10 +111,13 @@ def create_app(
         try:
             yield
         finally:
+            if background_tasks:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
             await http.aclose()
             await resolver.db.close()
 
     app = FastAPI(title="Cortext", lifespan=lifespan)
+    app.state.background_tasks = background_tasks
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -123,16 +167,24 @@ def create_app(
                 await upstream.aclose()
             if upstream.status_code >= 400:
                 resolver.ledger.reset(session_id)
+            else:
+                schedule_distillation(session_id, query, _completion_text(body))
             return Response(body, status_code=upstream.status_code, media_type=content_type)
 
         async def relay() -> AsyncIterator[bytes]:
+            collected: list[bytes] = []
+            completed = False
             try:
                 async for chunk in upstream.aiter_raw():
+                    collected.append(chunk)
                     yield chunk
+                completed = True
             except httpx.HTTPError:
                 resolver.ledger.reset(session_id)
             finally:
                 await upstream.aclose()
+            if completed:
+                schedule_distillation(session_id, query, _stream_text(b"".join(collected)))
 
         return StreamingResponse(
             relay(),
