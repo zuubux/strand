@@ -2,15 +2,15 @@
 
 import inspect
 import json
-import logging
 import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .db import DatabaseManager
+from .logging import get_logger
 from .stopwords import is_valid_entity_name
 
-logger = logging.getLogger(__name__)
+logger = get_logger("distill")
 
 # An extraction is a dict: {"entities": [{"name", "archetype"?, "summary"?}],
 # "edges": [{"source", "target", "relation", "weight"?}], "summary": str}. Entities and
@@ -271,7 +271,9 @@ class DistillationEngine:
         """
         try:
             if not is_substantive_exchange(query, response):
+                logger.info("Skipped non-substantive exchange session=%r", session_id)
                 return None
+            logger.info("Substantive exchange session=%r; extracting", session_id)
             extraction = await self._extract(query, response)
             ids: dict[str, int] = {}
             ranks: dict[str, float] = {}
@@ -285,6 +287,7 @@ class DistillationEngine:
                         ids, name, entity.get("archetype"), entity.get("summary"), origin, confidence, ranks
                     )
 
+            edge_count = 0
             for edge in extraction.get("edges") or []:
                 if not isinstance(edge, dict):
                     continue
@@ -306,9 +309,18 @@ class DistillationEngine:
                     origin=origin,
                     confidence=confidence,
                 )
+                edge_count += 1
 
             narrative = str(extraction.get("summary") or "").strip() or _narrative(query, response)
-            return await self.db.record_episode(session_id, narrative, sorted(set(ids.values())))
+            episode_id = await self.db.record_episode(session_id, narrative, sorted(set(ids.values())))
+            logger.info(
+                "Recorded episode id=%s session=%r entities=%d edges=%d",
+                episode_id,
+                session_id,
+                len(ids),
+                edge_count,
+            )
+            return episode_id
         except Exception as exc:  # background work must never crash the app
             logger.warning("Distillation failed for session %r: %r", session_id, exc)
             return None

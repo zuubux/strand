@@ -7,11 +7,13 @@ import argparse
 import asyncio
 import json
 import sys
+from collections import deque
 from collections.abc import Sequence
 from typing import Any
 
-from .config import Config
+from .config import ENV_VARS, load_config, save_config_value
 from .db import DatabaseManager
+from .logging import default_log_path
 
 
 async def _resolve(db: DatabaseManager, ref: str) -> dict[str, Any] | None:
@@ -167,6 +169,58 @@ async def cmd_prune_stale(db: DatabaseManager, args: argparse.Namespace) -> int:
     return 0
 
 
+def mask_secret(value: str) -> str:
+    """Mask an API key as `sk-...abcd`; short secrets are fully hidden."""
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "****"
+    return f"{value[:3]}...{value[-4:]}"
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    if args.config_command == "set":
+        try:
+            save_config_value(args.key, args.value)
+        except KeyError as exc:
+            print(f"error: {exc.args[0]}", file=sys.stderr)
+            return 1
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        shown = mask_secret(args.value) if args.key == "upstream_api_key" else args.value
+        print(f"set {args.key} = {shown}")
+        return 0
+    config = load_config()
+    values = {key: getattr(config, key) for key in ENV_VARS}
+    if args.config_command == "get":
+        if args.key not in values:
+            print(f"error: unknown config key '{args.key}'; valid keys: {', '.join(values)}", file=sys.stderr)
+            return 1
+        print(values[args.key])
+        return 0
+    values["upstream_api_key"] = mask_secret(values["upstream_api_key"])
+    for key, value in values.items():
+        print(f"{key}: {value}")
+    return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    path = default_log_path()
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            lines = deque(fh, maxlen=args.tail)
+    except FileNotFoundError:
+        print(f"no log file at {path}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"error: cannot read {path}: {exc}", file=sys.stderr)
+        return 1
+    for line in lines:
+        print(line.rstrip("\n"))
+    return 0
+
+
 def _confidence(value: str) -> float:
     number = float(value)
     if not 0.0 <= number <= 1.0:
@@ -205,11 +259,27 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("prune-stale", help="purge low-confidence model-inferred facts")
     p.add_argument("--confidence-below", type=_confidence, default=0.5, metavar="X")
     p.set_defaults(func=cmd_prune_stale)
+
+    config = sub.add_parser("config", help="show or change persistent settings")
+    config_sub = config.add_subparsers(dest="config_command", required=True)
+    config_sub.add_parser("show", help="print the active configuration (API key masked)")
+    p = config_sub.add_parser("get", help="print the raw value of one setting")
+    p.add_argument("key")
+    p = config_sub.add_parser("set", help="persist a setting to config.json")
+    p.add_argument("key")
+    p.add_argument("value")
+    config.set_defaults(func=cmd_config, local=True)
+
+    p = sub.add_parser("logs", help="print the end of the Cortext log file")
+    p.add_argument("--tail", "-n", type=_positive, default=50, metavar="N", help="lines to show (default 50)")
+    p.set_defaults(func=cmd_logs, local=True)
     return parser
 
 
 async def _run(args: argparse.Namespace) -> int:
-    db_path = args.db or Config.from_env().db_path
+    if getattr(args, "local", False):
+        return args.func(args)
+    db_path = args.db or load_config().db_path
     async with DatabaseManager(db_path) as db:
         return await args.func(db, args)
 

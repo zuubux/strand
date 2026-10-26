@@ -12,8 +12,10 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .config import Config
 from .distill import DistillationEngine
+from .logging import get_logger
 from .resolver import ContextResolver
 
+logger = get_logger("proxy")
 DEFAULT_SESSION_ID = "default"
 _UPSTREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 
@@ -81,6 +83,18 @@ def _stream_text(raw: bytes) -> str:
     return "".join(parts)
 
 
+def _delta_counts(delta: str) -> tuple[int, int]:
+    """(entity, edge) line counts in a formatted context delta."""
+    counts = {"Entities:": 0, "Relations:": 0}
+    section = ""
+    for line in delta.splitlines():
+        if line in counts:
+            section = line
+        elif section and line.startswith("- "):
+            counts[section] += 1
+    return counts["Entities:"], counts["Relations:"]
+
+
 def _error(status: int, message: str, kind: str) -> JSONResponse:
     return JSONResponse({"error": {"message": message, "type": kind}}, status_code=status)
 
@@ -137,7 +151,16 @@ def create_app(
             payload.pop("session_id", None) or request.headers.get("x-session-id") or DEFAULT_SESSION_ID
         )
         query = _last_user_query(messages)
+        logger.info("Incoming query session=%r chars=%d: %.80r", session_id, len(query), query)
         delta = await resolver.resolve(query, session_id) if query else ""
+        if delta:
+            logger.info(
+                "Resolved delta session=%r entities=%d edges=%d",
+                session_id,
+                *_delta_counts(delta),
+            )
+        else:
+            logger.info("Resolved delta session=%r entities=0 edges=0", session_id)
         if delta:
             payload["messages"] = _inject_delta(messages, delta)
 
@@ -153,19 +176,25 @@ def create_app(
         try:
             upstream = await http.send(upstream_request, stream=True)
         except httpx.HTTPError as exc:
+            logger.error("Upstream request failed session=%r: %r; session reset", session_id, exc)
             resolver.ledger.reset(session_id)
             return _error(502, f"Upstream request failed: {exc!r}", "upstream_error")
 
         content_type = upstream.headers.get("content-type")
+        if streaming and upstream.status_code < 400:
+            logger.info("Upstream status=%d session=%r (streaming)", upstream.status_code, session_id)
         if upstream.status_code >= 400 or not streaming:
             try:
                 body = await upstream.aread()
             except httpx.HTTPError as exc:
+                logger.error("Upstream read failed session=%r: %r; session reset", session_id, exc)
                 resolver.ledger.reset(session_id)
                 return _error(502, f"Upstream read failed: {exc!r}", "upstream_error")
             finally:
                 await upstream.aclose()
+            logger.info("Upstream status=%d session=%r", upstream.status_code, session_id)
             if upstream.status_code >= 400:
+                logger.warning("Upstream error status=%d; session %r reset", upstream.status_code, session_id)
                 resolver.ledger.reset(session_id)
             else:
                 schedule_distillation(session_id, query, _completion_text(body))
@@ -179,7 +208,8 @@ def create_app(
                     collected.append(chunk)
                     yield chunk
                 completed = True
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
+                logger.error("Upstream stream interrupted session=%r: %r; session reset", session_id, exc)
                 resolver.ledger.reset(session_id)
             finally:
                 await upstream.aclose()

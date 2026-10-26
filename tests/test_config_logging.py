@@ -1,0 +1,121 @@
+import json
+import logging
+
+import pytest
+
+from cortext.cli import main, mask_secret
+from cortext.config import Config, load_config, save_config_value
+from cortext.logging import get_logger, setup_logging, shutdown_logging
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for name in (
+        "CORTEXT_UPSTREAM_URL",
+        "CORTEXT_UPSTREAM_API_KEY",
+        "CORTEXT_HOST",
+        "CORTEXT_PORT",
+        "CORTEXT_DB_PATH",
+        "CORTEXT_LOG_LEVEL",
+        "CORTEXT_LOG_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return tmp_path
+
+
+def test_defaults_when_no_file(home):
+    assert load_config() == Config()
+    assert Config().log_level == "INFO"
+
+
+def test_file_overrides_defaults_and_env_overrides_file(home, monkeypatch):
+    path = home / ".config" / "cortext" / "config.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"upstream_url": "http://file/v1", "port": 9001, "log_level": "debug"}))
+    config = load_config()
+    assert (config.upstream_url, config.port, config.log_level) == ("http://file/v1", 9001, "DEBUG")
+    assert config.host == "127.0.0.1"
+
+    monkeypatch.setenv("CORTEXT_UPSTREAM_URL", "http://env/v1")
+    monkeypatch.setenv("CORTEXT_PORT", "7000")
+    config = load_config()
+    assert (config.upstream_url, config.port, config.log_level) == ("http://env/v1", 7000, "DEBUG")
+
+
+def test_corrupt_file_is_ignored(home):
+    path = home / ".config" / "cortext" / "config.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json")
+    assert load_config() == Config()
+
+
+def test_save_config_value_creates_dirs_and_merges(home):
+    save_config_value("upstream_api_key", "sk-abc")
+    save_config_value("port", "9100")
+    path = home / ".config" / "cortext" / "config.json"
+    assert json.loads(path.read_text()) == {"port": 9100, "upstream_api_key": "sk-abc"}
+    assert path.stat().st_mode & 0o777 == 0o600
+    with pytest.raises(KeyError):
+        save_config_value("bogus", 1)
+
+
+def test_mask_secret():
+    assert mask_secret("sk-1234567890abcd") == "sk-...abcd"
+    assert mask_secret("short") == "****"
+    assert mask_secret("") == ""
+
+
+def test_cli_config_set_get_show(home, capsys):
+    assert main(["config", "set", "upstream_api_key", "sk-1234567890abcd"]) == 0
+    assert "sk-...abcd" in capsys.readouterr().out
+    assert main(["config", "set", "port", "9200"]) == 0
+    capsys.readouterr()
+
+    assert main(["config", "get", "port"]) == 0
+    assert capsys.readouterr().out.strip() == "9200"
+    assert main(["config", "get", "upstream_api_key"]) == 0
+    assert capsys.readouterr().out.strip() == "sk-1234567890abcd"
+
+    assert main(["config", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "upstream_api_key: sk-...abcd" in out
+    assert "1234567890" not in out
+    assert "port: 9200" in out
+
+    assert main(["config", "get", "nope"]) == 1
+    assert main(["config", "set", "nope", "x"]) == 1
+
+
+def test_logs_missing_file(home, capsys):
+    assert main(["logs"]) == 1
+    assert "no log file" in capsys.readouterr().err
+
+
+def test_rotating_logger_writes_and_cli_tails(home, capsys, monkeypatch):
+    log_path = home / "logs" / "cortext.log"
+    monkeypatch.setenv("CORTEXT_LOG_PATH", str(log_path))
+    try:
+        logger = setup_logging("INFO", debug=False)
+        get_logger("proxy").info("hello %d", 1)
+        for i in range(5):
+            get_logger("db").warning("line %d", i)
+        get_logger("db").debug("hidden")
+        for handler in logger.handlers:
+            handler.flush()
+    finally:
+        shutdown_logging()
+
+    text = log_path.read_text()
+    assert "[INFO] [proxy] hello 1" in text
+    assert "[WARNING] [db] line 4" in text
+    assert "hidden" not in text
+    assert text.split(" [")[0].count("-") == 2  # YYYY-MM-DD HH:MM:SS prefix
+    assert not any(getattr(h, "_cortext_managed", False) for h in logging.getLogger("cortext").handlers)
+
+    assert main(["logs", "--tail", "2"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2
+    assert lines[-1].endswith("[db] line 4")
+    assert main(["logs"]) == 0
+    assert len(capsys.readouterr().out.splitlines()) == 6

@@ -12,6 +12,10 @@ from typing import Any
 import aiosqlite
 import sqlite_vec
 
+from .logging import get_logger
+
+logger = get_logger("db")
+
 DEFAULT_DB_PATH = Path("~/.config/cortext/memory.db")
 EMBEDDING_DIM = 384
 
@@ -157,6 +161,7 @@ class DatabaseManager:
             await conn.execute("PRAGMA foreign_keys=ON")
             await conn.execute("PRAGMA busy_timeout=5000")
 
+            logger.info("WAL journal mode enabled for %s", self.db_path)
             await conn.executescript(_SCHEMA)
             await self._migrate(conn)
             await conn.commit()
@@ -164,6 +169,7 @@ class DatabaseManager:
             await conn.close()
             raise
         self._conn = conn
+        logger.info("Database connected: %s", self.db_path)
 
     @staticmethod
     async def _migrate(conn: aiosqlite.Connection) -> None:
@@ -173,12 +179,14 @@ class DatabaseManager:
                 existing = {row[1] for row in await cur.fetchall()}
             for column, ddl in _PROVENANCE_COLUMNS:
                 if column not in existing:
+                    logger.info("Migration: adding %s.%s", table, column)
                     await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     async def close(self) -> None:
         if self._conn is not None:
             conn, self._conn = self._conn, None
             await conn.close()
+            logger.info("Database closed: %s", self.db_path)
 
     async def __aenter__(self) -> "DatabaseManager":
         await self.connect()
