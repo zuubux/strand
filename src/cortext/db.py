@@ -430,6 +430,47 @@ class DatabaseManager:
                 return entity_id
         return None
 
+    async def find_entity(self, name_or_alias: str) -> tuple[int, str] | None:
+        """(id, canonical name) of the entity `name_or_alias` refers to, else None.
+
+        A case-insensitive canonical-name match wins; otherwise a `metadata.aliases` match
+        counts only when it is unambiguous (exactly one entity), so a shared alias never
+        resolves to an arbitrary entity.
+        """
+        folded = (name_or_alias or "").strip().casefold()
+        if not folded:
+            return None
+        async with self.conn.execute("SELECT id, name, metadata FROM entities ORDER BY id") as cur:
+            rows = await cur.fetchall()
+        for entity_id, name, _ in rows:
+            if name.casefold() == folded:
+                return int(entity_id), name
+        matches = [
+            (int(entity_id), name)
+            for entity_id, name, raw in rows
+            if folded in {a.strip().casefold() for a in self._aliases_of(raw)}
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    async def drop_entity(self, entity_id: int) -> bool:
+        """Permanently delete an entity with its edges and embedding (one transaction).
+
+        Returns False when no such entity exists.
+        """
+        async with self._transaction() as conn:
+            await conn.execute(
+                "DELETE FROM edges WHERE source_id = ? OR target_id = ?", (entity_id, entity_id)
+            )
+            if self.vec_enabled:
+                await conn.execute("DELETE FROM entity_embeddings WHERE entity_id = ?", (entity_id,))
+            cur = await conn.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
+            return cur.rowcount > 0
+
+    async def drop_entity_by_name(self, name_or_alias: str) -> bool:
+        """`drop_entity` for the entity a canonical name or alias resolves to."""
+        found = await self.find_entity(name_or_alias)
+        return found is not None and await self.drop_entity(found[0])
+
     async def find_similar_entities(
         self, query_embedding: Sequence[float], limit: int = 5, distance_threshold: float = 1.0
     ) -> list[int]:

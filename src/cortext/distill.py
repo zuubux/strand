@@ -9,6 +9,7 @@ from typing import Any
 from .db import DatabaseManager
 from .logging import get_logger
 from .sanitize import is_secret_token, sanitize_text
+from .session import SessionLedger
 from .stopwords import is_filler_name, is_stop_word, is_valid_entity_name, name_tokens
 
 logger = get_logger("distill")
@@ -52,6 +53,13 @@ _SEVER_RELATIONS = {
     "sold": "owns", "use": "uses", "own": "owns", "drive": "drives", "maintain": "maintains",
     "manage": "manages", "lead": "leads", "using": "uses", "driving": "drives", "maintaining": "maintains",
 }
+
+# Explicit user commands to erase an entity (heuristic fallback only). "don't forget X" is a
+# remember-request and never matches; "delete" needs an explicit entity/note/record qualifier.
+_FORGET_RE = re.compile(
+    rf"(?<![Dd]on't )(?<![Dd]ont )(?<![Dd]o not )(?<![Dd]on’t )\b(?:(?i:forget(?:\s+about)?|erase|scrub)|(?i:delete)(?=\s+(?i:(?:the|my)\s+)?(?i:entity|note|record|memory)\b))"
+    rf"\s+(?i:(?:the|my)\s+)?(?:(?i:entity|note|record|memory)\s+(?i:(?:for|about|on|of)\s+)?)?(?P<name>{_NAME})"
+)
 
 _MIN_QUERY_WORDS = 4
 _TRIVIAL_WORDS = frozenset(
@@ -234,6 +242,16 @@ def _severed_edges(query: str) -> list[dict[str, Any]]:
     return found
 
 
+def _forget_commands(query: str) -> tuple[list[str], str]:
+    """(entity names the user ordered forgotten, query with those commands removed)."""
+    names: list[str] = []
+    for m in _FORGET_RE.finditer(query or ""):
+        name = _clean_name(m.group("name"))
+        if name and name not in names and is_valid_entity_name(name):
+            names.append(name)
+    return names, _FORGET_RE.sub(" ", query or "")
+
+
 def heuristic_extract(query: str, response: str) -> Extraction:
     """Lightweight fallback extractor.
 
@@ -254,7 +272,8 @@ def heuristic_extract(query: str, response: str) -> Extraction:
                     item.setdefault("confidence", MODEL_CONFIDENCE)
             return ground_extraction(data, query)
 
-    user_text, other_text = _split_user_assertions(query)
+    forgotten, scan_query = _forget_commands(query)
+    user_text, other_text = _split_user_assertions(scan_query)
     entities: dict[str, dict[str, Any]] = {}
     edges: list[dict[str, Any]] = []
     # User assertions first so their provenance wins when the assistant repeats a fact.
@@ -263,6 +282,7 @@ def heuristic_extract(query: str, response: str) -> Extraction:
     extraction = {"entities": list(entities.values()), "edges": edges, "summary": _narrative(query, response)}
     extraction = ground_extraction(extraction, query)
     extraction["deprecated_edges"] = _severed_edges(query)
+    extraction["forgotten_entities"] = forgotten
     return extraction
 
 
@@ -340,8 +360,10 @@ class DistillationEngine:
         db: DatabaseManager,
         extractor: Extractor | None = None,
         dedup_distance_threshold: float = DEFAULT_DEDUP_DISTANCE_THRESHOLD,
+        ledger: SessionLedger | None = None,
     ) -> None:
         self.db = db
+        self.ledger = ledger
         self.dedup_distance_threshold = dedup_distance_threshold
         self.extractor: Extractor = extractor or heuristic_extract
 
@@ -489,6 +511,35 @@ class DistillationEngine:
                 names |= {ends[0], ends[1]}
         return names
 
+    async def _forget(self, names: Any) -> tuple[int, set[str]]:
+        """Drop entities the user ordered forgotten.
+
+        Returns (dropped count, casefolded names/aliases to discard from this extraction).
+        Unknown names are a no-op apart from being excluded from this extraction.
+        """
+        blocked: set[str] = set()
+        dropped = 0
+        for raw in names if isinstance(names, list) else []:
+            name = str(raw or "").strip()
+            if not name:
+                continue
+            blocked.add(name.casefold())
+            found = await self.db.find_entity(name)
+            if found is None:
+                logger.info("User-directed forgetting: no entity matches %r; ignored", name)
+                continue
+            entity_id, canonical = found
+            async with self.db.conn.execute("SELECT metadata FROM entities WHERE id = ?", (entity_id,)) as cur:
+                row = await cur.fetchone()
+            blocked.add(canonical.casefold())
+            blocked |= {a.strip().casefold() for a in self.db._aliases_of(row[0] if row else None)}
+            if await self.db.drop_entity(entity_id):
+                dropped += 1
+                if self.ledger is not None:
+                    self.ledger.evict_entity(entity_id)
+                logger.info("User-directed forgetting: dropped entity '%s' (id=%d)", canonical, entity_id)
+        return dropped, blocked
+
     async def process_exchange(self, session_id: str, query: str, response: str) -> int | None:
         """Extract and persist entities, edges and an episode; return the episode id.
 
@@ -502,6 +553,35 @@ class DistillationEngine:
                 return None
             logger.info("Substantive exchange session=%r; extracting", session_id)
             extraction = await self._extract(query, response)
+            forgotten_count, blocked = await self._forget(extraction.get("forgotten_entities"))
+            if blocked:
+                # Nothing referencing a forgotten entity may be re-created in the same turn.
+                extraction = {
+                    **extraction,
+                    "entities": [
+                        e
+                        for e in extraction.get("entities") or []
+                        if not (isinstance(e, dict) and str(e.get("name", "")).strip().casefold() in blocked)
+                    ],
+                    "edges": [
+                        e
+                        for e in extraction.get("edges") or []
+                        if not (
+                            isinstance(e, dict)
+                            and {str(e.get("source", "")).strip().casefold(), str(e.get("target", "")).strip().casefold()}
+                            & blocked
+                        )
+                    ],
+                    "deprecated_edges": [
+                        e
+                        for e in extraction.get("deprecated_edges") or []
+                        if not (
+                            isinstance(e, dict)
+                            and {str(e.get("source", "")).strip().casefold(), str(e.get("target", "")).strip().casefold()}
+                            & blocked
+                        )
+                    ],
+                }
             ids: dict[str, int] = {}
             ranks: dict[str, float] = {}
             candidates = [e for e in extraction.get("entities") or [] if isinstance(e, dict)]
@@ -555,12 +635,13 @@ class DistillationEngine:
             narrative = sanitize_text(str(extraction.get("summary") or "").strip()) or _narrative(query, response)
             episode_id = await self.db.record_episode(session_id, narrative, sorted(set(ids.values())))
             logger.info(
-                "Recorded episode id=%s session=%r entities=%d edges=%d deprecated=%d",
+                "Recorded episode id=%s session=%r entities=%d edges=%d deprecated=%d%s",
                 episode_id,
                 session_id,
                 len(ids),
                 edge_count,
                 deprecated_count,
+                f" forgotten={forgotten_count}" if forgotten_count else "",
             )
             return episode_id
         except Exception as exc:  # background work must never crash the app

@@ -77,6 +77,15 @@ class SessionLedger:
         """Forget a session entirely. Returns True if it existed."""
         return self._sessions.pop(session_id, None) is not None
 
+    def evict_entity(self, entity_id: int) -> int:
+        """Remove `entity_id` from every session's seen set. Returns how many sessions held it."""
+        count = 0
+        for state in self._sessions.values():
+            if entity_id in state.seen_entity_ids:
+                state.seen_entity_ids.discard(entity_id)
+                count += 1
+        return count
+
     def evict_expired(self, now: float | None = None) -> int:
         """Drop sessions idle for at least `ttl_seconds`. Returns how many were evicted."""
         now = self._clock() if now is None else now

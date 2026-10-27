@@ -109,7 +109,11 @@ def create_app(
     """Build the proxy app. The lifespan connects/closes the resolver's DB and the HTTP client."""
     http = client if client is not None else httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
     chat_url = config.upstream_url.rstrip("/") + "/chat/completions"
-    engine = distill_engine if distill_engine is not None else DistillationEngine(resolver.db)
+    engine = (
+        distill_engine
+        if distill_engine is not None
+        else DistillationEngine(resolver.db, ledger=resolver.ledger)
+    )
     background_tasks: set[asyncio.Task[Any]] = set()
 
     def schedule_distillation(session_id: str, query: str, response: str) -> None:

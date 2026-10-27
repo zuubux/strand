@@ -28,7 +28,12 @@ SYSTEM_PROMPT = (
     "Use deprecated_edges only when the user explicitly states an existing relationship has ended, "
     "been replaced, sold, stopped or invalidated (e.g. 'I sold X', 'I switched from A to B', "
     "'I no longer work at Y'); name the same source, target and relation the relationship had. "
-    'If nothing is worth keeping return {"entities": [], "edges": [], "deprecated_edges": []}.'
+    "Optionally add forgotten_entities: [entity_name, ...]. Use it only when the user explicitly "
+    "commands the system to forget, delete, scrub or erase an entity, concept or record "
+    "(e.g. 'Forget my old address', 'Delete the entity for Project Titan', 'Forget X'); list the "
+    "target entity names. Never also list a forgotten entity in entities or as an edge endpoint. "
+    'If nothing is worth keeping return {"entities": [], "edges": [], "deprecated_edges": [], '
+    '"forgotten_entities": []}.'
 )
 
 
@@ -38,7 +43,9 @@ def _text(value: Any) -> str:
 
 def parse_extraction(content: str) -> Extraction:
     """Parse model output into an extraction dict; malformed input yields empty lists."""
-    empty: Extraction = {"entities": [], "edges": [], "deprecated_edges": [], "summary": ""}
+    empty: Extraction = {
+        "entities": [], "edges": [], "deprecated_edges": [], "forgotten_entities": [], "summary": ""
+    }
     text = content.strip()
     if text.startswith("```"):
         text = text.strip("`").removeprefix("json").strip()
@@ -72,7 +79,17 @@ def parse_extraction(content: str) -> Extraction:
     for item in data.get("deprecated_edges") or []:
         if isinstance(item, dict) and all(_text(item.get(k)) for k in ("source", "target", "relation")):
             deprecated.append({k: _text(item.get(k)) for k in ("source", "target", "relation", "reason")})
-    return {"entities": entities, "edges": edges, "deprecated_edges": deprecated, "summary": ""}
+    raw_forgotten = data.get("forgotten_entities")
+    forgotten = list(
+        dict.fromkeys(_text(n) for n in raw_forgotten if _text(n)) if isinstance(raw_forgotten, list) else ()
+    )
+    return {
+        "entities": entities,
+        "edges": edges,
+        "deprecated_edges": deprecated,
+        "forgotten_entities": forgotten,
+        "summary": "",
+    }
 
 
 class LLMExtractor:
@@ -116,4 +133,4 @@ class LLMExtractor:
             return parse_extraction(content if isinstance(content, str) else "")
         except Exception as exc:
             logger.warning("local extractor failed: %s", exc)
-            return {"entities": [], "edges": [], "deprecated_edges": [], "summary": ""}
+            return parse_extraction("")

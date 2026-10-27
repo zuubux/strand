@@ -35,7 +35,10 @@ def build_app(config: Config):
             config.extractor_url or DEFAULT_EXTRACTOR_URL, config.extractor_model
         )
     engine = DistillationEngine(
-        db, extractor=extractor, dedup_distance_threshold=config.dedup_distance_threshold
+        db,
+        extractor=extractor,
+        dedup_distance_threshold=config.dedup_distance_threshold,
+        ledger=resolver.ledger,
     )
     return create_app(config, resolver, distill_engine=engine)
 
