@@ -24,7 +24,7 @@ CONVERSATIONAL_STARTERS = frozenset(
     the a an it its i me my we us our you your he she they them their his her
     note remember consider imagine suppose assume
     got whenever wherever whatever whichever whoever classic understood noted certainly
-    sounds looks seems keep mind
+    sounds looks seems keep mind as not just prep
     """.split()
 )
 

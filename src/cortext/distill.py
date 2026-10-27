@@ -41,13 +41,6 @@ _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 _HEADING_LINE_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t].*)?$", re.MULTILINE)
 _BOLD_LABEL_RE = re.compile(r"\*\*[^*\n]+:\*\*|\*\*[^*\n]+\*\*:")
-_STOPWORDS = frozenset(
-    "a an and are as at be but by can could did do does for from had has have he her his how i if in is it "
-    "its just let me my no not of on or our please she so sure that the their then there they this to us "
-    "was we what when where which who why will with would yes you your hi hello thanks thank ok okay "
-    "here prep give tell make show write help also however".split()
-)
-
 
 _MIN_QUERY_WORDS = 4
 _TRIVIAL_WORDS = frozenset(
@@ -114,7 +107,7 @@ def is_substantive_exchange(query: str, response: str) -> bool:
 
 def _clean_name(raw: str) -> str:
     words = raw.split()
-    while words and (words[0].lower() in _STOPWORDS or is_stop_word(words[0])):
+    while words and is_stop_word(words[0]):
         words.pop(0)
     return " ".join(words)
 
@@ -196,7 +189,7 @@ def _pattern_extract(
 
     for raw in _NAME_RE.findall(text):
         name = _clean_name(raw)
-        if is_valid_entity_name(name) and name.lower() not in _STOPWORDS:
+        if is_valid_entity_name(name):
             add(name)
 
     for m in _IS_RE.finditer(text):
@@ -249,7 +242,7 @@ def heuristic_extract(query: str, response: str) -> Extraction:
 def _significant_tokens(text: str) -> set[str]:
     """Casefolded significant words of `text` (length >= 2, no stop-words or filler)."""
     tokens = (t.rstrip(".-").casefold() for t in re.findall(r"\w[\w\-.#+]*", text or ""))
-    return {t for t in tokens if len(t) >= 2 and t not in _STOPWORDS and not is_filler_name(t)}
+    return {t for t in tokens if len(t) >= 2 and not is_filler_name(t)}
 
 
 def _is_grounded(name: str, query_tokens: set[str]) -> bool:
@@ -292,6 +285,24 @@ def ground_extraction(extraction: Extraction, query: str) -> Extraction:
     ]
     kept_entities = [e for e in kept_entities if trusted(e) or not is_filler_name(str(e.get("name", "")))]
     return {**extraction, "entities": kept_entities, "edges": kept_edges}
+
+
+def _valid_edge(edge: Any) -> tuple[str, str, str] | None:
+    """(source, target, relation) of a persistable edge, else None.
+
+    Valid = dict with non-empty endpoints/relation, no self-loop, valid names, no secrets.
+    Single source of truth for both the edge-requirement check and edge persistence.
+    """
+    if not isinstance(edge, dict):
+        return None
+    source, target, relation = (str(edge.get(k, "")).strip() for k in ("source", "target", "relation"))
+    if not (source and target and relation) or source == target:
+        return None
+    if not (is_valid_entity_name(source) and is_valid_entity_name(target)):
+        return None
+    if is_secret_token(source) or is_secret_token(target):
+        return None
+    return source, target, relation
 
 
 class DistillationEngine:
@@ -428,17 +439,9 @@ class DistillationEngine:
         """Names that are an endpoint of at least one edge `process_exchange` will persist."""
         names: set[str] = set()
         for edge in extraction.get("edges") or []:
-            if not isinstance(edge, dict):
-                continue
-            source = str(edge.get("source", "")).strip()
-            target = str(edge.get("target", "")).strip()
-            relation = str(edge.get("relation", "")).strip()
-            if not (source and target and relation) or source == target:
-                continue
-            if is_secret_token(source) or is_secret_token(target):
-                continue
-            if is_valid_entity_name(source) and is_valid_entity_name(target):
-                names |= {source, target}
+            ends = _valid_edge(edge)
+            if ends:
+                names |= {ends[0], ends[1]}
         return names
 
     async def process_exchange(self, session_id: str, query: str, response: str) -> int | None:
@@ -456,13 +459,13 @@ class DistillationEngine:
             extraction = await self._extract(query, response)
             ids: dict[str, int] = {}
             ranks: dict[str, float] = {}
-            candidates = [e for e in extraction.get("entities") or []]
+            candidates = [e for e in extraction.get("entities") or [] if isinstance(e, dict)]
             # Multi-word names first so single-token mentions ("BMW") consolidate into them.
-            candidates.sort(key=lambda e: len(str(e.get("name", "")).split()) < 2 if isinstance(e, dict) else True)
+            candidates.sort(key=lambda e: len(str(e.get("name", "")).split()) < 2)
             connected = self._connected_names(extraction)
             for entity in candidates:
-                name = str(entity.get("name", "")).strip() if isinstance(entity, dict) else ""
-                archetype = entity.get("archetype") if isinstance(entity, dict) else None
+                name = str(entity.get("name", "")).strip()
+                archetype = entity.get("archetype")
                 if name and not is_secret_token(name) and is_valid_entity_name(name, archetype if archetype in VALID_ARCHETYPES else DEFAULT_ARCHETYPE):
                     origin, confidence = self._provenance(entity)
                     if origin != USER_ORIGIN and name not in connected:
@@ -474,17 +477,10 @@ class DistillationEngine:
 
             edge_count = 0
             for edge in extraction.get("edges") or []:
-                if not isinstance(edge, dict):
+                ends = _valid_edge(edge)
+                if not ends:
                     continue
-                source = str(edge.get("source", "")).strip()
-                target = str(edge.get("target", "")).strip()
-                relation = str(edge.get("relation", "")).strip()
-                if not (source and target and relation) or source == target:
-                    continue
-                if not (is_valid_entity_name(source) and is_valid_entity_name(target)):
-                    continue
-                if is_secret_token(source) or is_secret_token(target):
-                    continue
+                source, target, relation = ends
                 origin, confidence = self._provenance(edge)
                 source_id = await self._upsert(ids, source, origin=origin, confidence=confidence, ranks=ranks)
                 target_id = await self._upsert(ids, target, origin=origin, confidence=confidence, ranks=ranks)
