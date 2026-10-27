@@ -53,7 +53,8 @@ def test_distillation_rejects_stopword_entities(tmp_path):
             return names, edges
 
     names, edges = asyncio.run(scenario())
-    assert names == {"Atlas"}
+    # Atlas is model_inferred and its only edge was rejected (stop-word endpoint), so it is edge-free and dropped.
+    assert names == set()
     assert edges == 0
 
 

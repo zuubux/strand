@@ -23,6 +23,8 @@ CONVERSATIONAL_STARTERS = frozenset(
     although though while since unless until whether for from with without about into
     the a an it its i me my we us our you your he she they them their his her
     note remember consider imagine suppose assume
+    got whenever wherever whatever whichever whoever classic understood noted certainly
+    sounds looks seems keep mind
     """.split()
 )
 
@@ -86,3 +88,51 @@ def is_valid_entity_name(name: str, archetype: str = "concept") -> bool:
     if archetype == "concept" and is_stop_word(word):
         return False
     return True
+
+# Function words that carry no identity when a multi-word name is split into tokens.
+FUNCTION_WORDS = frozenset(
+    {"the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "at", "by", "with", "from", "my", "is"}
+)
+
+
+def name_tokens(name: str, min_length: int = 2) -> list[str]:
+    """Significant tokens of a multi-word `name` (original case, de-duplicated, in order).
+
+    Drops tokens shorter than `min_length`, stop-words and function words. Single-word
+    names yield no tokens: they are already matched by name.
+    """
+    words = name.split()
+    if len(words) < 2:
+        return []
+    tokens: list[str] = []
+    for word in words:
+        token = word.strip(" \t\n.,;:!?\"'()[]{}")
+        if (
+            len(token) >= min_length
+            and not is_stop_word(token)
+            and token.casefold() not in FUNCTION_WORDS
+            and token.casefold() not in {t.casefold() for t in tokens}
+        ):
+            tokens.append(token)
+    return tokens
+
+# Assistant headers, instructional markers and generic nouns that never name a graph entity
+# on their own ("Important Tip", "Capacity", "Weight", "Note", "Feel").
+FILLER_WORDS = frozenset(
+    """
+    important tip tips note notes feel look looks capacity capacities weight weights
+    example examples summary overview reference quick general common popular option options
+    step steps warning caution reminder conclusion recommendation recommendations
+    answer details detail info information feature features benefit benefits tl dr
+    pro pros con cons key takeaway takeaways point points
+    specification specifications spec specs recommended tips instructions instruction
+    guide checklist procedure procedures requirement requirements section torque
+    """.split()
+)
+
+
+def is_filler_name(name: str) -> bool:
+    """True when every word of `name` is a stop-word or assistant filler/header word."""
+    words = [w.strip(" \t\n.,;:!?\"'()[]{}").casefold() for w in name.split()]
+    words = [w for w in words if w]
+    return not words or all(w in FILLER_WORDS or w in STOP_WORDS for w in words)

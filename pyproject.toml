@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cortext"
+version = "0.1.0"
+description = "Headless local cognitive working-memory daemon"
+requires-python = ">=3.11"
+dependencies = [
+    "aiosqlite",
+    "sqlite-vec",
+    "fastapi",
+    "uvicorn",
+    "httpx",
+]
+
+[project.scripts]
+cortext = "cortext.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

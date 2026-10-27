@@ -124,7 +124,7 @@ def test_legacy_database_is_migrated(tmp_path):
 
 def test_heuristic_extract_attributes_user_vs_assistant():
     result = heuristic_extract(
-        "Remember that Marcus manages Atlas. Tell me about Zephyr.",
+        "Remember that Marcus manages Atlas. Tell me about Zephyr and Dana.",
         "Dana leads Orion. Marcus is the CTO.",
     )
     ents = {e["name"]: e for e in result["entities"]}
@@ -141,7 +141,9 @@ def test_process_exchange_persists_provenance_and_protects_user_facts(tmp_path):
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
             engine = DistillationEngine(db)
-            await engine.process_exchange("s", "Remember that Marcus manages Atlas.", "Noted. Dana leads Orion.")
+            await engine.process_exchange(
+                "s", "Remember that Marcus manages Atlas. Ask about Dana.", "Noted. Dana leads Orion."
+            )
             # A later assistant reply repeats/contradicts the user's fact at lower confidence.
             await engine.process_exchange(
                 "s", "What is going on?", "Marcus is a junior intern. Marcus manages Atlas. Dana leads Orion."

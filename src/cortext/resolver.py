@@ -1,14 +1,16 @@
 """Context resolver: maps a prompt onto the entity graph and emits a compact, session-aware delta."""
 
 import json
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 from cortext.db import DatabaseManager
 from cortext.session import SessionDelta, SessionLedger
-from cortext.stopwords import is_stop_word
+from cortext.stopwords import FUNCTION_WORDS, is_stop_word
 
 MAX_HOPS_LIMIT = 2
+MIN_TOKEN_LENGTH = 3  # shortest whole-word token allowed in the token-overlap fallback
 _HEADER = "## Cortext Memory"
 ESTABLISHED_CONFIDENCE = 0.8  # facts at or above this are presented as established
 
@@ -164,8 +166,37 @@ class ContextResolver:
                     row["id"], row["name"], row["archetype"], row["summary"] or "", row["origin"], row["confidence"]
                 )
                 hits.append((min(positions), entity.id, entity))
-        hits.sort(key=lambda hit: hit[:2])
-        return [entity for _, _, entity in hits[: self.max_entities]]
+        exact_ids = {entity.id for _, _, entity in hits}
+        token_hits = [h for h in self._token_hits(haystack, rows) if h[2].id not in exact_ids]
+        # Rank: higher confidence first (user facts beat model-inferred noise), then exact
+        # before token matches, then first mention in the query, then id.
+        ranked = [(0, *h) for h in hits] + [(1, *h) for h in token_hits]
+        ranked.sort(key=lambda r: (-r[3].confidence, r[0], r[1], r[2]))
+        return [entity for *_, entity in ranked[: self.max_entities]]
+
+    @staticmethod
+    def _token_hits(haystack: str, rows: Iterable) -> list[tuple[int, int, Entity]]:
+        """Fallback: whole-word (`\\b`) overlap between query words and name/alias tokens."""
+        hits: list[tuple[int, int, Entity]] = []
+        for row in rows:
+            tokens = {
+                w.casefold()
+                for term in (row["name"], *_aliases(row["metadata"]))
+                for w in term.split()
+            }
+            positions = []
+            for token in tokens:
+                token = token.strip(" \t\n.,;:!?\"'()[]{}")
+                if len(token) < MIN_TOKEN_LENGTH or is_stop_word(token) or token in FUNCTION_WORDS:
+                    continue
+                if (m := re.search(rf"\b{re.escape(token)}\b", haystack)) is not None:
+                    positions.append(m.start())
+            if positions:
+                entity = Entity(
+                    row["id"], row["name"], row["archetype"], row["summary"] or "", row["origin"], row["confidence"]
+                )
+                hits.append((min(positions), entity.id, entity))
+        return hits
 
     async def gather(self, query: str) -> tuple[list[Entity], list[Edge]]:
         """Matched entities plus their `max_hops` neighbourhood, de-duplicated across roots."""
