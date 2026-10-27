@@ -8,11 +8,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from .common import EMBEDDING_DIM
 from .logging import get_logger
 
 logger = get_logger("embed")
 
-EMBEDDING_DIM = 384
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 UNAVAILABLE_MESSAGE = "fastembed unavailable; falling back to lexical-only matching."
 

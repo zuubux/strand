@@ -131,7 +131,7 @@ async def cmd_inspect(db: DatabaseManager, args: argparse.Namespace) -> int:
 async def _delete_entities(db: DatabaseManager, ids: Sequence[int]) -> tuple[int, int]:
     """Delete entities with their edges and embeddings; return (entities, edges) removed."""
     edges = entities = 0
-    async with db._transaction() as conn:
+    async with db.transaction() as conn:
         for entity_id in ids:
             cur = await conn.execute(
                 "DELETE FROM edges WHERE source_id = ? OR target_id = ?", (entity_id, entity_id)
@@ -171,7 +171,7 @@ async def cmd_drop(db: DatabaseManager, args: argparse.Namespace) -> int:
 async def cmd_prune_stale(db: DatabaseManager, args: argparse.Namespace) -> int:
     """Purge low-confidence model_inferred edges, then model_inferred entities left orphaned."""
     threshold = args.confidence_below
-    async with db._transaction() as conn:
+    async with db.transaction() as conn:
         cur = await conn.execute(
             "DELETE FROM edges WHERE origin = 'model_inferred' AND confidence < ?", (threshold,)
         )
@@ -210,7 +210,7 @@ async def cmd_embed_backfill(
         except EmbeddingUnavailable:
             print(f"error: {UNAVAILABLE_MESSAGE} Embedded {done} entit(y/ies) before stopping.", file=sys.stderr)
             return 1
-        async with db._transaction() as conn:
+        async with db.transaction() as conn:
             await conn.execute("DELETE FROM entity_embeddings WHERE entity_id = ?", (row["id"],))
             await conn.execute(
                 "INSERT INTO entity_embeddings (entity_id, embedding) VALUES (?, ?)",

@@ -2,12 +2,14 @@
 
 import asyncio
 import json
+import math
 import re
 from collections.abc import Iterable
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from cortext.common import MIN_EDGE_CONFIDENCE, aliases_of, clean_text
 from cortext.db import DatabaseManager
 from cortext.embed import Embedder, EmbeddingUnavailable
 from cortext.logging import get_logger
@@ -17,7 +19,6 @@ from cortext.stopwords import FUNCTION_WORDS, is_stop_word
 MAX_HOPS_LIMIT = 2
 MIN_TOKEN_LENGTH = 3  # shortest whole-word token allowed in the token-overlap fallback
 _HEADER = "## Cortext Memory"
-MIN_EDGE_CONFIDENCE = 0.2  # edges below this are treated as deprecated and never recalled
 ESTABLISHED_CONFIDENCE = 0.8  # facts at or above this are presented as established
 MIN_EFFECTIVE_PRIORITY = 0.15  # with decay enabled, candidates below this are pruned
 MAX_FREQUENCY_FACTOR = 1.5  # cap on the access-frequency boost
@@ -83,7 +84,7 @@ def effective_priority(
     treated as fresh.
     """
     base = confidence * weight
-    if not decay_enabled:
+    if not decay_enabled or not math.isfinite(half_life_days) or half_life_days <= 0:
         return base
     ref = _parse_time(last_accessed_at) or _parse_time(created_at)
     delta_days = (now - ref).total_seconds() / 86400.0 if ref is not None else 0.0
@@ -134,18 +135,7 @@ def _first_match(haystack: str, term: str) -> int:
 
 def _aliases(raw_metadata: str | None) -> list[str]:
     """Aliases live in entity metadata as {"aliases": [...]}; tolerate anything else."""
-    if not raw_metadata or "aliases" not in raw_metadata:
-        return []
-    try:
-        meta = json.loads(raw_metadata)
-    except ValueError:
-        return []
-    aliases = meta.get("aliases") if isinstance(meta, dict) else None
-    if isinstance(aliases, str):
-        aliases = [aliases]
-    if not isinstance(aliases, list):
-        return []
-    return [a for a in aliases if isinstance(a, str)]
+    return aliases_of(raw_metadata)
 
 
 def is_private(archetype: str | None, raw_metadata: str | None) -> bool:
@@ -171,7 +161,7 @@ def _is_active_edge(row: dict) -> bool:
 
 def _clean(text: object) -> str:
     """Collapse all whitespace so every fact stays on a single line."""
-    return " ".join(str(text or "").split())
+    return clean_text(text)
 
 
 def _marker(confidence: float) -> str:

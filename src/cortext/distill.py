@@ -6,6 +6,7 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from .common import MAX_SUMMARY_LEN, MODEL_CONFIDENCE, aliases_of, load_metadata, strip_think
 from .db import DatabaseManager
 from .logging import get_logger
 from .sanitize import is_secret_token, sanitize_text
@@ -23,13 +24,11 @@ Extractor = Callable[[str, str], Extraction | Awaitable[Extraction]]
 
 DEFAULT_ARCHETYPE = "concept"
 VALID_ARCHETYPES = frozenset({"person", "project", "system", "vehicle", "concept"})
-_MAX_SUMMARY = 300
 
 USER_ORIGIN = "user_explicit"
 MODEL_ORIGIN = "model_inferred"
 USER_CONFIDENCE = 1.0
 DEFAULT_DEDUP_DISTANCE_THRESHOLD = 0.45  # L2 (~cosine 0.90); mirrors config.py
-MODEL_CONFIDENCE = 0.6  # default confidence for facts the assistant (not the user) asserted
 
 _NAME = r"[A-Z][\w\-]*(?:\s+[A-Z][\w\-]*)*"
 _RELATIONS = (
@@ -196,7 +195,7 @@ def _pattern_extract(
         archetype = "vehicle" if _VEHICLE_ATTR_RE.search(attr) else "project" if "project" in attr.lower() else "concept"
         add(name)
         entities[name].setdefault("archetype", archetype)
-        entities[name].setdefault("summary", f"My {attr}: {m.group('value').strip()}"[:_MAX_SUMMARY])
+        entities[name].setdefault("summary", f"My {attr}: {m.group('value').strip()}"[:MAX_SUMMARY_LEN])
         part_name = _clean_name(part.strip()) if part else ""
         if part_name and part_name != name and is_valid_entity_name(part_name):
             add(part_name)
@@ -215,7 +214,7 @@ def _pattern_extract(
         name = _clean_name(m.group(1))
         # Never let a lower-confidence pass retag or re-summarize an already-asserted entity.
         if name in local and entities[name]["confidence"] <= confidence:
-            entities[name]["summary"] = m.group(2).strip()[:_MAX_SUMMARY]
+            entities[name]["summary"] = m.group(2).strip()[:MAX_SUMMARY_LEN]
             entities[name].update(tag)
 
     for m in _EDGE_RE.finditer(text):
@@ -238,7 +237,7 @@ def _severed_edges(query: str) -> list[dict[str, Any]]:
         relation = _SEVER_RELATIONS.get(verb)
         target = _clean_name(m.group("target"))
         if relation and target and is_valid_entity_name(target):
-            found.append({"source": "User", "target": target, "relation": relation, "reason": m.group(0)[:_MAX_SUMMARY]})
+            found.append({"source": "User", "target": target, "relation": relation, "reason": m.group(0)[:MAX_SUMMARY_LEN]})
     return found
 
 
@@ -250,6 +249,36 @@ def _forget_commands(query: str) -> tuple[list[str], str]:
         if name and name not in names and is_valid_entity_name(name):
             names.append(name)
     return names, _FORGET_RE.sub(" ", query or "")
+
+
+_FORGET_VERB_RE = re.compile(
+    r"(?<![Dd]on't )(?<![Dd]ont )(?<![Dd]o not )(?<![Dd]on’t )\b(?:forget|erase|scrub|delete)\b", re.IGNORECASE
+)
+
+
+def _corroborated_forgets(query: str, names: Any) -> list[str]:
+    """Subset of `names` the user's own prompt backs: a forget command plus a mention of the name."""
+    if not isinstance(names, list) or not _FORGET_VERB_RE.search(query or ""):
+        return []
+    folded = (query or "").casefold()
+    return [
+        n
+        for n in names
+        if isinstance(n, str)
+        and n.strip()
+        and re.search(rf"(?<!\w){re.escape(n.strip().casefold())}(?!\w)", folded)
+    ]
+
+
+def _clamp_model_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Copy of an assistant-emitted item forced to model_inferred at <= MODEL_CONFIDENCE."""
+    try:
+        confidence = float(item.get("confidence", MODEL_CONFIDENCE))
+    except (TypeError, ValueError):
+        confidence = MODEL_CONFIDENCE
+    if confidence != confidence:  # NaN
+        confidence = MODEL_CONFIDENCE
+    return {**item, "origin": MODEL_ORIGIN, "confidence": min(MODEL_CONFIDENCE, max(0.0, confidence))}
 
 
 def heuristic_extract(query: str, response: str) -> Extraction:
@@ -266,10 +295,13 @@ def heuristic_extract(query: str, response: str) -> Extraction:
             continue
         if isinstance(data, dict) and ("entities" in data or "edges" in data):
             data.setdefault("summary", _narrative(query, response))
-            for item in (*(data.get("entities") or []), *(data.get("edges") or [])):
-                if isinstance(item, dict):
-                    item.setdefault("origin", MODEL_ORIGIN)
-                    item.setdefault("confidence", MODEL_CONFIDENCE)
+            # Assistant output is untrusted: clamp provenance and never accept its
+            # destructive directives; only the user's own prompt can forget or sever.
+            for key in ("entities", "edges"):
+                items = data.get(key)
+                data[key] = [_clamp_model_item(i) for i in items if isinstance(i, dict)] if isinstance(items, list) else []
+            data["forgotten_entities"] = _forget_commands(query)[0]
+            data["deprecated_edges"] = _severed_edges(query)
             return ground_extraction(data, query)
 
     forgotten, scan_query = _forget_commands(query)
@@ -460,20 +492,12 @@ class DistillationEngine:
         matches: list[int] = []
         for entity_id, entity_name, raw in rows:
             names = {t.casefold() for t in name_tokens(entity_name)}
-            try:
-                meta = json.loads(raw or "{}")
-            except ValueError:
-                meta = {}
-            stored = meta.get("aliases") if isinstance(meta, dict) else None
-            if isinstance(stored, str):
-                stored = [stored]
-            if isinstance(stored, list):
-                names |= {a.strip().casefold() for a in stored if isinstance(a, str)}
+            names |= {a.strip().casefold() for a in aliases_of(raw)}
             if folded in names:
                 matches.append(int(entity_id))
         if len(matches) != 1:
             return None
-        async with self.db._transaction() as conn:
+        async with self.db.transaction() as conn:
             await conn.execute("UPDATE entities SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (matches[0],))
         logger.info("Consolidated candidate %r into existing entity id=%d", name, matches[0])
         return matches[0]
@@ -488,14 +512,8 @@ class DistillationEngine:
             return None
         async with self.db.conn.execute("SELECT metadata FROM entities WHERE name = ?", (name,)) as cur:
             row = await cur.fetchone()
-        try:
-            meta = json.loads(row[0] or "{}") if row else {}
-        except ValueError:
-            meta = {}
-        if not isinstance(meta, dict):
-            meta = {}
-        stored = meta.get("aliases")
-        aliases = [a for a in stored if isinstance(a, str)] if isinstance(stored, list) else []
+        meta = load_metadata(row[0] if row else None)
+        aliases = aliases_of(meta)
         seen = {a.casefold() for a in aliases}
         aliases += [t for t in tokens if t.casefold() not in seen]
         meta["aliases"] = aliases
@@ -532,7 +550,7 @@ class DistillationEngine:
             async with self.db.conn.execute("SELECT metadata FROM entities WHERE id = ?", (entity_id,)) as cur:
                 row = await cur.fetchone()
             blocked.add(canonical.casefold())
-            blocked |= {a.strip().casefold() for a in self.db._aliases_of(row[0] if row else None)}
+            blocked |= {a.strip().casefold() for a in aliases_of(row[0] if row else None)}
             if await self.db.drop_entity(entity_id):
                 dropped += 1
                 if self.ledger is not None:
@@ -547,13 +565,18 @@ class DistillationEngine:
         warnings, never raised).
         """
         try:
-            query, response = sanitize_text(query), sanitize_text(response)
+            query, response = sanitize_text(query), sanitize_text(strip_think(response))
             if not is_substantive_exchange(query, response):
                 logger.info("Skipped non-substantive exchange session=%r", session_id)
                 return None
             logger.info("Substantive exchange session=%r; extracting", session_id)
             extraction = await self._extract(query, response)
-            forgotten_count, blocked = await self._forget(extraction.get("forgotten_entities"))
+            # Forgetting needs the user's own corroborating command in this turn's prompt.
+            requested = extraction.get("forgotten_entities")
+            allowed = _corroborated_forgets(query, requested)
+            if isinstance(requested, list) and len(allowed) != len(requested):
+                logger.warning("Ignored uncorroborated forgotten_entities session=%r", session_id)
+            forgotten_count, blocked = await self._forget(allowed)
             if blocked:
                 # Nothing referencing a forgotten entity may be re-created in the same turn.
                 extraction = {
@@ -626,7 +649,7 @@ class DistillationEngine:
                     continue
                 source, target, relation = ends
                 reason = str(item.get("reason") or "").strip()
-                reason = sanitize_text(reason)[:_MAX_SUMMARY] or "deprecated"
+                reason = sanitize_text(reason)[:MAX_SUMMARY_LEN] or "deprecated"
                 # Canonical mapping: names merged/consolidated this turn, else db alias resolution.
                 if await self.db.deprecate_edge(ids.get(source, source), ids.get(target, target), relation, reason):
                     deprecated_count += 1

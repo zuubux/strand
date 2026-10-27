@@ -181,7 +181,9 @@ def test_upstream_connection_failure_returns_502(tmp_path):
 def test_invalid_requests_return_400(tmp_path):
     async def scenario():
         async with proxy_client(tmp_path / "m.db", ok_json) as (client, seen):
-            bad_json = await client.post("/v1/chat/completions", content=b"{nope")
+            bad_json = await client.post(
+                "/v1/chat/completions", content=b"{nope", headers={"Content-Type": "application/json"}
+            )
             no_messages = await client.post("/v1/chat/completions", json={"model": "m"})
             return bad_json, no_messages, seen
 

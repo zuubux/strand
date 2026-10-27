@@ -117,7 +117,11 @@ class Config:
         file_values = file_values or {}
 
         def pick(key: str, default: Any) -> Any:
-            return env.get(ENV_VARS[key]) or file_values.get(key) or default
+            # Empty env vars count as unset; file values (incl. 0, 0.0, "") are kept.
+            val = env.get(ENV_VARS[key])
+            if val is None or val == "":
+                val = file_values.get(key)
+            return default if val is None else val
 
         return cls(
             upstream_url=str(pick("upstream_url", DEFAULT_UPSTREAM_URL)),
@@ -164,11 +168,14 @@ def _read_file(path: Path, strict: bool = False) -> dict[str, Any]:
 
 
 def load_config(
-    env: Mapping[str, str] | None = None, config_path: Path | None = None
+    env: Mapping[str, str] | None = None, config_path: Path | None = None, strict: bool = False
 ) -> Config:
-    """Load config with precedence env > config.json > defaults. A bad file is ignored."""
+    """Load config with precedence env > config.json > defaults.
+
+    A bad file is ignored unless `strict` (used by the daemon), which raises ValueError.
+    """
     path = config_path if config_path is not None else default_config_path()
-    return Config.from_env(env, _read_file(path))
+    return Config.from_env(env, _read_file(path, strict=strict))
 
 
 def save_config_value(key: str, value: Any, config_path: Path | None = None) -> None:
@@ -186,7 +193,11 @@ def save_config_value(key: str, value: Any, config_path: Path | None = None) -> 
     path = config_path if config_path is not None else default_config_path()
     data = _read_file(path, strict=True)
     data[key] = value
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except PermissionError:
+        pass
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

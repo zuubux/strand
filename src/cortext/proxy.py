@@ -10,15 +10,20 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
+from .common import strip_think
 from .config import Config
 from .distill import DistillationEngine
 from .logging import get_logger
 from .resolver import ContextResolver
+from .session import MAX_SESSION_ID_LEN
 
 logger = get_logger("proxy")
 DEFAULT_SESSION_ID = "default"
 _UPSTREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
+MAX_CONCURRENT_DISTILLATIONS = 4
+_CONTEXT_ROLES = ("system", "developer")
 
 
 def _text_of(content: Any) -> str:
@@ -42,10 +47,10 @@ def _last_user_query(messages: list[Any]) -> str:
 
 
 def _inject_delta(messages: list[Any], delta: str) -> list[Any]:
-    """Prepend `delta` to the first system message, or insert a new one at index 0."""
+    """Prepend `delta` to the first system/developer message, or insert a system message at index 0."""
     out = list(messages)
     for i, message in enumerate(out):
-        if isinstance(message, dict) and message.get("role") == "system":
+        if isinstance(message, dict) and message.get("role") in _CONTEXT_ROLES:
             content = message.get("content")
             if isinstance(content, list):
                 merged: Any = [{"type": "text", "text": delta}, *content]
@@ -68,7 +73,8 @@ def _completion_text(body: bytes) -> str:
 def _stream_text(raw: bytes) -> str:
     """Concatenate delta content from a collected SSE stream."""
     parts: list[str] = []
-    for line in raw.decode("utf-8", errors="replace").splitlines():
+    # Split on "\n" only: str.splitlines() also breaks on U+2028/U+0085 and would truncate events.
+    for line in raw.decode("utf-8", errors="replace").split("\n"):
         line = line.strip()
         if not line.startswith("data:"):
             continue
@@ -76,12 +82,49 @@ def _stream_text(raw: bytes) -> str:
         if not data or data == "[DONE]":
             continue
         try:
-            delta = json.loads(data)["choices"][0]["delta"]["content"]
-        except (ValueError, KeyError, IndexError, TypeError):
+            choices = json.loads(data)["choices"]
+            for choice in choices:
+                if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+                    continue
+                delta = choice["delta"]["content"]
+                if isinstance(delta, str):
+                    parts.append(delta)
+        except (ValueError, KeyError, TypeError):
             continue
-        if isinstance(delta, str):
-            parts.append(delta)
-    return "".join(parts)
+    return strip_think("".join(parts))
+
+
+def _stream_outcome(raw: bytes) -> tuple[bool, bool]:
+    """(finished, errored) for a collected SSE stream.
+
+    `finished` means a `[DONE]` marker or a non-null `finish_reason` was seen; `errored`
+    means some data event carried an `error` object.
+    """
+    finished = errored = False
+    for line in raw.decode("utf-8", errors="replace").split("\n"):
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            finished = True
+            continue
+        if '"error"' not in data:
+            if "finish_reason" not in data:
+                continue
+        try:
+            event = json.loads(data)
+        except ValueError:
+            errored = errored or '"error":' in data
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("error"):
+            errored = True
+        for choice in event.get("choices") or []:
+            if isinstance(choice, dict) and choice.get("finish_reason"):
+                finished = True
+    return finished, errored
 
 
 def _delta_counts(delta: str) -> tuple[int, int]:
@@ -115,12 +158,17 @@ def create_app(
         else DistillationEngine(resolver.db, ledger=resolver.ledger)
     )
     background_tasks: set[asyncio.Task[Any]] = set()
+    distill_slots = asyncio.Semaphore(MAX_CONCURRENT_DISTILLATIONS)
+
+    async def _distill(session_id: str, query: str, response: str) -> None:
+        async with distill_slots:
+            await engine.process_exchange(session_id, query, response)
 
     def schedule_distillation(session_id: str, query: str, response: str) -> None:
         """Fire-and-forget; process_exchange swallows its own errors."""
         if not query or not response:
             return
-        task = asyncio.create_task(engine.process_exchange(session_id, query, response))
+        task = asyncio.create_task(_distill(session_id, query, response))
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
 
@@ -135,7 +183,8 @@ def create_app(
             await http.aclose()
             await resolver.db.close()
 
-    app = FastAPI(title="Cortext", lifespan=lifespan)
+    # No auto-generated docs/schema routes on the daemon.
+    app = FastAPI(title="Cortext", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
     if config.api_key:
         expected = f"Bearer {config.api_key}".encode()
@@ -156,6 +205,9 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
+        media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if media_type != "application/json":
+            return _error(415, "Content-Type must be application/json", "invalid_request_error")
         try:
             payload = await request.json()
         except ValueError:
@@ -167,10 +219,18 @@ def create_app(
         session_id = str(
             payload.pop("session_id", None) or request.headers.get("x-session-id") or DEFAULT_SESSION_ID
         )
+        if len(session_id) > MAX_SESSION_ID_LEN:
+            return _error(400, f"session_id must be at most {MAX_SESSION_ID_LEN} characters", "invalid_request_error")
         query = _last_user_query(messages)
         allow_private = request.headers.get("x-cortext-allow-private", "").strip().lower() == "true"
         logger.info("Incoming query session=%r chars=%d: %.80r", session_id, len(query), query)
-        delta = await resolver.resolve(query, session_id, allow_private) if query else ""
+        try:
+            delta = await resolver.resolve(query, session_id, allow_private) if query else ""
+        except Exception:
+            # Fail open: memory problems must never block the user's request.
+            logger.error("Context resolution failed session=%r; forwarding without context", session_id, exc_info=True)
+            resolver.ledger.reset(session_id)
+            delta = ""
         if delta:
             logger.info(
                 "Resolved delta session=%r entities=%d edges=%d",
@@ -190,6 +250,9 @@ def create_app(
             headers["Authorization"] = request.headers["authorization"]
 
         streaming = bool(payload.get("stream"))
+        if streaming:
+            # Compressed SSE cannot be line-parsed for distillation; ask for plaintext.
+            headers["Accept-Encoding"] = "identity"
         upstream_request = http.build_request("POST", chat_url, content=json.dumps(payload), headers=headers)
         try:
             upstream = await http.send(upstream_request, stream=True)
@@ -222,23 +285,42 @@ def create_app(
             collected: list[bytes] = []
             completed = False
             try:
-                async for chunk in upstream.aiter_raw():
+                async for chunk in upstream.aiter_bytes():
                     collected.append(chunk)
                     yield chunk
                 completed = True
+            except (GeneratorExit, asyncio.CancelledError):
+                logger.warning("Client disconnected mid-stream session=%r; session reset", session_id)
+                resolver.ledger.reset(session_id)
+                await asyncio.shield(upstream.aclose())
+                raise
             except httpx.HTTPError as exc:
                 logger.error("Upstream stream interrupted session=%r: %r; session reset", session_id, exc)
                 resolver.ledger.reset(session_id)
+                error = {"error": {"message": f"Upstream stream interrupted: {exc!r}", "type": "upstream_error"}}
+                yield f"data: {json.dumps(error)}\n\n".encode()
             finally:
-                await upstream.aclose()
-            if completed:
-                schedule_distillation(session_id, query, _stream_text(b"".join(collected)))
+                await asyncio.shield(upstream.aclose())
+            if not completed:
+                return
+            raw = b"".join(collected)
+            finished, errored = _stream_outcome(raw)
+            if errored or not finished:
+                logger.warning(
+                    "Stream %s session=%r; not distilling, session reset",
+                    "carried an error event" if errored else "ended without finish_reason/[DONE]",
+                    session_id,
+                )
+                resolver.ledger.reset(session_id)
+                return
+            schedule_distillation(session_id, query, _stream_text(raw))
 
         return StreamingResponse(
             relay(),
             status_code=upstream.status_code,
             media_type=content_type or "text/event-stream",
             headers={"Cache-Control": "no-cache"},
+            background=BackgroundTask(upstream.aclose),
         )
 
     return app

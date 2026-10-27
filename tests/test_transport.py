@@ -69,7 +69,12 @@ def test_plain_config_has_no_socket():
 def test_prepare_socket_creates_private_dir_and_unlinks_stale(tmp_path):
     sock = tmp_path / "run" / "cortext" / "cortext.sock"
     sock.parent.mkdir(parents=True, mode=0o755)
-    sock.write_text("stale")
+    import socket
+
+    dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dead.bind(str(sock))
+    dead.close()  # leaves a stale socket file with no listener
+    assert sock.exists()
     daemon.prepare_socket(str(sock))
     assert not sock.exists()
     assert stat.S_IMODE(sock.parent.stat().st_mode) == 0o700

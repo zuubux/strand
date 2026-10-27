@@ -5,12 +5,12 @@ heuristic. If the SLM is unreachable or returns unusable output the session is
 skipped (episodes stay uncompacted) and a warning is logged; nothing is raised.
 """
 
-import json
 import re
 from typing import Any
 
 import httpx
 
+from .common import MAX_SUMMARY_LEN, MODEL_CONFIDENCE, extract_json, load_metadata
 from .db import DatabaseManager
 from .extractors import DEFAULT_EXTRACTOR_URL
 from .logging import get_logger
@@ -20,11 +20,10 @@ logger = get_logger("compactor")
 
 DEFAULT_THRESHOLD_HOURS = 24.0
 COMPACTION_ORIGIN = "model_inferred"
-SLM_CONFIDENCE = 0.6
+SLM_CONFIDENCE = MODEL_CONFIDENCE
 HEURISTIC_CONFIDENCE = 0.5
 _TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 _MAX_INPUT_CHARS = 12000
-_MAX_SUMMARY = 300
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 
 SYSTEM_PROMPT = (
@@ -43,20 +42,8 @@ def _text(value: Any) -> str:
 
 def parse_compaction(content: str) -> dict[str, Any] | None:
     """Parse SLM output; returns None when no JSON object can be recovered."""
-    text = content.strip()
-    if text.startswith("```"):
-        text = text.strip("`").removeprefix("json").strip()
-    try:
-        data = json.loads(text)
-    except ValueError:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            return None
-        try:
-            data = json.loads(text[start : end + 1])
-        except ValueError:
-            return None
-    if not isinstance(data, dict):
+    data = extract_json(content)
+    if data is None:
         return None
     summaries = []
     for item in data.get("entity_summaries") or []:
@@ -89,9 +76,15 @@ class SessionCompactor:
             return []
         marks = ",".join("?" * len(ids))
         async with self.db.conn.execute(
-            f"SELECT id, name, summary FROM entities WHERE id IN ({marks}) ORDER BY id", sorted(ids)
+            f"SELECT id, name, summary, archetype, metadata FROM entities WHERE id IN ({marks}) ORDER BY id",
+            sorted(ids),
         ) as cur:
-            return [dict(row) for row in await cur.fetchall()]
+            rows = await cur.fetchall()
+        return [
+            {"id": r["id"], "name": r["name"], "summary": r["summary"]}
+            for r in rows
+            if r["archetype"] != "private" and load_metadata(r["metadata"]).get("private") is not True
+        ]
 
     async def _ask_slm(self, narratives: list[str], entities: list[dict[str, Any]]) -> dict[str, Any] | None:
         known = "\n".join(f"- {e['name']}: {e['summary'] or '(no summary)'}" for e in entities)
@@ -139,7 +132,7 @@ class SessionCompactor:
                     if sentence and pattern.search(sentence) and sentence not in sentences:
                         sentences.append(sentence)
             if sentences:
-                summaries.append({"name": entity["name"], "summary": " ".join(sentences)[:_MAX_SUMMARY]})
+                summaries.append({"name": entity["name"], "summary": " ".join(sentences)[:MAX_SUMMARY_LEN]})
         return {"entity_summaries": summaries, "session_summary": ""}
 
     async def compact_session(self, session_id: str) -> dict[str, Any]:
@@ -169,7 +162,7 @@ class SessionCompactor:
                 return result
             updated = 0
             for item in parsed["entity_summaries"]:
-                summary = sanitize_text(item["summary"])[:_MAX_SUMMARY]
+                summary = sanitize_text(item["summary"])[:MAX_SUMMARY_LEN]
                 if await self.db.update_entity_summary(item["name"], summary, COMPACTION_ORIGIN, confidence):
                     updated += 1
             await self.db.mark_episodes_compacted([e["id"] for e in episodes])

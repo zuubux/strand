@@ -5,6 +5,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 DEFAULT_TTL_SECONDS = 3600.0
+DEFAULT_MAX_SESSIONS = 1000
+MAX_SESSION_ID_LEN = 128
 
 
 @dataclass(slots=True)
@@ -43,9 +45,13 @@ class SessionLedger:
         self,
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        max_sessions: int = DEFAULT_MAX_SESSIONS,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError(f"ttl_seconds must be positive, got {ttl_seconds}")
+        if max_sessions < 1:
+            raise ValueError(f"max_sessions must be at least 1, got {max_sessions}")
+        self.max_sessions = max_sessions
         self.ttl_seconds = ttl_seconds
         self._clock = clock
         self._sessions: dict[str, SessionState] = {}
@@ -60,11 +66,17 @@ class SessionLedger:
         self, session_id: str, entity_ids: Iterable[int], edge_ids: Iterable[int]
     ) -> SessionDelta:
         """Return only the candidates this session has not seen, and mark them as seen."""
+        if len(session_id) > MAX_SESSION_ID_LEN:
+            raise ValueError(f"session_id longer than {MAX_SESSION_ID_LEN} characters")
         now = self._clock()
         self.evict_expired(now)
-        state = self._sessions.get(session_id)
+        state = self._sessions.pop(session_id, None)
         if state is None:
-            state = self._sessions[session_id] = SessionState()
+            state = SessionState()
+            while len(self._sessions) >= self.max_sessions:
+                # Dicts keep insertion order; re-inserting on use makes the first key the LRU one.
+                del self._sessions[next(iter(self._sessions))]
+        self._sessions[session_id] = state
         state.last_active = now
 
         new_entities = _novel(entity_ids, state.seen_entity_ids)

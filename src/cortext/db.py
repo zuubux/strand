@@ -13,75 +13,16 @@ from typing import Any
 import aiosqlite
 import sqlite_vec
 
+from .common import EMBEDDING_DIM, MIN_EDGE_CONFIDENCE, aliases_of, load_metadata
 from .embed import Embedder, EmbeddingUnavailable
 from .logging import get_logger
+from .schema import run_migrations
 
 logger = get_logger("db")
 
 DEFAULT_DB_PATH = Path("~/.config/cortext/memory.db")
-EMBEDDING_DIM = 384
-
-_SCHEMA = f"""
-CREATE TABLE IF NOT EXISTS entities (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL,
-    archetype TEXT NOT NULL,
-    summary TEXT DEFAULT '',
-    metadata JSON DEFAULT '{{}}',
-    origin TEXT NOT NULL DEFAULT 'user_explicit',
-    confidence REAL NOT NULL DEFAULT 1.0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    access_count INTEGER NOT NULL DEFAULT 0,
-    last_accessed_at DATETIME
-);
-
-CREATE TABLE IF NOT EXISTS edges (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_id INTEGER NOT NULL REFERENCES entities(id),
-    target_id INTEGER NOT NULL REFERENCES entities(id),
-    relation TEXT NOT NULL,
-    weight REAL NOT NULL DEFAULT 1.0,
-    metadata JSON DEFAULT '{{}}',
-    origin TEXT NOT NULL DEFAULT 'user_explicit',
-    confidence REAL NOT NULL DEFAULT 1.0,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    access_count INTEGER NOT NULL DEFAULT 0,
-    last_accessed_at DATETIME,
-    UNIQUE(source_id, target_id, relation)
-);
-CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
-
-CREATE TABLE IF NOT EXISTS episodes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp REAL NOT NULL,
-    session_id TEXT NOT NULL,
-    narrative TEXT NOT NULL,
-    extracted_entities JSON DEFAULT '[]',
-    compacted_at DATETIME
-);
-"""
-
-_VEC_SCHEMA = f"""
-CREATE VIRTUAL TABLE IF NOT EXISTS entity_embeddings USING vec0(
-    entity_id INTEGER PRIMARY KEY,
-    embedding float[{EMBEDDING_DIM}]
-);
-"""
 
 VEC_UNAVAILABLE_MESSAGE = "sqlite-vec extension failed to load; vector indexing disabled."
-
-# Columns added after the first release; applied to pre-existing databases on connect.
-_PROVENANCE_COLUMNS = (
-    ("origin", "TEXT NOT NULL DEFAULT 'user_explicit'"),
-    ("confidence", "REAL NOT NULL DEFAULT 1.0"),
-)
-
-# Access-tracking columns (temporal decay / frequency reinforcement), migrated onto older DBs.
-_ACCESS_COLUMNS = (
-    ("access_count", "INTEGER NOT NULL DEFAULT 0"),
-    ("last_accessed_at", "DATETIME"),
-)
 
 # Provenance precedence: a higher-confidence assertion wins; at equal confidence a
 # user_explicit assertion is never displaced by a non-user origin. Evaluated against
@@ -109,9 +50,9 @@ def _check_confidence(confidence: float) -> float:
 
 
 # An edge is active unless deprecated: weight > 0, confidence >= 0.2, no metadata.deprecated flag.
-MIN_ACTIVE_CONFIDENCE = 0.2
+MIN_ACTIVE_CONFIDENCE = MIN_EDGE_CONFIDENCE
 _ACTIVE = (
-    "{t}.weight > 0.0 AND {t}.confidence >= 0.2 "
+    "{t}.weight > 0.0 AND {t}.confidence >= " + str(MIN_EDGE_CONFIDENCE) + " "
     "AND COALESCE(json_extract({t}.metadata, '$.deprecated'), 0) != 1"
 )
 
@@ -126,7 +67,11 @@ WITH RECURSIVE walk(node_id, hop) AS (
            w.hop + 1
     FROM walk AS w
     JOIN edges AS e ON e.source_id = w.node_id OR e.target_id = w.node_id
+    JOIN entities AS en ON en.id = CASE WHEN e.source_id = w.node_id THEN e.target_id ELSE e.source_id END
     WHERE w.hop < :max_hops AND (:active_only = 0 OR (ACTIVE_E))
+      AND en.archetype != 'private'
+      AND (NOT json_valid(en.metadata)
+           OR COALESCE(json_extract(en.metadata, '$.private'), 0) NOT IN (1, 'true'))
 ),
 reach(node_id, hop) AS (
     SELECT node_id, MIN(hop) FROM walk GROUP BY node_id
@@ -228,10 +173,7 @@ class DatabaseManager:
             await conn.execute("PRAGMA busy_timeout=5000")
 
             logger.info("WAL journal mode enabled for %s", self.db_path)
-            await conn.executescript(_SCHEMA)
-            if vec_enabled:
-                await conn.executescript(_VEC_SCHEMA)
-            await self._migrate(conn)
+            await run_migrations(conn, vec_enabled)
             await conn.commit()
             self._secure_files()
         except BaseException:
@@ -258,29 +200,6 @@ class DatabaseManager:
             except (sqlite3.Error, AttributeError):
                 pass
 
-    @staticmethod
-    async def _migrate(conn: aiosqlite.Connection) -> None:
-        """Add provenance columns to databases created before they existed."""
-        for table in ("entities", "edges"):
-            async with conn.execute(f"PRAGMA table_info({table})") as cur:
-                existing = {row[1] for row in await cur.fetchall()}
-            for column, ddl in _PROVENANCE_COLUMNS:
-                if column not in existing:
-                    logger.info("Migration: adding %s.%s", table, column)
-                    await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-            for column, ddl in _ACCESS_COLUMNS:
-                if column not in existing:
-                    logger.info("Migration: adding %s.%s", table, column)
-                    await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-        async with conn.execute("PRAGMA table_info(episodes)") as cur:
-            if "compacted_at" not in {row[1] for row in await cur.fetchall()}:
-                logger.info("Migration: adding episodes.compacted_at")
-                await conn.execute("ALTER TABLE episodes ADD COLUMN compacted_at DATETIME")
-        async with conn.execute("PRAGMA table_info(edges)") as cur:
-            if "updated_at" not in {row[1] for row in await cur.fetchall()}:
-                logger.info("Migration: adding edges.updated_at")
-                await conn.execute("ALTER TABLE edges ADD COLUMN updated_at DATETIME")
-
     async def close(self) -> None:
         if self._conn is not None:
             conn, self._conn = self._conn, None
@@ -295,7 +214,7 @@ class DatabaseManager:
         await self.close()
 
     @asynccontextmanager
-    async def _transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+    async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
         """Serialize writers on the shared connection; commit on success, roll back on error."""
         conn = self.conn
         async with self._write_lock:
@@ -344,7 +263,7 @@ class DatabaseManager:
         wins = _WINS.format(table="entities")
         meta_json = json.dumps(metadata) if metadata is not None else None
 
-        async with self._transaction() as conn:
+        async with self.transaction() as conn:
             async with conn.execute(
                 """
                 INSERT INTO entities (name, archetype, summary, metadata, origin, confidence)
@@ -375,19 +294,6 @@ class DatabaseManager:
                 )
         return entity_id
 
-    @staticmethod
-    def _aliases_of(raw: Any) -> list[str]:
-        """String aliases from stored metadata (JSON text or dict); tolerates bad data."""
-        if isinstance(raw, (str, bytes)) or raw is None:
-            try:
-                raw = json.loads(raw or "{}")
-            except ValueError:
-                return []
-        stored = raw.get("aliases") if isinstance(raw, dict) else None
-        if isinstance(stored, str):
-            stored = [stored]
-        return [a for a in stored if isinstance(a, str)] if isinstance(stored, list) else []
-
     async def find_duplicate_entity(
         self,
         name: str,
@@ -411,7 +317,7 @@ class DatabaseManager:
         if any(row[1] == name for row in rows):
             return None
         for entity_id, entity_name, raw in rows:
-            aliases = {a.strip().casefold() for a in self._aliases_of(raw)}
+            aliases = {a.strip().casefold() for a in aliases_of(raw)}
             if entity_name.casefold() == folded or folded in aliases:
                 return int(entity_id)
         if not self.vec_enabled or self.embedder is None:
@@ -448,7 +354,7 @@ class DatabaseManager:
         matches = [
             (int(entity_id), name)
             for entity_id, name, raw in rows
-            if folded in {a.strip().casefold() for a in self._aliases_of(raw)}
+            if folded in {a.strip().casefold() for a in aliases_of(raw)}
         ]
         return matches[0] if len(matches) == 1 else None
 
@@ -457,7 +363,7 @@ class DatabaseManager:
 
         Returns False when no such entity exists.
         """
-        async with self._transaction() as conn:
+        async with self.transaction() as conn:
             await conn.execute(
                 "DELETE FROM edges WHERE source_id = ? OR target_id = ?", (entity_id, entity_id)
             )
@@ -508,7 +414,7 @@ class DatabaseManager:
         """
         confidence = _check_confidence(confidence)
         alias = alias.strip()
-        async with self._transaction() as conn:
+        async with self.transaction() as conn:
             async with conn.execute(
                 "SELECT name, summary, metadata, origin, confidence FROM entities WHERE id = ?",
                 (entity_id,),
@@ -517,13 +423,8 @@ class DatabaseManager:
             if row is None:
                 raise KeyError(f"entity {entity_id} does not exist")
             name, old_summary, raw, old_origin, old_conf = row
-            try:
-                meta = json.loads(raw or "{}")
-            except ValueError:
-                meta = {}
-            if not isinstance(meta, dict):
-                meta = {}
-            aliases = self._aliases_of(meta)
+            meta = load_metadata(raw)
+            aliases = aliases_of(meta)
             seen = {a.casefold() for a in aliases} | {name.casefold()}
             if alias and alias.casefold() not in seen:
                 aliases.append(alias)
@@ -550,7 +451,7 @@ class DatabaseManager:
         if fill and self.vec_enabled and self.embedder is not None:
             embedding = await self._auto_embed(name, new_summary)
             if embedding is not None:
-                async with self._transaction() as conn:
+                async with self.transaction() as conn:
                     await conn.execute("DELETE FROM entity_embeddings WHERE entity_id = ?", (entity_id,))
                     await conn.execute(
                         "INSERT INTO entity_embeddings (entity_id, embedding) VALUES (?, ?)",
@@ -601,7 +502,7 @@ class DatabaseManager:
         confidence = _check_confidence(confidence)
         wins = _WINS.format(table="edges")
 
-        async with self._transaction() as conn:
+        async with self.transaction() as conn:
             async with conn.execute(
                 """
                 INSERT INTO edges (source_id, target_id, relation, weight, metadata, origin, confidence)
@@ -639,7 +540,7 @@ class DatabaseManager:
             if entity_name == name:
                 return int(entity_id)
         for entity_id, entity_name, raw in rows:
-            aliases = {a.strip().casefold() for a in self._aliases_of(raw)}
+            aliases = {a.strip().casefold() for a in aliases_of(raw)}
             if entity_name.casefold() == folded or folded in aliases:
                 return int(entity_id)
         return None
@@ -664,7 +565,7 @@ class DatabaseManager:
         if source_id is None or target_id is None:
             return False
         wanted = _norm_relation(relation)
-        async with self._transaction() as conn:
+        async with self.transaction() as conn:
             async with conn.execute(
                 "SELECT id, relation, metadata FROM edges WHERE source_id = ? AND target_id = ?",
                 (source_id, target_id),
@@ -673,12 +574,7 @@ class DatabaseManager:
             for edge_id, stored_relation, raw in rows:
                 if _norm_relation(stored_relation) != wanted:
                     continue
-                try:
-                    meta = json.loads(raw or "{}")
-                except ValueError:
-                    meta = {}
-                if not isinstance(meta, dict):
-                    meta = {}
+                meta = load_metadata(raw)
                 if meta.get("deprecated") is True:
                     continue
                 meta["deprecated"] = True
@@ -713,7 +609,7 @@ class DatabaseManager:
         results = []
         for row in rows:
             item = dict(row)
-            item["metadata"] = json.loads(item["metadata"] or "{}")
+            item["metadata"] = load_metadata(item["metadata"])
             results.append(item)
         return results
 
@@ -727,7 +623,7 @@ class DatabaseManager:
         edge_rows = [(int(i),) for i in dict.fromkeys(edge_ids)]
         if not entity_rows and not edge_rows:
             return
-        async with self._transaction() as conn:
+        async with self.transaction() as conn:
             for table, rows in (("entities", entity_rows), ("edges", edge_rows)):
                 if rows:
                     await conn.executemany(
@@ -740,7 +636,7 @@ class DatabaseManager:
         self, session_id: str, narrative: str, entity_ids: Sequence[int] | None = None
     ) -> int:
         """Append an episode (timestamped now) and return its id."""
-        async with self._transaction() as conn:
+        async with self.transaction() as conn:
             async with conn.execute(
                 """
                 INSERT INTO episodes (timestamp, session_id, narrative, extracted_entities)
@@ -787,7 +683,7 @@ class DatabaseManager:
         rows = [(int(i),) for i in dict.fromkeys(episode_ids)]
         if not rows:
             return
-        async with self._transaction() as conn:
+        async with self.transaction() as conn:
             await conn.executemany(
                 "UPDATE episodes SET compacted_at = CURRENT_TIMESTAMP WHERE id = ?", rows
             )
@@ -802,7 +698,7 @@ class DatabaseManager:
         Returns False when no entity matches (case-insensitive) or the assertion loses.
         """
         confidence = _check_confidence(confidence)
-        async with self._transaction() as conn:
+        async with self.transaction() as conn:
             cur = await conn.execute(
                 "UPDATE entities SET summary = :summary, updated_at = CURRENT_TIMESTAMP "
                 "WHERE name = :name COLLATE NOCASE AND (:conf > confidence OR (:conf = confidence "

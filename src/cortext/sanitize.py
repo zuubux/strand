@@ -10,7 +10,8 @@ _PATTERNS = tuple(
     re.compile(p)
     for p in (
         r"-----BEGIN[ A-Z0-9_-]*PRIVATE KEY-----[\s\S]*?-----END[ A-Z0-9_-]*PRIVATE KEY-----",
-        r"[a-zA-Z0-9+]+:\/\/[^:\s]+:[^@\s]+@[^\s]+",
+        # Lookbehind + bounded quantifiers: no polynomial backtracking on long alphanumerics.
+        r"(?<![a-zA-Z0-9+])[a-zA-Z][a-zA-Z0-9+]{0,31}:\/\/[^:\s]{1,256}:[^@\s]{1,256}@[^\s]+",
         r"eyJ[a-zA-Z0-9_\-]+\.eyJ[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+",
         r"Bearer\s+[a-zA-Z0-9_\-\.]{20,}",
         r"github_pat_[a-zA-Z0-9_\-]{50,}",
@@ -18,9 +19,17 @@ _PATTERNS = tuple(
         r"sk-[a-zA-Z0-9_\-]{20,}",
         r"AIza[0-9A-Za-z\-_]{35}",
         r"AKIA[0-9A-Z]{16}",
+        r"ASIA[0-9A-Z]{16}",
+        r"sk_live_[0-9a-zA-Z]+",
+        r"xox[bap]-[0-9a-zA-Z-]+",
+        r"gh[sou]_[a-zA-Z0-9]{20,}",
+        r"hf_[0-9a-zA-Z]+",
+        # Unclosed PEM block (no END marker): redact through end-of-string.
+        r"-----BEGIN[ A-Z0-9_-]*PRIVATE KEY-----[\s\S]*",
     )
 )
 
+_MAX_SANITIZE_LEN = 200_000  # input beyond this is dropped, never left unsanitized
 _MIN_ENTROPY_LEN = 24
 _ENTROPY_THRESHOLD = 3.5
 
@@ -29,6 +38,7 @@ def sanitize_text(text: str) -> str:
     """Mask credentials in `text` with [REDACTED_SECRET]."""
     if not text:
         return text
+    text = text[:_MAX_SANITIZE_LEN]
     for pattern in _PATTERNS:
         text = pattern.sub(REDACTED, text)
     return text

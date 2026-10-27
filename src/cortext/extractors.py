@@ -5,11 +5,11 @@ and never raises: any transport, status or JSON problem yields an empty extracti
 so distillation falls back to storing just the episode.
 """
 
-import json
 from typing import Any
 
 import httpx
 
+from .common import extract_json, strip_think
 from .distill import Extraction
 from .logging import get_logger
 
@@ -42,24 +42,16 @@ def _text(value: Any) -> str:
 
 
 def parse_extraction(content: str) -> Extraction:
-    """Parse model output into an extraction dict; malformed input yields empty lists."""
+    """Parse model output into an extraction dict; malformed input yields empty lists.
+
+    Only whitelisted fields are copied, so any model-emitted `origin`/`confidence` is dropped
+    and the engine applies the model defaults (model_inferred at MODEL_CONFIDENCE).
+    """
     empty: Extraction = {
         "entities": [], "edges": [], "deprecated_edges": [], "forgotten_entities": [], "summary": ""
     }
-    text = content.strip()
-    if text.startswith("```"):
-        text = text.strip("`").removeprefix("json").strip()
-    try:
-        data = json.loads(text)
-    except ValueError:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
-            return empty
-        try:
-            data = json.loads(text[start : end + 1])
-        except ValueError:
-            return empty
-    if not isinstance(data, dict):
+    data = extract_json(content)
+    if data is None:
         return empty
     entities = []
     for item in data.get("entities") or []:
@@ -108,6 +100,7 @@ class LLMExtractor:
         self._client = client
 
     async def __call__(self, query: str, response: str) -> Extraction:
+        response = strip_think(response)
         payload = {
             "model": self.model_name,
             "temperature": 0,
