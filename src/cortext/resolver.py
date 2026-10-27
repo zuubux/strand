@@ -1,11 +1,13 @@
 """Context resolver: maps a prompt onto the entity graph and emits a compact, session-aware delta."""
 
+import asyncio
 import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 from cortext.db import DatabaseManager
+from cortext.embed import Embedder
 from cortext.session import SessionDelta, SessionLedger
 from cortext.stopwords import FUNCTION_WORDS, is_stop_word
 
@@ -142,6 +144,8 @@ class ContextResolver:
         max_hops: int = MAX_HOPS_LIMIT,
         edge_limit: int = 10,
         max_entities: int = 5,
+        embedder: Embedder | None = None,
+        distance_threshold: float = 1.0,
     ) -> None:
         if not 1 <= max_hops <= MAX_HOPS_LIMIT:
             raise ValueError(f"max_hops must be between 1 and {MAX_HOPS_LIMIT}, got {max_hops}")
@@ -152,6 +156,8 @@ class ContextResolver:
         self.max_hops = max_hops
         self.edge_limit = edge_limit
         self.max_entities = max_entities
+        self.embedder = embedder
+        self.distance_threshold = distance_threshold
 
     async def match_entities(self, query: str, allow_private: bool = True) -> list[Entity]:
         """Entities whose name or metadata alias appears in `query` (case-insensitive, whole word).
@@ -187,7 +193,31 @@ class ContextResolver:
         # before token matches, then first mention in the query, then id.
         ranked = [(0, *h) for h in hits] + [(1, *h) for h in token_hits]
         ranked.sort(key=lambda r: (-r[3].confidence, r[0], r[1], r[2]))
-        return [entity for *_, entity in ranked[: self.max_entities]]
+        matched = [entity for *_, entity in ranked[: self.max_entities]]
+        if self.embedder is not None and len(matched) < self.max_entities:
+            matched += await self._semantic_hits(query, rows, {e.id for e in matched})
+        return matched[: self.max_entities]
+
+    async def _semantic_hits(self, query: str, rows: Iterable, taken: set[int]) -> list[Entity]:
+        """Tier 3: vector KNN over entity embeddings, nearest first, excluding `taken`.
+
+        `rows` is already privacy-filtered, so private entities never surface here
+        unless the caller allowed them.
+        """
+        vector = await asyncio.to_thread(self.embedder.embed, query)
+        ids = await self.db.find_similar_entities(
+            vector, limit=self.max_entities * 4 + len(taken), distance_threshold=self.distance_threshold
+        )
+        by_id = {r["id"]: r for r in rows}
+        hits: list[Entity] = []
+        for entity_id in ids:
+            row = by_id.get(entity_id)
+            if row is None or entity_id in taken:
+                continue
+            hits.append(
+                Entity(row["id"], row["name"], row["archetype"], row["summary"] or "", row["origin"], row["confidence"])
+            )
+        return hits[: self.max_entities - len(taken)]
 
     @staticmethod
     def _token_hits(haystack: str, rows: Iterable) -> list[tuple[int, int, Entity]]:

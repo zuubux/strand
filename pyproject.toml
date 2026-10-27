@@ -13,6 +13,7 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "httpx",
+    "fastembed",
 ]
 
 [project.scripts]

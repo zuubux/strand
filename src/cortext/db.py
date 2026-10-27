@@ -12,6 +12,7 @@ from typing import Any
 import aiosqlite
 import sqlite_vec
 
+from .embed import Embedder
 from .logging import get_logger
 
 logger = get_logger("db")
@@ -72,6 +73,12 @@ _WINS = (
     "(excluded.confidence > {table}.confidence OR (excluded.confidence = {table}.confidence "
     "AND ({table}.origin != 'user_explicit' OR excluded.origin = 'user_explicit')))"
 )
+
+
+def embedding_text(name: str, summary: str | None) -> str:
+    """Text embedded for an entity: `name: summary`, or just `name` without a summary."""
+    summary = (summary or "").strip()
+    return f"{name}: {summary}" if summary else name
 
 
 def _check_confidence(confidence: float) -> float:
@@ -139,8 +146,11 @@ def _chmod_quiet(path: Path, mode: int) -> None:
 class DatabaseManager:
     """Owns the async SQLite connection and all graph read/write operations."""
 
-    def __init__(self, db_path: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self, db_path: str | os.PathLike[str] | None = None, embedder: Embedder | None = None
+    ) -> None:
         self.db_path = Path(db_path if db_path is not None else DEFAULT_DB_PATH).expanduser()
+        self.embedder = embedder
         self._conn: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
 
@@ -225,6 +235,14 @@ class DatabaseManager:
                 await conn.rollback()
                 raise
 
+    async def _auto_embed(self, name: str, summary: str) -> list[float] | None:
+        """Embed `name: summary` with the configured embedder; failures never block the write."""
+        try:
+            return await asyncio.to_thread(self.embedder.embed, embedding_text(name, summary))
+        except Exception:
+            logger.warning("embedding generation failed for %r", name, exc_info=True)
+            return None
+
     async def upsert_entity(
         self,
         name: str,
@@ -246,6 +264,8 @@ class DatabaseManager:
         if embedding is not None and len(embedding) != EMBEDDING_DIM:
             raise ValueError(f"embedding must have {EMBEDDING_DIM} dimensions, got {len(embedding)}")
         confidence = _check_confidence(confidence)
+        if embedding is None and self.embedder is not None:
+            embedding = await self._auto_embed(name, summary)
         wins = _WINS.format(table="entities")
         meta_json = json.dumps(metadata) if metadata is not None else None
 
@@ -279,6 +299,25 @@ class DatabaseManager:
                     (entity_id, sqlite_vec.serialize_float32(list(embedding))),
                 )
         return entity_id
+
+    async def find_similar_entities(
+        self, query_embedding: Sequence[float], limit: int = 5, distance_threshold: float = 1.0
+    ) -> list[int]:
+        """Entity ids nearest to `query_embedding` (sqlite-vec KNN, L2 distance), nearest first.
+
+        Only neighbours with `distance <= distance_threshold` are returned.
+        """
+        if limit < 1:
+            return []
+        if len(query_embedding) != EMBEDDING_DIM:
+            raise ValueError(f"embedding must have {EMBEDDING_DIM} dimensions, got {len(query_embedding)}")
+        async with self.conn.execute(
+            "SELECT entity_id, distance FROM entity_embeddings "
+            "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+            (sqlite_vec.serialize_float32(list(query_embedding)), limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [int(r[0]) for r in rows if r[1] <= distance_threshold]
 
     async def upsert_edge(
         self,

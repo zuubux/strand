@@ -1,9 +1,16 @@
 """Daemon entrypoint: wires the DB, session ledger, resolver and proxy, then serves."""
 
+import asyncio
+import os
+from pathlib import Path
+
 import uvicorn
 
 from .config import Config, load_config
 from .db import DatabaseManager
+from .distill import DistillationEngine
+from .embed import EmbeddingManager
+from .extractors import DEFAULT_EXTRACTOR_URL, LLMExtractor
 from .logging import get_logger, setup_logging
 from .proxy import create_app
 from .resolver import ContextResolver
@@ -11,9 +18,44 @@ from .session import SessionLedger
 
 
 def build_app(config: Config):
-    db = DatabaseManager(config.db_path)
-    resolver = ContextResolver(db, SessionLedger())
-    return create_app(config, resolver)
+    embedder = EmbeddingManager()  # lazy: the model loads on first embed, not at startup
+    db = DatabaseManager(config.db_path, embedder=embedder)
+    resolver = ContextResolver(
+        db, SessionLedger(), embedder=embedder, distance_threshold=config.distance_threshold
+    )
+    extractor = None
+    if config.extractor_model:
+        extractor = LLMExtractor(
+            config.extractor_url or DEFAULT_EXTRACTOR_URL, config.extractor_model
+        )
+    return create_app(config, resolver, distill_engine=DistillationEngine(db, extractor=extractor))
+
+
+def prepare_socket(socket_path: str) -> None:
+    """Create the 0700 parent dir and remove any stale socket file."""
+    path = Path(socket_path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    path.unlink(missing_ok=True)
+
+
+async def _secure_socket(server: uvicorn.Server, socket_path: str) -> None:
+    """Wait for the socket to be bound, then restrict it to 0600."""
+    while not server.started:
+        if server.should_exit:
+            return
+        await asyncio.sleep(0.01)
+    os.chmod(socket_path, 0o600)
+
+
+async def _serve_uds(app, socket_path: str) -> None:
+    server = uvicorn.Server(uvicorn.Config(app, uds=socket_path))
+    chmod_task = asyncio.create_task(_secure_socket(server, socket_path))
+    try:
+        await server.serve()
+    finally:
+        chmod_task.cancel()
+        Path(socket_path).unlink(missing_ok=True)
 
 
 def main() -> None:
@@ -21,8 +63,16 @@ def main() -> None:
     which closes the HTTP client and the SQLite connection cleanly."""
     config = load_config()
     setup_logging(config.log_level)
-    get_logger("daemon").info("Starting Cortext on %s:%d", config.host, config.port)
-    uvicorn.run(build_app(config), host=config.host, port=config.port)
+    log = get_logger("daemon")
+    app = build_app(config)
+    if config.is_socket_mode():
+        socket_path = config.effective_socket_path()
+        prepare_socket(socket_path)
+        log.info("Starting Cortext on unix:%s", socket_path)
+        asyncio.run(_serve_uds(app, socket_path))
+    else:
+        log.info("Starting Cortext on %s:%d", config.host, config.port)
+        uvicorn.run(app, host=config.host, port=config.port)
 
 
 if __name__ == "__main__":

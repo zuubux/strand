@@ -11,8 +11,11 @@ from collections import deque
 from collections.abc import Sequence
 from typing import Any
 
+import sqlite_vec
+
 from .config import ENV_VARS, load_config, save_config_value
-from .db import DatabaseManager
+from .db import DatabaseManager, embedding_text
+from .embed import Embedder, EmbeddingManager
 from .logging import default_log_path
 
 
@@ -169,6 +172,33 @@ async def cmd_prune_stale(db: DatabaseManager, args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_embed_backfill(
+    db: DatabaseManager, args: argparse.Namespace, embedder: Embedder | None = None
+) -> int:
+    """Embed every entity that has no row in `entity_embeddings`."""
+    async with db.conn.execute(
+        "SELECT id, name, summary FROM entities "
+        "WHERE id NOT IN (SELECT entity_id FROM entity_embeddings) ORDER BY id"
+    ) as cur:
+        rows = [dict(r) for r in await cur.fetchall()]
+    if not rows:
+        print("embedded 0 entit(y/ies); nothing to backfill")
+        return 0
+    embedder = embedder or getattr(args, "embedder", None) or EmbeddingManager()
+    done = 0
+    for row in rows:
+        vector = await asyncio.to_thread(embedder.embed, embedding_text(row["name"], row["summary"]))
+        async with db._transaction() as conn:
+            await conn.execute("DELETE FROM entity_embeddings WHERE entity_id = ?", (row["id"],))
+            await conn.execute(
+                "INSERT INTO entity_embeddings (entity_id, embedding) VALUES (?, ?)",
+                (row["id"], sqlite_vec.serialize_float32(vector)),
+            )
+        done += 1
+    print(f"embedded {done} entit(y/ies)")
+    return 0
+
+
 SECRET_KEYS = ("upstream_api_key", "api_key")
 
 
@@ -263,6 +293,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("prune-stale", help="purge low-confidence model-inferred facts")
     p.add_argument("--confidence-below", type=_confidence, default=0.5, metavar="X")
     p.set_defaults(func=cmd_prune_stale)
+
+    sub.add_parser("embed-backfill", help="embed entities missing from entity_embeddings").set_defaults(
+        func=cmd_embed_backfill
+    )
 
     config = sub.add_parser("config", help="show or change persistent settings")
     config_sub = config.add_subparsers(dest="config_command", required=True)
