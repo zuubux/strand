@@ -13,10 +13,23 @@ from typing import Any
 
 import sqlite_vec
 
+import httpx
+
 from .config import ENV_VARS, load_config, save_config_value
 from .db import DatabaseManager, embedding_text
-from .embed import Embedder, EmbeddingManager
+from .embed import (
+    DEFAULT_MODEL,
+    UNAVAILABLE_MESSAGE,
+    Embedder,
+    EmbeddingManager,
+    EmbeddingUnavailable,
+    fastembed_available,
+    model_cache_dir,
+)
+from .extractors import DEFAULT_EXTRACTOR_URL
 from .logging import default_log_path
+
+PING_TIMEOUT = 0.5
 
 
 async def _resolve(db: DatabaseManager, ref: str) -> dict[str, Any] | None:
@@ -123,7 +136,8 @@ async def _delete_entities(db: DatabaseManager, ids: Sequence[int]) -> tuple[int
                 "DELETE FROM edges WHERE source_id = ? OR target_id = ?", (entity_id, entity_id)
             )
             edges += cur.rowcount
-            await conn.execute("DELETE FROM entity_embeddings WHERE entity_id = ?", (entity_id,))
+            if db.vec_enabled:
+                await conn.execute("DELETE FROM entity_embeddings WHERE entity_id = ?", (entity_id,))
             cur = await conn.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
             entities += cur.rowcount
     return entities, edges
@@ -176,6 +190,9 @@ async def cmd_embed_backfill(
     db: DatabaseManager, args: argparse.Namespace, embedder: Embedder | None = None
 ) -> int:
     """Embed every entity that has no row in `entity_embeddings`."""
+    if not db.vec_enabled:
+        print("error: sqlite-vec is unavailable; vector indexing is disabled", file=sys.stderr)
+        return 1
     async with db.conn.execute(
         "SELECT id, name, summary FROM entities "
         "WHERE id NOT IN (SELECT entity_id FROM entity_embeddings) ORDER BY id"
@@ -187,7 +204,11 @@ async def cmd_embed_backfill(
     embedder = embedder or getattr(args, "embedder", None) or EmbeddingManager()
     done = 0
     for row in rows:
-        vector = await asyncio.to_thread(embedder.embed, embedding_text(row["name"], row["summary"]))
+        try:
+            vector = await asyncio.to_thread(embedder.embed, embedding_text(row["name"], row["summary"]))
+        except EmbeddingUnavailable:
+            print(f"error: {UNAVAILABLE_MESSAGE} Embedded {done} entit(y/ies) before stopping.", file=sys.stderr)
+            return 1
         async with db._transaction() as conn:
             await conn.execute("DELETE FROM entity_embeddings WHERE entity_id = ?", (row["id"],))
             await conn.execute(
@@ -196,6 +217,59 @@ async def cmd_embed_backfill(
             )
         done += 1
     print(f"embedded {done} entit(y/ies)")
+    return 0
+
+
+async def _ping(url: str) -> bool:
+    """True if anything answers HTTP at `url` within PING_TIMEOUT (any status counts)."""
+    try:
+        async with httpx.AsyncClient(timeout=PING_TIMEOUT) as client:
+            await client.get(url)
+        return True
+    except Exception:
+        return False
+
+
+def _check(ok: bool | None) -> str:
+    return "[ok]  " if ok else ("[warn]" if ok is None else "[fail]")
+
+
+async def cmd_doctor(db: DatabaseManager, args: argparse.Namespace) -> int:
+    """Print a health checklist. Degraded components are warnings, never errors."""
+    config = load_config()
+    async with db.conn.execute("PRAGMA journal_mode") as cur:
+        mode = str((await cur.fetchone())[0]).lower()
+    print("Cortext doctor")
+    print(f"{_check(mode == 'wal')} database: {db.db_path} (journal_mode={mode})")
+    vec = db.vec_enabled
+    print(f"{_check(vec)} sqlite-vec: {'loaded' if vec else 'not loaded; vector indexing disabled'}")
+
+    if fastembed_available():
+        cached = model_cache_dir()
+        print(f"{_check(True)} fastembed: installed")
+        if cached:
+            print(f"{_check(True)} model cache: {DEFAULT_MODEL} cached at {cached}")
+        else:
+            print(f"{_check(None)} model cache: {DEFAULT_MODEL} not cached (downloads on first use)")
+    else:
+        print(f"{_check(None)} fastembed: not installed; {UNAVAILABLE_MESSAGE}")
+        print(f"{_check(None)} model cache: n/a")
+
+    base = (config.extractor_url or DEFAULT_EXTRACTOR_URL).rstrip("/")
+    reachable = await _ping(base + "/models")
+    label = f"extractor SLM: {base}"
+    if config.extractor_model:
+        label += f" (model {config.extractor_model})"
+    if reachable:
+        print(f"{_check(True)} {label} reachable")
+    elif config.extractor_model:
+        print(f"{_check(False)} {label} unreachable; heuristic extraction only")
+    else:
+        print(f"{_check(None)} {label} unreachable (none configured; heuristic extraction in use)")
+
+    kind, target = config.get_bind_target()
+    transport = f"uds {target}" if kind == "uds" else f"tcp {target}:{config.port}"
+    print(f"{_check(True)} transport: {transport}")
     return 0
 
 
@@ -296,6 +370,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("embed-backfill", help="embed entities missing from entity_embeddings").set_defaults(
         func=cmd_embed_backfill
+    )
+
+    sub.add_parser("doctor", help="check DB, sqlite-vec, fastembed, extractor and transport").set_defaults(
+        func=cmd_doctor
     )
 
     config = sub.add_parser("config", help="show or change persistent settings")

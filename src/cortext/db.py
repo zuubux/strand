@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -12,7 +13,7 @@ from typing import Any
 import aiosqlite
 import sqlite_vec
 
-from .embed import Embedder
+from .embed import Embedder, EmbeddingUnavailable
 from .logging import get_logger
 
 logger = get_logger("db")
@@ -53,12 +54,16 @@ CREATE TABLE IF NOT EXISTS episodes (
     narrative TEXT NOT NULL,
     extracted_entities JSON DEFAULT '[]'
 );
+"""
 
+_VEC_SCHEMA = f"""
 CREATE VIRTUAL TABLE IF NOT EXISTS entity_embeddings USING vec0(
     entity_id INTEGER PRIMARY KEY,
     embedding float[{EMBEDDING_DIM}]
 );
 """
+
+VEC_UNAVAILABLE_MESSAGE = "sqlite-vec extension failed to load; vector indexing disabled."
 
 # Columns added after the first release; applied to pre-existing databases on connect.
 _PROVENANCE_COLUMNS = (
@@ -152,6 +157,7 @@ class DatabaseManager:
         self.db_path = Path(db_path if db_path is not None else DEFAULT_DB_PATH).expanduser()
         self.embedder = embedder
         self._conn: aiosqlite.Connection | None = None
+        self.vec_enabled = False
         self._write_lock = asyncio.Lock()
 
     @property
@@ -176,9 +182,7 @@ class DatabaseManager:
             conn.row_factory = aiosqlite.Row
             self._secure_files()
 
-            await conn.enable_load_extension(True)
-            await conn.load_extension(sqlite_vec.loadable_path())
-            await conn.enable_load_extension(False)
+            vec_enabled = await self._load_vec(conn)
 
             async with conn.execute("PRAGMA journal_mode=WAL") as cur:
                 row = await cur.fetchone()
@@ -190,6 +194,8 @@ class DatabaseManager:
 
             logger.info("WAL journal mode enabled for %s", self.db_path)
             await conn.executescript(_SCHEMA)
+            if vec_enabled:
+                await conn.executescript(_VEC_SCHEMA)
             await self._migrate(conn)
             await conn.commit()
             self._secure_files()
@@ -197,7 +203,25 @@ class DatabaseManager:
             await conn.close()
             raise
         self._conn = conn
+        self.vec_enabled = vec_enabled
         logger.info("Database connected: %s", self.db_path)
+
+    @staticmethod
+    async def _load_vec(conn: aiosqlite.Connection) -> bool:
+        """Load sqlite-vec; on failure warn and return False so relational ops keep working."""
+        try:
+            await conn.enable_load_extension(True)
+            await conn.load_extension(sqlite_vec.loadable_path())
+            return True
+        except (sqlite3.Error, AttributeError, OSError) as exc:
+            logger.warning(VEC_UNAVAILABLE_MESSAGE)
+            logger.debug("sqlite-vec load error: %r", exc, exc_info=True)
+            return False
+        finally:
+            try:
+                await conn.enable_load_extension(False)
+            except (sqlite3.Error, AttributeError):
+                pass
 
     @staticmethod
     async def _migrate(conn: aiosqlite.Connection) -> None:
@@ -237,8 +261,12 @@ class DatabaseManager:
 
     async def _auto_embed(self, name: str, summary: str) -> list[float] | None:
         """Embed `name: summary` with the configured embedder; failures never block the write."""
+        if not self.vec_enabled:
+            return None
         try:
             return await asyncio.to_thread(self.embedder.embed, embedding_text(name, summary))
+        except EmbeddingUnavailable:
+            return None  # already warned once by the embedder
         except Exception:
             logger.warning("embedding generation failed for %r", name, exc_info=True)
             return None
@@ -291,7 +319,7 @@ class DatabaseManager:
             entity_id = int(row[0])
             applied = row[1] == origin and row[2] == confidence
 
-            if embedding is not None and applied:
+            if embedding is not None and applied and self.vec_enabled:
                 # vec0 has no upsert; replace within the same transaction.
                 await conn.execute("DELETE FROM entity_embeddings WHERE entity_id = ?", (entity_id,))
                 await conn.execute(
@@ -311,6 +339,8 @@ class DatabaseManager:
             return []
         if len(query_embedding) != EMBEDDING_DIM:
             raise ValueError(f"embedding must have {EMBEDDING_DIM} dimensions, got {len(query_embedding)}")
+        if not self.vec_enabled:
+            return []
         async with self.conn.execute(
             "SELECT entity_id, distance FROM entity_embeddings "
             "WHERE embedding MATCH ? AND k = ? ORDER BY distance",

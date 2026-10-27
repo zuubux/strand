@@ -9,7 +9,7 @@ import uvicorn
 from .config import Config, load_config
 from .db import DatabaseManager
 from .distill import DistillationEngine
-from .embed import EmbeddingManager
+from .embed import create_embedder
 from .extractors import DEFAULT_EXTRACTOR_URL, LLMExtractor
 from .logging import get_logger, setup_logging
 from .proxy import create_app
@@ -18,7 +18,8 @@ from .session import SessionLedger
 
 
 def build_app(config: Config):
-    embedder = EmbeddingManager()  # lazy: the model loads on first embed, not at startup
+    # Lazy: the model loads on first embed. None (lexical-only) when fastembed is missing.
+    embedder = create_embedder()
     db = DatabaseManager(config.db_path, embedder=embedder)
     resolver = ContextResolver(
         db, SessionLedger(), embedder=embedder, distance_threshold=config.distance_threshold
@@ -69,7 +70,12 @@ def main() -> None:
         socket_path = config.effective_socket_path()
         prepare_socket(socket_path)
         log.info("Starting Cortext on unix:%s", socket_path)
-        asyncio.run(_serve_uds(app, socket_path))
+        try:
+            asyncio.run(_serve_uds(app, socket_path))
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Uvicorn re-raises the captured SIGINT after its shutdown completes;
+            # _serve_uds's finally block has already unlinked the socket.
+            pass
     else:
         log.info("Starting Cortext on %s:%d", config.host, config.port)
         uvicorn.run(app, host=config.host, port=config.port)

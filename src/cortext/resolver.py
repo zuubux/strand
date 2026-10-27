@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from cortext.db import DatabaseManager
-from cortext.embed import Embedder
+from cortext.embed import Embedder, EmbeddingUnavailable
 from cortext.session import SessionDelta, SessionLedger
 from cortext.stopwords import FUNCTION_WORDS, is_stop_word
 
@@ -194,7 +194,7 @@ class ContextResolver:
         ranked = [(0, *h) for h in hits] + [(1, *h) for h in token_hits]
         ranked.sort(key=lambda r: (-r[3].confidence, r[0], r[1], r[2]))
         matched = [entity for *_, entity in ranked[: self.max_entities]]
-        if self.embedder is not None and len(matched) < self.max_entities:
+        if self.embedder is not None and self.db.vec_enabled and len(matched) < self.max_entities:
             matched += await self._semantic_hits(query, rows, {e.id for e in matched})
         return matched[: self.max_entities]
 
@@ -204,7 +204,10 @@ class ContextResolver:
         `rows` is already privacy-filtered, so private entities never surface here
         unless the caller allowed them.
         """
-        vector = await asyncio.to_thread(self.embedder.embed, query)
+        try:
+            vector = await asyncio.to_thread(self.embedder.embed, query)
+        except EmbeddingUnavailable:
+            return []  # lexical-only fallback; the embedder already logged the warning
         ids = await self.db.find_similar_entities(
             vector, limit=self.max_entities * 4 + len(taken), distance_threshold=self.distance_threshold
         )
