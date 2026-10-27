@@ -22,14 +22,22 @@ def build_app(config: Config):
     embedder = create_embedder()
     db = DatabaseManager(config.db_path, embedder=embedder)
     resolver = ContextResolver(
-        db, SessionLedger(), embedder=embedder, distance_threshold=config.distance_threshold
+        db,
+        SessionLedger(),
+        embedder=embedder,
+        distance_threshold=config.distance_threshold,
+        decay_enabled=config.decay_enabled,
+        decay_half_life_days=config.decay_half_life_days,
     )
     extractor = None
     if config.extractor_model:
         extractor = LLMExtractor(
             config.extractor_url or DEFAULT_EXTRACTOR_URL, config.extractor_model
         )
-    return create_app(config, resolver, distill_engine=DistillationEngine(db, extractor=extractor))
+    engine = DistillationEngine(
+        db, extractor=extractor, dedup_distance_threshold=config.dedup_distance_threshold
+    )
+    return create_app(config, resolver, distill_engine=engine)
 
 
 def prepare_socket(socket_path: str) -> None:

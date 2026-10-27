@@ -15,6 +15,7 @@ import sqlite_vec
 
 import httpx
 
+from .compactor import SessionCompactor
 from .config import ENV_VARS, load_config, save_config_value
 from .db import DatabaseManager, embedding_text
 from .embed import (
@@ -329,6 +330,39 @@ def cmd_logs(args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_compact(db: DatabaseManager, args: argparse.Namespace) -> int:
+    config = load_config()
+    compactor = SessionCompactor(
+        db,
+        config.extractor_url or DEFAULT_EXTRACTOR_URL,
+        config.extractor_model,
+        threshold_hours=config.compaction_threshold_hours,
+    )
+    hours = config.compaction_threshold_hours if args.hours is None else args.hours
+    if args.session:
+        sessions = [args.session]
+    else:
+        sessions = await db.get_uncompacted_sessions(hours * 3600.0)
+    if not sessions:
+        print("no sessions to compact")
+        return 0
+    compacted = 0
+    for session_id in sessions:
+        result = await compactor.compact_session(session_id)
+        if result["skipped"]:
+            print(f"Skipped session '{session_id}' (extractor unavailable or failed)")
+        elif not result["episodes"]:
+            print(f"Session '{session_id}' has no uncompacted episodes")
+        else:
+            compacted += 1
+            print(
+                f"Compacted session '{session_id}' ({result['episodes']} episodes, "
+                f"{result['summaries_updated']} summaries updated)"
+            )
+    print(f"{compacted} of {len(sessions)} session(s) compacted")
+    return 0
+
+
 def _confidence(value: str) -> float:
     number = float(value)
     if not 0.0 <= number <= 1.0:
@@ -371,6 +405,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("embed-backfill", help="embed entities missing from entity_embeddings").set_defaults(
         func=cmd_embed_backfill
     )
+
+    p = sub.add_parser("compact", help="synthesize inactive sessions' episodes into entity summaries")
+    p.add_argument("--hours", type=float, metavar="FLOAT", help="inactivity threshold override (hours)")
+    p.add_argument("--session", metavar="TEXT", help="compact this session regardless of age")
+    p.set_defaults(func=cmd_compact)
 
     sub.add_parser("doctor", help="check DB, sqlite-vec, fastembed, extractor and transport").set_defaults(
         func=cmd_doctor

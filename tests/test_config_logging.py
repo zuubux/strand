@@ -119,3 +119,13 @@ def test_rotating_logger_writes_and_cli_tails(home, capsys, monkeypatch):
     assert lines[-1].endswith("[db] line 4")
     assert main(["logs"]) == 0
     assert len(capsys.readouterr().out.splitlines()) == 6
+
+
+def test_dedup_distance_threshold_config(tmp_path):
+    from cortext.config import ENV_VARS, Config, load_config
+
+    assert Config().dedup_distance_threshold == 0.45
+    assert ENV_VARS["dedup_distance_threshold"] == "CORTEXT_DEDUP_DISTANCE_THRESHOLD"
+    assert Config.from_env({}, {"dedup_distance_threshold": 0.3}).dedup_distance_threshold == 0.3
+    env = {"CORTEXT_DEDUP_DISTANCE_THRESHOLD": "0.2"}
+    assert load_config(env, tmp_path / "none.json").dedup_distance_threshold == 0.2

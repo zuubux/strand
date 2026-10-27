@@ -295,3 +295,122 @@ def test_data_persists_across_connections(db_path):
     assert [(e["source_name"], e["relation"], e["target_name"]) for e in edges] == [
         ("Nic", "owns", "1995 BMW 540i")
     ]
+
+
+# --- Semantic entity merging / alias consolidation ----------------------------------
+
+
+def _dedup_embedder():
+    from tests.test_embed import MockEmbeddingManager
+
+    return MockEmbeddingManager(
+        {
+            "AMD Epyc 7302P": 0,
+            "AMD Epyc 7302P CPU": 0,
+            "AMD Epyc 7302P CPU: 16-core server CPU": 0,
+            "AMD Epyc 7302P CPU: Other": 0,
+            "Epyc Concept": 0,
+            "Corvette": 1,
+        }
+    )
+
+
+async def _entity_rows(db):
+    async with db.conn.execute("SELECT id, name, summary, metadata FROM entities ORDER BY id") as cur:
+        return [tuple(r) for r in await cur.fetchall()]
+
+
+def test_near_identical_candidate_merges_and_records_alias(db_path):
+    async def scenario():
+        async with DatabaseManager(db_path, embedder=_dedup_embedder()) as db:
+            canon = await db.upsert_entity("AMD Epyc 7302P", "system", "")
+            merged = await db.upsert_entity_deduped("AMD Epyc 7302P CPU", "system", "16-core server CPU")
+            again = await db.upsert_entity_deduped("AMD Epyc 7302P CPU", "system", "")
+            async with db.conn.execute("SELECT updated_at FROM entities WHERE id = ?", (canon,)) as cur:
+                stamp = (await cur.fetchone())[0]
+            return canon, merged, again, await _entity_rows(db), stamp
+
+    canon, merged, again, rows, stamp = run(scenario())
+    assert merged == again == canon
+    assert len(rows) == 1
+    assert json.loads(rows[0][3])["aliases"] == ["AMD Epyc 7302P CPU"]
+    assert rows[0][2] == "16-core server CPU" and stamp
+
+
+def test_merge_does_not_overwrite_existing_summary_or_lower_confidence(db_path):
+    async def scenario():
+        async with DatabaseManager(db_path, embedder=_dedup_embedder()) as db:
+            canon = await db.upsert_entity("AMD Epyc 7302P", "system", "Original")
+            await db.upsert_entity_deduped(
+                "AMD Epyc 7302P CPU", "system", "Other", origin="model_inferred", confidence=0.6
+            )
+            async with db.conn.execute(
+                "SELECT summary, origin, confidence FROM entities WHERE id = ?", (canon,)
+            ) as cur:
+                return tuple(await cur.fetchone())
+
+    assert run(scenario()) == ("Original", "user_explicit", 1.0)
+
+
+def test_merge_raises_confidence_when_candidate_wins(db_path):
+    async def scenario():
+        async with DatabaseManager(db_path, embedder=_dedup_embedder()) as db:
+            canon = await db.upsert_entity(
+                "AMD Epyc 7302P", "system", "", origin="model_inferred", confidence=0.6
+            )
+            await db.upsert_entity_deduped("AMD Epyc 7302P CPU", "system", "")
+            async with db.conn.execute(
+                "SELECT origin, confidence FROM entities WHERE id = ?", (canon,)
+            ) as cur:
+                return tuple(await cur.fetchone())
+
+    assert run(scenario()) == ("user_explicit", 1.0)
+
+
+def test_different_archetype_does_not_merge_despite_zero_distance(db_path):
+    async def scenario():
+        async with DatabaseManager(db_path, embedder=_dedup_embedder()) as db:
+            a = await db.upsert_entity("AMD Epyc 7302P", "system", "")
+            b = await db.upsert_entity_deduped("Epyc Concept", "concept", "")
+            return a, b, await _entity_rows(db)
+
+    a, b, rows = run(scenario())
+    assert a != b and len(rows) == 2
+
+
+def test_distant_candidate_does_not_merge(db_path):
+    async def scenario():
+        async with DatabaseManager(db_path, embedder=_dedup_embedder()) as db:
+            a = await db.upsert_entity("AMD Epyc 7302P", "system", "")
+            b = await db.upsert_entity_deduped("Corvette", "system", "")
+            return a, b
+
+    a, b = run(scenario())
+    assert a != b
+
+
+def test_alias_and_case_insensitive_match_without_vectors(db_path, monkeypatch):
+    async def scenario():
+        async with DatabaseManager(db_path) as db:  # no embedder: string matching only
+            canon = await db.upsert_entity("Promethean", "system", "", {"aliases": ["The Box"]})
+            by_alias = await db.upsert_entity_deduped("the box", "system", "")
+            by_name = await db.upsert_entity_deduped("PROMETHEAN", "system", "")
+            fresh = await db.upsert_entity_deduped("Promethean Server", "system", "")
+            return canon, by_alias, by_name, fresh
+
+    canon, by_alias, by_name, fresh = run(scenario())
+    assert by_alias == by_name == canon
+    assert fresh != canon  # no vectors: near-synonyms are not merged
+
+
+def test_vec_disabled_falls_back_to_string_matching(db_path):
+    async def scenario():
+        async with DatabaseManager(db_path, embedder=_dedup_embedder()) as db:
+            db.vec_enabled = False
+            canon = await db.upsert_entity("AMD Epyc 7302P", "system", "")
+            near = await db.upsert_entity_deduped("AMD Epyc 7302P CPU", "system", "")
+            exact = await db.upsert_entity_deduped("amd epyc 7302p", "system", "")
+            return canon, near, exact
+
+    canon, near, exact = run(scenario())
+    assert exact == canon and near != canon

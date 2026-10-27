@@ -427,3 +427,89 @@ def test_secrets_never_reach_entities_edges_or_episode(tmp_path):
     assert key not in blob and "hunter2pw" not in blob
     assert episodes and any("[REDACTED_SECRET]" in n for (n,) in episodes)
     assert not any("REDACTED" in name for name, _ in entities)
+
+
+# --- Semantic entity merging --------------------------------------------------------
+
+
+def _dedup_embedder():
+    from tests.test_embed import MockEmbeddingManager
+
+    return MockEmbeddingManager(
+        {"AMD Epyc 7302P": 0, "AMD Epyc 7302P CPU": 0, "AMD Epyc 7302P CPU: 16-core CPU": 0, "Epyc Notes": 0, "Promethean": 1, "Zeta Tool": 2}
+    )
+
+
+def _user(name, archetype, summary=""):
+    return {"name": name, "archetype": archetype, "summary": summary, "origin": "user_explicit"}
+
+
+def test_distill_merges_near_duplicate_and_remaps_edges(tmp_path):
+    async def extractor(query, response):
+        return {
+            "entities": [_user("AMD Epyc 7302P CPU", "system", "16-core CPU"), _user("Zeta Tool", "system")],
+            "edges": [
+                {"source": "Promethean", "target": "AMD Epyc 7302P CPU", "relation": "uses", "origin": "user_explicit"},
+                {"source": "AMD Epyc 7302P CPU", "target": "Zeta Tool", "relation": "runs", "origin": "user_explicit"},
+            ],
+        }
+
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db", embedder=_dedup_embedder()) as db:
+            await db.upsert_entity("AMD Epyc 7302P", "system", "")
+            await db.upsert_entity("Promethean", "system", "")
+            await DistillationEngine(db, extractor).process_exchange("s", "q", "r")
+            return (
+                await _rows(db, "SELECT name, summary, metadata FROM entities ORDER BY id"),
+                await _rows(
+                    db,
+                    "SELECT s.name, e.relation, t.name FROM edges e JOIN entities s ON s.id = e.source_id "
+                    "JOIN entities t ON t.id = e.target_id ORDER BY e.relation",
+                ),
+            )
+
+    entities, edges = run(scenario())
+    assert [e[0] for e in entities] == ["AMD Epyc 7302P", "Promethean", "Zeta Tool"]
+    assert entities[0][1] == "16-core CPU"
+    assert json.loads(entities[0][2])["aliases"] == ["AMD Epyc 7302P CPU"]
+    assert edges == [
+        ("AMD Epyc 7302P", "runs", "Zeta Tool"),
+        ("Promethean", "uses", "AMD Epyc 7302P"),
+    ]
+
+
+def test_distill_does_not_merge_across_archetypes(tmp_path):
+    async def extractor(query, response):
+        return {
+            "entities": [_user("Epyc Notes", "concept")],
+            "edges": [{"source": "Epyc Notes", "target": "Promethean", "relation": "about", "origin": "user_explicit"}],
+        }
+
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db", embedder=_dedup_embedder()) as db:
+            await db.upsert_entity("AMD Epyc 7302P", "system", "")
+            await db.upsert_entity("Promethean", "system", "")
+            await DistillationEngine(db, extractor).process_exchange("s", "q", "r")
+            return await _rows(db, "SELECT name FROM entities ORDER BY id")
+
+    assert run(scenario()) == [("AMD Epyc 7302P",), ("Promethean",), ("Epyc Notes",)]
+
+
+def test_distill_without_vectors_uses_alias_matching_and_resolver_sees_alias(tmp_path):
+    async def extractor(query, response):
+        return {
+            "entities": [_user("the box", "system")],
+            "edges": [{"source": "the box", "target": "Zeta Tool", "relation": "runs", "origin": "user_explicit"}],
+        }
+
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:  # no embedder
+            await db.upsert_entity("Promethean", "system", "Home server", {"aliases": ["The Box"]})
+            await DistillationEngine(db, extractor).process_exchange("s", "q", "r")
+            await db.merge_entity_alias(1, "Prom Server")
+            entities, _ = await ContextResolver(db, SessionLedger()).gather("what about prom server?")
+            return await _rows(db, "SELECT name FROM entities ORDER BY id"), [e.name for e in entities]
+
+    names, resolved = run(scenario())
+    assert names == [("Promethean",), ("Zeta Tool",)]
+    assert resolved[0] == "Promethean"

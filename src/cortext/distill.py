@@ -27,6 +27,7 @@ _MAX_SUMMARY = 300
 USER_ORIGIN = "user_explicit"
 MODEL_ORIGIN = "model_inferred"
 USER_CONFIDENCE = 1.0
+DEFAULT_DEDUP_DISTANCE_THRESHOLD = 0.45  # L2 (~cosine 0.90); mirrors config.py
 MODEL_CONFIDENCE = 0.6  # default confidence for facts the assistant (not the user) asserted
 
 _NAME = r"[A-Z][\w\-]*(?:\s+[A-Z][\w\-]*)*"
@@ -41,6 +42,16 @@ _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 _HEADING_LINE_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t].*)?$", re.MULTILINE)
 _BOLD_LABEL_RE = re.compile(r"\*\*[^*\n]+:\*\*|\*\*[^*\n]+\*\*:")
+
+# Phrases where the user says a relationship has ended (heuristic fallback only).
+_SEVER_RE = re.compile(
+    rf"\b(?:I|we)\s+(?:sold|no longer (?:use|own|drive|work (?:at|for|on)|maintain|manage|lead)|"
+    rf"stopped\s+(?:using|driving|working (?:at|for|on)|maintaining))\s+(?:my\s+|the\s+|our\s+)?(?P<target>{_NAME})"
+)
+_SEVER_RELATIONS = {
+    "sold": "owns", "use": "uses", "own": "owns", "drive": "drives", "maintain": "maintains",
+    "manage": "manages", "lead": "leads", "using": "uses", "driving": "drives", "maintaining": "maintains",
+}
 
 _MIN_QUERY_WORDS = 4
 _TRIVIAL_WORDS = frozenset(
@@ -209,6 +220,20 @@ def _pattern_extract(
             )
 
 
+def _severed_edges(query: str) -> list[dict[str, Any]]:
+    """Basic negation detection: "I sold Atlas" / "I no longer use Postgres" -> deprecated edges from `User`."""
+    found = []
+    for m in _SEVER_RE.finditer(query or ""):
+        verb = m.group(0).split()[1].lower()
+        verb = m.group(0).split()[3].lower() if verb == "no" else verb
+        verb = m.group(0).split()[2].lower() if verb == "stopped" else verb
+        relation = _SEVER_RELATIONS.get(verb)
+        target = _clean_name(m.group("target"))
+        if relation and target and is_valid_entity_name(target):
+            found.append({"source": "User", "target": target, "relation": relation, "reason": m.group(0)[:_MAX_SUMMARY]})
+    return found
+
+
 def heuristic_extract(query: str, response: str) -> Extraction:
     """Lightweight fallback extractor.
 
@@ -236,7 +261,9 @@ def heuristic_extract(query: str, response: str) -> Extraction:
     _pattern_extract(user_text, USER_ORIGIN, USER_CONFIDENCE, entities, edges)
     _pattern_extract(f"{other_text}\n{strip_markdown_structure(response)}", MODEL_ORIGIN, MODEL_CONFIDENCE, entities, edges)
     extraction = {"entities": list(entities.values()), "edges": edges, "summary": _narrative(query, response)}
-    return ground_extraction(extraction, query)
+    extraction = ground_extraction(extraction, query)
+    extraction["deprecated_edges"] = _severed_edges(query)
+    return extraction
 
 
 def _significant_tokens(text: str) -> set[str]:
@@ -308,8 +335,14 @@ def _valid_edge(edge: Any) -> tuple[str, str, str] | None:
 class DistillationEngine:
     """Persists knowledge learned from a completed exchange. Never raises from `process_exchange`."""
 
-    def __init__(self, db: DatabaseManager, extractor: Extractor | None = None) -> None:
+    def __init__(
+        self,
+        db: DatabaseManager,
+        extractor: Extractor | None = None,
+        dedup_distance_threshold: float = DEFAULT_DEDUP_DISTANCE_THRESHOLD,
+    ) -> None:
         self.db = db
+        self.dedup_distance_threshold = dedup_distance_threshold
         self.extractor: Extractor = extractor or heuristic_extract
 
     async def _extract(self, query: str, response: str) -> Extraction:
@@ -361,6 +394,18 @@ class DistillationEngine:
             ids[name] = parent_id
             return parent_id
         ranks[name] = max(confidence, ranks.get(name, 0.0))
+        summary_text = summary.strip() if isinstance(summary, str) else ""
+        dup_id = await self.db.find_duplicate_entity(
+            name,
+            archetype if archetype in VALID_ARCHETYPES else None,
+            summary_text,
+            self.dedup_distance_threshold,
+        )
+        if dup_id is not None:
+            await self.db.merge_entity_alias(dup_id, name, summary_text, origin, confidence)
+            logger.info("Merged candidate %r into existing entity id=%d as alias", name, dup_id)
+            ids[name] = dup_id
+            return dup_id
         existing = await self._existing(name)
         old_archetype, old_summary = existing if existing else (DEFAULT_ARCHETYPE, "")
         new_archetype = archetype if archetype in VALID_ARCHETYPES else old_archetype
@@ -494,14 +539,28 @@ class DistillationEngine:
                 )
                 edge_count += 1
 
+            deprecated_count = 0
+            for item in extraction.get("deprecated_edges") or []:
+                ends = _valid_edge(item)
+                if not ends:
+                    continue
+                source, target, relation = ends
+                reason = str(item.get("reason") or "").strip()
+                reason = sanitize_text(reason)[:_MAX_SUMMARY] or "deprecated"
+                # Canonical mapping: names merged/consolidated this turn, else db alias resolution.
+                if await self.db.deprecate_edge(ids.get(source, source), ids.get(target, target), relation, reason):
+                    deprecated_count += 1
+                    logger.info("Deprecated edge %r -[%s]-> %r reason=%r", source, relation, target, reason)
+
             narrative = sanitize_text(str(extraction.get("summary") or "").strip()) or _narrative(query, response)
             episode_id = await self.db.record_episode(session_id, narrative, sorted(set(ids.values())))
             logger.info(
-                "Recorded episode id=%s session=%r entities=%d edges=%d",
+                "Recorded episode id=%s session=%r entities=%d edges=%d deprecated=%d",
                 episode_id,
                 session_id,
                 len(ids),
                 edge_count,
+                deprecated_count,
             )
             return episode_id
         except Exception as exc:  # background work must never crash the app

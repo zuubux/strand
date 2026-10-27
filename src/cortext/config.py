@@ -16,6 +16,10 @@ DEFAULT_LOG_LEVEL = "INFO"
 # sqlite-vec returns L2 distance: unit vectors at cosine distance ~0.35 sit at L2 ~0.83,
 # orthogonal (unrelated) ones at >= 1.414.
 DEFAULT_DISTANCE_THRESHOLD = 1.0
+# Tight L2 cutoff (~cosine similarity 0.90) for merging near-duplicate entities on ingestion.
+DEFAULT_DEDUP_DISTANCE_THRESHOLD = 0.45
+DEFAULT_DECAY_HALF_LIFE_DAYS = 30.0
+DEFAULT_COMPACTION_THRESHOLD_HOURS = 24.0
 
 # config.json key -> environment variable
 ENV_VARS = {
@@ -30,7 +34,23 @@ ENV_VARS = {
     "extractor_model": "CORTEXT_EXTRACTOR_MODEL",
     "extractor_url": "CORTEXT_EXTRACTOR_URL",
     "distance_threshold": "CORTEXT_DISTANCE_THRESHOLD",
+    "dedup_distance_threshold": "CORTEXT_DEDUP_DISTANCE_THRESHOLD",
+    "decay_enabled": "CORTEXT_DECAY_ENABLED",
+    "decay_half_life_days": "CORTEXT_DECAY_HALF_LIFE_DAYS",
+    "compaction_threshold_hours": "CORTEXT_COMPACTION_THRESHOLD_HOURS",
 }
+
+
+def _as_bool(value: Any) -> bool:
+    """Parse a config boolean (bool, or 1/0, true/false, yes/no, on/off strings)."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().casefold()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off", ""):
+        return False
+    raise ValueError(f"invalid boolean {value!r}; use true or false")
 
 
 def default_config_path() -> Path:
@@ -54,6 +74,13 @@ class Config:
     extractor_url: str = ""
     # Max L2 distance for a semantic (vector KNN) match in the resolver.
     distance_threshold: float = DEFAULT_DISTANCE_THRESHOLD
+    # Max L2 distance for merging a candidate entity into an existing one at ingestion.
+    dedup_distance_threshold: float = DEFAULT_DEDUP_DISTANCE_THRESHOLD
+    # Temporal access decay: facts fade by 2^(-days_since_access / half_life); off by default.
+    decay_enabled: bool = False
+    decay_half_life_days: float = DEFAULT_DECAY_HALF_LIFE_DAYS
+    # A session is compactable once its newest uncompacted episode is this many hours old.
+    compaction_threshold_hours: float = DEFAULT_COMPACTION_THRESHOLD_HOURS
     # True when host or port came from the environment or config.json (forces TCP).
     tcp_explicit: bool = field(default=False, compare=False)
 
@@ -104,6 +131,18 @@ class Config:
             extractor_model=str(pick("extractor_model", "")),
             extractor_url=str(pick("extractor_url", "")),
             distance_threshold=float(pick("distance_threshold", DEFAULT_DISTANCE_THRESHOLD)),
+            dedup_distance_threshold=float(
+                pick("dedup_distance_threshold", DEFAULT_DEDUP_DISTANCE_THRESHOLD)
+            ),
+            decay_enabled=_as_bool(
+                env[ENV_VARS["decay_enabled"]]
+                if env.get(ENV_VARS["decay_enabled"]) not in (None, "")
+                else file_values.get("decay_enabled", False)
+            ),
+            decay_half_life_days=float(pick("decay_half_life_days", DEFAULT_DECAY_HALF_LIFE_DAYS)),
+            compaction_threshold_hours=float(
+                pick("compaction_threshold_hours", DEFAULT_COMPACTION_THRESHOLD_HOURS)
+            ),
             tcp_explicit=bool(pick("host", "") or pick("port", "")),
         )
 
@@ -138,8 +177,10 @@ def save_config_value(key: str, value: Any, config_path: Path | None = None) -> 
         raise KeyError(f"unknown config key {key!r}; valid keys: {', '.join(ENV_VARS)}")
     if key == "port":
         value = int(value)
-    elif key == "distance_threshold":
+    elif key in ("distance_threshold", "dedup_distance_threshold", "decay_half_life_days", "compaction_threshold_hours"):
         value = float(value)
+    elif key == "decay_enabled":
+        value = _as_bool(value)
     elif key == "log_level":
         value = str(value).upper()
     path = config_path if config_path is not None else default_config_path()

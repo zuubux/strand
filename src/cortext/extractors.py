@@ -22,9 +22,13 @@ _MAX_INPUT_CHARS = 6000
 SYSTEM_PROMPT = (
     "You extract a knowledge graph from a conversation turn. Reply with strict JSON only, "
     'shaped as {"entities": [{"name": str, "archetype": one of person|project|system|vehicle|concept, '
-    '"summary": str}], "edges": [{"source": str, "target": str, "relation": str}]}. '
+    '"summary": str}], "edges": [{"source": str, "target": str, "relation": str}], '
+    '"deprecated_edges": [{"source": str, "target": str, "relation": str, "reason": str}]}. '
     "Only include durable facts; edge endpoints must be entity names. "
-    'If nothing is worth keeping return {"entities": [], "edges": []}.'
+    "Use deprecated_edges only when the user explicitly states an existing relationship has ended, "
+    "been replaced, sold, stopped or invalidated (e.g. 'I sold X', 'I switched from A to B', "
+    "'I no longer work at Y'); name the same source, target and relation the relationship had. "
+    'If nothing is worth keeping return {"entities": [], "edges": [], "deprecated_edges": []}.'
 )
 
 
@@ -34,7 +38,7 @@ def _text(value: Any) -> str:
 
 def parse_extraction(content: str) -> Extraction:
     """Parse model output into an extraction dict; malformed input yields empty lists."""
-    empty: Extraction = {"entities": [], "edges": [], "summary": ""}
+    empty: Extraction = {"entities": [], "edges": [], "deprecated_edges": [], "summary": ""}
     text = content.strip()
     if text.startswith("```"):
         text = text.strip("`").removeprefix("json").strip()
@@ -64,7 +68,11 @@ def parse_extraction(content: str) -> Extraction:
     for item in data.get("edges") or []:
         if isinstance(item, dict) and all(_text(item.get(k)) for k in ("source", "target", "relation")):
             edges.append({k: _text(item[k]) for k in ("source", "target", "relation")})
-    return {"entities": entities, "edges": edges, "summary": ""}
+    deprecated = []
+    for item in data.get("deprecated_edges") or []:
+        if isinstance(item, dict) and all(_text(item.get(k)) for k in ("source", "target", "relation")):
+            deprecated.append({k: _text(item.get(k)) for k in ("source", "target", "relation", "reason")})
+    return {"entities": entities, "edges": edges, "deprecated_edges": deprecated, "summary": ""}
 
 
 class LLMExtractor:
@@ -108,4 +116,4 @@ class LLMExtractor:
             return parse_extraction(content if isinstance(content, str) else "")
         except Exception as exc:
             logger.warning("local extractor failed: %s", exc)
-            return {"entities": [], "edges": [], "summary": ""}
+            return {"entities": [], "edges": [], "deprecated_edges": [], "summary": ""}
