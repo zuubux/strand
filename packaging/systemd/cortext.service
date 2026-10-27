@@ -1,0 +1,18 @@
+[Unit]
+Description=Cortext cognitive working-memory daemon
+After=network.target
+
+[Service]
+Type=simple
+# `cortext` is the CLI; the daemon is the cortext.daemon module (pip install --user).
+ExecStart=/usr/bin/env python3 -m cortext.daemon
+Restart=on-failure
+RestartSec=3
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/cortext %h/.local/share/cortext
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

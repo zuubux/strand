@@ -1,6 +1,7 @@
 """OpenAI-compatible streaming proxy that injects novel graph context into the system prompt."""
 
 import asyncio
+import hmac
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -131,6 +132,18 @@ def create_app(
             await resolver.db.close()
 
     app = FastAPI(title="Cortext", lifespan=lifespan)
+
+    if config.api_key:
+        expected = f"Bearer {config.api_key}".encode()
+
+        @app.middleware("http")
+        async def require_api_key(request: Request, call_next: Any) -> Response:
+            if request.url.path == "/v1" or request.url.path.startswith("/v1/"):
+                supplied = request.headers.get("authorization", "").encode()
+                if not hmac.compare_digest(supplied, expected):
+                    return _error(401, "Invalid or missing API key", "authentication_error")
+            return await call_next(request)
+
     app.state.background_tasks = background_tasks
 
     @app.get("/health")
@@ -151,8 +164,9 @@ def create_app(
             payload.pop("session_id", None) or request.headers.get("x-session-id") or DEFAULT_SESSION_ID
         )
         query = _last_user_query(messages)
+        allow_private = request.headers.get("x-cortext-allow-private", "").strip().lower() == "true"
         logger.info("Incoming query session=%r chars=%d: %.80r", session_id, len(query), query)
-        delta = await resolver.resolve(query, session_id) if query else ""
+        delta = await resolver.resolve(query, session_id, allow_private) if query else ""
         if delta:
             logger.info(
                 "Resolved delta session=%r entities=%d edges=%d",
@@ -168,7 +182,7 @@ def create_app(
         api_key = config.upstream_api_key
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        elif request.headers.get("authorization"):
+        elif not config.api_key and request.headers.get("authorization"):
             headers["Authorization"] = request.headers["authorization"]
 
         streaming = bool(payload.get("stream"))

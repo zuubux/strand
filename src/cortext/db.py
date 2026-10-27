@@ -126,6 +126,16 @@ LIMIT :limit
 """
 
 
+def _chmod_quiet(path: Path, mode: int) -> None:
+    """chmod `path` if it exists; ignore PermissionError (not the owner / unprivileged)."""
+    try:
+        os.chmod(path, mode)
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        logger.debug("Cannot chmod %s to %o (permission denied)", path, mode)
+
+
 class DatabaseManager:
     """Owns the async SQLite connection and all graph read/write operations."""
 
@@ -140,14 +150,21 @@ class DatabaseManager:
             raise RuntimeError("DatabaseManager is not connected; call connect() first")
         return self._conn
 
+    def _secure_files(self) -> None:
+        """Restrict the database and its WAL/SHM companions to the owner (0600)."""
+        for suffix in ("", "-wal", "-shm"):
+            _chmod_quiet(self.db_path.with_name(self.db_path.name + suffix), 0o600)
+
     async def connect(self) -> None:
         """Open the database, load sqlite-vec, apply pragmas, and create the schema."""
         if self._conn is not None:
             return
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _chmod_quiet(self.db_path.parent, 0o700)
         conn = await aiosqlite.connect(str(self.db_path))
         try:
             conn.row_factory = aiosqlite.Row
+            self._secure_files()
 
             await conn.enable_load_extension(True)
             await conn.load_extension(sqlite_vec.loadable_path())
@@ -165,6 +182,7 @@ class DatabaseManager:
             await conn.executescript(_SCHEMA)
             await self._migrate(conn)
             await conn.commit()
+            self._secure_files()
         except BaseException:
             await conn.close()
             raise

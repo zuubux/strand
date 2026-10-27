@@ -169,6 +169,9 @@ async def cmd_prune_stale(db: DatabaseManager, args: argparse.Namespace) -> int:
     return 0
 
 
+SECRET_KEYS = ("upstream_api_key", "api_key")
+
+
 def mask_secret(value: str) -> str:
     """Mask an API key as `sk-...abcd`; short secrets are fully hidden."""
     if not value:
@@ -188,7 +191,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
-        shown = mask_secret(args.value) if args.key == "upstream_api_key" else args.value
+        shown = mask_secret(args.value) if args.key in SECRET_KEYS else args.value
         print(f"set {args.key} = {shown}")
         return 0
     config = load_config()
@@ -199,7 +202,8 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 1
         print(values[args.key])
         return 0
-    values["upstream_api_key"] = mask_secret(values["upstream_api_key"])
+    for secret in SECRET_KEYS:
+        values[secret] = mask_secret(values[secret])
     for key, value in values.items():
         print(f"{key}: {value}")
     return 0

@@ -395,3 +395,35 @@ def test_structural_section_terms_are_filler():
         assert is_filler_name(name), name
     assert not is_filler_name("Spark Plugs") and not is_filler_name("M60 V8")
     assert strip_markdown_structure("### Torque Specification\nNGK plugs") .strip() == "NGK plugs"
+
+
+def test_secrets_never_reach_entities_edges_or_episode(tmp_path):
+    key = "sk-" + "a1B2c3D4e5" * 3
+    uri = "postgres://admin:hunter2pw@db.example.com:5432/app"
+
+    async def extractor(query, response):
+        assert key not in query + response and "hunter2pw" not in query + response
+        return {
+            "entities": [{"name": key, "origin": "user_explicit"}, {"name": "Atlas", "archetype": "project"}],
+            "edges": [{"source": "Atlas", "target": key, "relation": "uses"}],
+            "summary": f"Atlas uses {key}",
+        }
+
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            await DistillationEngine(db, extractor).process_exchange(
+                "s", f"Atlas uses key {key} and {uri} for the billing project.", f"Noted {key}, Atlas is set up."
+            )
+            heur = DistillationEngine(db)
+            await heur.process_exchange("s2", f"Marcus manages Atlas with {uri}.", f"Marcus uses {key} daily.")
+            return (
+                await _rows(db, "SELECT name, summary FROM entities"),
+                await _rows(db, "SELECT relation FROM edges"),
+                await _rows(db, "SELECT narrative FROM episodes"),
+            )
+
+    entities, edges, episodes = run(scenario())
+    blob = repr(entities) + repr(edges) + repr(episodes)
+    assert key not in blob and "hunter2pw" not in blob
+    assert episodes and any("[REDACTED_SECRET]" in n for (n,) in episodes)
+    assert not any("REDACTED" in name for name, _ in entities)

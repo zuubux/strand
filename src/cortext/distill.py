@@ -8,6 +8,7 @@ from typing import Any
 
 from .db import DatabaseManager
 from .logging import get_logger
+from .sanitize import is_secret_token, sanitize_text
 from .stopwords import is_filler_name, is_stop_word, is_valid_entity_name, name_tokens
 
 logger = get_logger("distill")
@@ -434,6 +435,8 @@ class DistillationEngine:
             relation = str(edge.get("relation", "")).strip()
             if not (source and target and relation) or source == target:
                 continue
+            if is_secret_token(source) or is_secret_token(target):
+                continue
             if is_valid_entity_name(source) and is_valid_entity_name(target):
                 names |= {source, target}
         return names
@@ -445,6 +448,7 @@ class DistillationEngine:
         warnings, never raised).
         """
         try:
+            query, response = sanitize_text(query), sanitize_text(response)
             if not is_substantive_exchange(query, response):
                 logger.info("Skipped non-substantive exchange session=%r", session_id)
                 return None
@@ -459,7 +463,7 @@ class DistillationEngine:
             for entity in candidates:
                 name = str(entity.get("name", "")).strip() if isinstance(entity, dict) else ""
                 archetype = entity.get("archetype") if isinstance(entity, dict) else None
-                if name and is_valid_entity_name(name, archetype if archetype in VALID_ARCHETYPES else DEFAULT_ARCHETYPE):
+                if name and not is_secret_token(name) and is_valid_entity_name(name, archetype if archetype in VALID_ARCHETYPES else DEFAULT_ARCHETYPE):
                     origin, confidence = self._provenance(entity)
                     if origin != USER_ORIGIN and name not in connected:
                         logger.info("Dropped edge-free inferred entity %r", name)
@@ -479,6 +483,8 @@ class DistillationEngine:
                     continue
                 if not (is_valid_entity_name(source) and is_valid_entity_name(target)):
                     continue
+                if is_secret_token(source) or is_secret_token(target):
+                    continue
                 origin, confidence = self._provenance(edge)
                 source_id = await self._upsert(ids, source, origin=origin, confidence=confidence, ranks=ranks)
                 target_id = await self._upsert(ids, target, origin=origin, confidence=confidence, ranks=ranks)
@@ -492,7 +498,7 @@ class DistillationEngine:
                 )
                 edge_count += 1
 
-            narrative = str(extraction.get("summary") or "").strip() or _narrative(query, response)
+            narrative = sanitize_text(str(extraction.get("summary") or "").strip()) or _narrative(query, response)
             episode_id = await self.db.record_episode(session_id, narrative, sorted(set(ids.values())))
             logger.info(
                 "Recorded episode id=%s session=%r entities=%d edges=%d",

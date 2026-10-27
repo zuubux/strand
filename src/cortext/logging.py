@@ -27,6 +27,22 @@ def default_log_path() -> Path:
     return Path.home() / ".local" / "share" / "cortext" / "cortext.log"
 
 
+def _chmod_quiet(path: Path, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except (FileNotFoundError, PermissionError):
+        pass
+
+
+class _SecureRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler whose log file is always 0600 (also after each rollover)."""
+
+    def _open(self):  # type: ignore[no-untyped-def]
+        stream = super()._open()
+        _chmod_quiet(Path(self.baseFilename), 0o600)
+        return stream
+
+
 class _ComponentFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.component = record.name.rsplit(".", 1)[-1]
@@ -56,9 +72,10 @@ def setup_logging(
     _remove_managed_handlers(logger)
 
     log_path = Path(path).expanduser() if path is not None else default_log_path()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _chmod_quiet(log_path.parent, 0o700)
     handlers: list[logging.Handler] = [
-        RotatingFileHandler(log_path, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding="utf-8")
+        _SecureRotatingFileHandler(log_path, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding="utf-8")
     ]
     if debug is None:
         debug = numeric <= logging.DEBUG and sys.stderr.isatty()

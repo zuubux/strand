@@ -18,6 +18,7 @@ DEFAULT_LOG_LEVEL = "INFO"
 ENV_VARS = {
     "upstream_url": "CORTEXT_UPSTREAM_URL",
     "upstream_api_key": "CORTEXT_UPSTREAM_API_KEY",
+    "api_key": "CORTEXT_API_KEY",
     "host": "CORTEXT_HOST",
     "port": "CORTEXT_PORT",
     "db_path": "CORTEXT_DB_PATH",
@@ -37,6 +38,8 @@ class Config:
     port: int = DEFAULT_PORT
     db_path: str = DEFAULT_DB_PATH
     log_level: str = DEFAULT_LOG_LEVEL
+    # Inbound key clients must present to Cortext (distinct from upstream_api_key).
+    api_key: str = ""
 
     @classmethod
     def from_env(
@@ -52,6 +55,7 @@ class Config:
         return cls(
             upstream_url=str(pick("upstream_url", DEFAULT_UPSTREAM_URL)),
             upstream_api_key=str(pick("upstream_api_key", "")),
+            api_key=str(pick("api_key", "")),
             host=str(pick("host", DEFAULT_HOST)),
             port=int(pick("port", DEFAULT_PORT)),
             db_path=str(pick("db_path", DEFAULT_DB_PATH)),

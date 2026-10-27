@@ -73,6 +73,19 @@ def _aliases(raw_metadata: str | None) -> list[str]:
     return [a for a in aliases if isinstance(a, str)]
 
 
+def is_private(archetype: str | None, raw_metadata: str | None) -> bool:
+    """Private entities have archetype "private" or metadata {"private": true}."""
+    if archetype == "private":
+        return True
+    if not raw_metadata or "private" not in raw_metadata:
+        return False
+    try:
+        meta = json.loads(raw_metadata)
+    except ValueError:
+        return False
+    return isinstance(meta, dict) and meta.get("private") is True
+
+
 def _clean(text: object) -> str:
     """Collapse all whitespace so every fact stays on a single line."""
     return " ".join(str(text or "").split())
@@ -140,7 +153,7 @@ class ContextResolver:
         self.edge_limit = edge_limit
         self.max_entities = max_entities
 
-    async def match_entities(self, query: str) -> list[Entity]:
+    async def match_entities(self, query: str, allow_private: bool = True) -> list[Entity]:
         """Entities whose name or metadata alias appears in `query` (case-insensitive, whole word).
 
         Results are ordered by first mention in the query and capped at `max_entities`.
@@ -152,6 +165,8 @@ class ContextResolver:
             "SELECT id, name, archetype, summary, metadata, origin, confidence FROM entities ORDER BY id"
         ) as cur:
             rows = await cur.fetchall()
+        if not allow_private:
+            rows = [r for r in rows if not is_private(r["archetype"], r["metadata"])]
 
         hits: list[tuple[int, int, Entity]] = []
         for row in rows:
@@ -198,9 +213,18 @@ class ContextResolver:
                 hits.append((min(positions), entity.id, entity))
         return hits
 
-    async def gather(self, query: str) -> tuple[list[Entity], list[Edge]]:
-        """Matched entities plus their `max_hops` neighbourhood, de-duplicated across roots."""
-        roots = await self.match_entities(query)
+    async def _private_ids(self) -> set[int]:
+        async with self.db.conn.execute("SELECT id, archetype, metadata FROM entities") as cur:
+            rows = await cur.fetchall()
+        return {r["id"] for r in rows if is_private(r["archetype"], r["metadata"])}
+
+    async def gather(self, query: str, allow_private: bool = True) -> tuple[list[Entity], list[Edge]]:
+        """Matched entities plus their `max_hops` neighbourhood, de-duplicated across roots.
+
+        Unless `allow_private`, private entities and every edge touching them are omitted.
+        """
+        roots = await self.match_entities(query, allow_private)
+        hidden = set() if allow_private else await self._private_ids()
         entities = {e.id: e for e in roots}
         edges: dict[int, Edge] = {}
         for root in roots:
@@ -208,6 +232,8 @@ class ContextResolver:
                 root.id, max_hops=self.max_hops, limit=self.edge_limit
             )
             for row in rows:
+                if row["source_id"] in hidden or row["target_id"] in hidden:
+                    continue
                 edges.setdefault(
                     row["edge_id"],
                     Edge(
@@ -232,13 +258,13 @@ class ContextResolver:
                         )
         return list(entities.values()), list(edges.values())
 
-    async def resolve(self, query: str, session_id: str) -> str:
+    async def resolve(self, query: str, session_id: str, allow_private: bool = False) -> str:
         """Markdown block of facts new to `session_id`, or "" if there is nothing to add.
 
         Facts are marked as seen as soon as they are returned, so callers should
         inject the result into the prompt (or `ledger.reset` the session on failure).
         """
-        entities, edges = await self.gather(query)
+        entities, edges = await self.gather(query, allow_private)
         if not entities:
             return ""
         delta = self.ledger.filter_new(
