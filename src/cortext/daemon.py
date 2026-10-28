@@ -1,9 +1,14 @@
 """Daemon entrypoint: wires the DB, session ledger, resolver and proxy, then serves."""
 
+import argparse
 import asyncio
+import contextlib
+import copy
 import os
 import socket
 import stat
+import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 import uvicorn
@@ -125,14 +130,83 @@ async def _serve_uds(app, socket_path: str) -> None:
             pass
 
 
-def main() -> None:
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _is_loopback_host(host: str) -> bool:
+    host = host.strip().lower()
+    return host in _LOOPBACK_HOSTS or host.startswith("127.")
+
+
+def warn_if_exposed(config: Config, log=None) -> bool:
+    """Warn loudly when TCP mode binds beyond loopback without an inbound `api_key` (C2).
+
+    Returns True when the warning was emitted.
+    """
+    if config.api_key or _is_loopback_host(config.host):
+        return False
+    (log or get_logger("daemon")).warning(
+        "SECURITY: binding to non-loopback host %s:%d with no api_key configured; anyone who can "
+        "reach this port can read your memory graph and use your upstream credentials. "
+        "Set CORTEXT_API_KEY or bind to 127.0.0.1.",
+        config.host,
+        config.port,
+    )
+    return True
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="python -m cortext.daemon", description="Run the Cortext daemon.")
+    parser.add_argument(
+        "--diag",
+        "--debug",
+        dest="diag",
+        action="store_true",
+        help="diagnostic mode: verbose colored logs on stderr/stdout (default: quiet, log file only)",
+    )
+    return parser.parse_args(argv)
+
+
+@contextlib.contextmanager
+def _quiet_uvicorn_logging():
+    """Route uvicorn's own logs into the cortext log file instead of the terminal."""
+    original = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    handler = {"()": "cortext.logging.uvicorn_log_handler"}
+    quiet = copy.deepcopy(original)
+    quiet["formatters"] = {}
+    quiet["handlers"] = {"default": handler, "access": handler}
+    uvicorn.config.LOGGING_CONFIG.clear()
+    uvicorn.config.LOGGING_CONFIG.update(quiet)
+    try:
+        yield
+    finally:
+        uvicorn.config.LOGGING_CONFIG.clear()
+        uvicorn.config.LOGGING_CONFIG.update(original)
+
+
+def main(argv: Sequence[str] | None = None) -> None:
     """Run the daemon. uvicorn traps SIGINT/SIGTERM and runs the app lifespan shutdown,
-    which closes the HTTP client and the SQLite connection cleanly."""
+    which closes the HTTP client and the SQLite connection cleanly.
+
+    Quiet by default (logs go to the cortext log file only); `--diag`/`--debug` streams
+    verbose colored logs to the terminal as well."""
+    args = _parse_args([] if argv is None else argv)
+    if args.diag:
+        _run(args)
+    else:
+        with _quiet_uvicorn_logging():
+            _run(args)
+
+
+def _run(args: argparse.Namespace) -> None:
     try:
         config = load_config(strict=True)
     except ValueError as exc:
         raise SystemExit(f"cortext: configuration error: {exc}") from exc
-    setup_logging(config.log_level)
+    if args.diag:
+        setup_logging("DEBUG", debug=True)
+    else:
+        setup_logging(config.log_level, debug=False)
     log = get_logger("daemon")
     app = build_app(config)
     if config.is_socket_mode():
@@ -149,9 +223,10 @@ def main() -> None:
             # _serve_uds's finally block has already unlinked the socket.
             pass
     else:
+        warn_if_exposed(config, log)
         log.info("Starting Cortext on %s:%d", config.host, config.port)
         uvicorn.run(app, host=config.host, port=config.port)
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])

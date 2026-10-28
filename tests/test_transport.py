@@ -118,3 +118,36 @@ def test_serve_uds_sets_0600_and_cleans_up(tmp_path, monkeypatch):
 
     assert asyncio.run(run()) == 0o600
     assert not sock.exists()
+
+
+def test_daemon_quiet_by_default_and_diag_flag(monkeypatch, tmp_path):
+    import logging
+
+    from cortext.logging import shutdown_logging
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for key in ("XDG_RUNTIME_DIR", "CORTEXT_SOCKET_PATH", "CORTEXT_PORT", "CORTEXT_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("CORTEXT_HOST", "127.0.0.1")
+    monkeypatch.setenv("CORTEXT_LOG_PATH", str(tmp_path / "c.log"))
+    monkeypatch.setattr(daemon, "build_app", lambda config: object())
+    seen = []
+    monkeypatch.setattr(
+        daemon.uvicorn,
+        "run",
+        lambda app, **kw: seen.append(dict(daemon.uvicorn.config.LOGGING_CONFIG["handlers"]["default"])),
+    )
+    original = dict(daemon.uvicorn.config.LOGGING_CONFIG["handlers"]["default"])
+    logger = logging.getLogger("cortext")
+    try:
+        daemon.main([])
+        assert seen[0] == {"()": "cortext.logging.uvicorn_log_handler"}
+        assert daemon.uvicorn.config.LOGGING_CONFIG["handlers"]["default"] == original
+        assert not any(type(h) is logging.StreamHandler for h in logger.handlers)
+        daemon.main(["--diag"])
+        assert seen[1] == original
+        assert logger.level == logging.DEBUG
+        assert any(type(h) is logging.StreamHandler for h in logger.handlers)
+    finally:
+        shutdown_logging()
+    assert "Starting Cortext" in (tmp_path / "c.log").read_text()

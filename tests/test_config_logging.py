@@ -129,3 +129,16 @@ def test_dedup_distance_threshold_config(tmp_path):
     assert Config.from_env({}, {"dedup_distance_threshold": 0.3}).dedup_distance_threshold == 0.3
     env = {"CORTEXT_DEDUP_DISTANCE_THRESHOLD": "0.2"}
     assert load_config(env, tmp_path / "none.json").dedup_distance_threshold == 0.2
+
+
+def test_model_default_precedence_and_cli_persistence(home, monkeypatch, capsys):
+    assert Config().model_default == ""
+    assert load_config().model_default == ""
+    assert main(["config", "set", "model_default", "  gemini-3.6-flash "]) == 0
+    capsys.readouterr()
+    assert load_config().model_default == "gemini-3.6-flash"
+    assert main(["config", "get", "model_default"]) == 0
+    assert capsys.readouterr().out.strip() == "gemini-3.6-flash"
+    monkeypatch.setenv("CORTEXT_MODEL_DEFAULT", "env-model")
+    assert load_config().model_default == "env-model"
+    assert load_config({}).model_default == "gemini-3.6-flash"

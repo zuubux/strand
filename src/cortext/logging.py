@@ -43,6 +43,25 @@ class _SecureRotatingFileHandler(RotatingFileHandler):
         return stream
 
 
+_LEVEL_COLORS = {
+    logging.DEBUG: "\033[36m",
+    logging.INFO: "\033[32m",
+    logging.WARNING: "\033[33m",
+    logging.ERROR: "\033[31m",
+    logging.CRITICAL: "\033[1;31m",
+}
+_RESET = "\033[0m"
+
+
+class _ColorFormatter(logging.Formatter):
+    """Formatter that colors the whole line by level (used for the diagnostic stream on a TTY)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        text = super().format(record)
+        color = _LEVEL_COLORS.get(record.levelno)
+        return f"{color}{text}{_RESET}" if color else text
+
+
 class _ComponentFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.component = record.name.rsplit(".", 1)[-1]
@@ -84,7 +103,10 @@ def setup_logging(
 
     formatter = logging.Formatter(FORMAT, DATE_FORMAT)
     for handler in handlers:
-        handler.setFormatter(formatter)
+        if isinstance(handler, _SecureRotatingFileHandler) or not sys.stderr.isatty():
+            handler.setFormatter(formatter)
+        else:
+            handler.setFormatter(_ColorFormatter(FORMAT, DATE_FORMAT))
         handler.addFilter(_ComponentFilter())
         handler._cortext_managed = True  # type: ignore[attr-defined]
         logger.addHandler(handler)
@@ -98,3 +120,11 @@ def shutdown_logging() -> None:
 
 def get_logger(component: str) -> logging.Logger:
     return logging.getLogger(f"{LOGGER_NAME}.{component}")
+
+
+def uvicorn_log_handler() -> logging.Handler:
+    """Handler factory for uvicorn's dictConfig: the managed cortext file handler (or a no-op)."""
+    for handler in logging.getLogger(LOGGER_NAME).handlers:
+        if isinstance(handler, _SecureRotatingFileHandler):
+            return handler
+    return logging.NullHandler()

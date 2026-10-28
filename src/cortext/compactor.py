@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from .common import MAX_SUMMARY_LEN, MODEL_CONFIDENCE, extract_json, load_metadata
+from .common import MAX_SUMMARY_LEN, MODEL_CONFIDENCE, extract_json, is_private
 from .db import DatabaseManager
 from .extractors import DEFAULT_EXTRACTOR_URL
 from .logging import get_logger
@@ -83,7 +83,7 @@ class SessionCompactor:
         return [
             {"id": r["id"], "name": r["name"], "summary": r["summary"]}
             for r in rows
-            if r["archetype"] != "private" and load_metadata(r["metadata"]).get("private") is not True
+            if not is_private(r["archetype"], r["metadata"])
         ]
 
     async def _ask_slm(self, narratives: list[str], entities: list[dict[str, Any]]) -> dict[str, Any] | None:

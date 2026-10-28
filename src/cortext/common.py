@@ -46,11 +46,12 @@ def extract_json(content: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-_THINK_RE = re.compile(r"<think>.*?(?:</think>|\Z)", re.IGNORECASE | re.DOTALL)
+# The backreference pairs each opener with its own closer, so `<think>` is never ended by `</thought>`.
+_THINK_RE = re.compile(r"<(thinking|think|thought|reasoning)>.*?(?:</\1>|\Z)", re.IGNORECASE | re.DOTALL)
 
 
 def strip_think(text: str) -> str:
-    """Remove <think>...</think> reasoning blocks (an unclosed one runs to the end)."""
+    """Remove <think>, <thinking>, <thought> and <reasoning> blocks (an unclosed one runs to the end)."""
     return _THINK_RE.sub("", text) if "<" in text else text
 
 
@@ -62,6 +63,54 @@ def load_metadata(raw: dict | str | bytes | None) -> dict[str, Any]:
         except ValueError:
             return {}
     return raw if isinstance(raw, dict) else {}
+
+
+_FLAG_STRINGS = frozenset({"true", "1"})
+_TRIM = " \t\n\r"  # trimmed from archetypes and flag strings; db.PRIVATE_ENTITY_SQL trims the same set
+
+
+def _reject_constant(name: str) -> Any:
+    """json.loads hook: SQLite's json_valid() rejects NaN/Infinity, so the Python side must too."""
+    raise ValueError(f"invalid JSON constant {name}")
+
+
+def _flag_is_set(value: Any) -> bool:
+    """Strict truthiness of a metadata flag: True, 1 / 1.0, or the strings "true" / "1" (any case).
+
+    Deliberately not Python truthiness: the string "false" must stay False.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return isinstance(value, str) and value.strip(_TRIM).lower() in _FLAG_STRINGS
+
+
+def is_private(archetype: str | None, metadata: dict | str | bytes | None) -> bool:
+    """The single privacy predicate for an entity (its SQL twin is `db.PRIVATE_ENTITY_SQL`).
+
+    Private when the archetype is "private" (case-insensitive) or `metadata["private"]` is
+    set (see `_flag_is_set`). Fails closed: metadata that is corrupt JSON, or valid JSON that
+    is not an object, counts as private. Only absent or blank metadata means "no flags".
+    """
+    if isinstance(archetype, str) and archetype.strip(_TRIM).lower() == "private":
+        return True
+    if metadata is None:
+        return False
+    if isinstance(metadata, (str, bytes)):
+        try:
+            text = metadata.decode("utf-8") if isinstance(metadata, bytes) else metadata
+        except UnicodeDecodeError:
+            return True
+        if not text.strip(_TRIM):
+            return False
+        try:
+            metadata = json.loads(text, parse_constant=_reject_constant)
+        except (ValueError, RecursionError):
+            return True
+    if not isinstance(metadata, dict):
+        return True
+    return _flag_is_set(metadata.get("private"))
 
 
 def aliases_of(metadata: dict | str | None) -> list[str]:

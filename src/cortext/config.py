@@ -38,6 +38,7 @@ ENV_VARS = {
     "decay_enabled": "CORTEXT_DECAY_ENABLED",
     "decay_half_life_days": "CORTEXT_DECAY_HALF_LIFE_DAYS",
     "compaction_threshold_hours": "CORTEXT_COMPACTION_THRESHOLD_HOURS",
+    "model_default": "CORTEXT_MODEL_DEFAULT",
 }
 
 
@@ -81,6 +82,8 @@ class Config:
     decay_half_life_days: float = DEFAULT_DECAY_HALF_LIFE_DAYS
     # A session is compactable once its newest uncompacted episode is this many hours old.
     compaction_threshold_hours: float = DEFAULT_COMPACTION_THRESHOLD_HOURS
+    # Default chat model for clients such as the GUI; empty = client-side fallback.
+    model_default: str = ""
     # True when host or port came from the environment or config.json (forces TCP).
     tcp_explicit: bool = field(default=False, compare=False)
 
@@ -147,6 +150,7 @@ class Config:
             compaction_threshold_hours=float(
                 pick("compaction_threshold_hours", DEFAULT_COMPACTION_THRESHOLD_HOURS)
             ),
+            model_default=str(pick("model_default", "")).strip(),
             tcp_explicit=bool(pick("host", "") or pick("port", "")),
         )
 
@@ -190,6 +194,8 @@ def save_config_value(key: str, value: Any, config_path: Path | None = None) -> 
         value = _as_bool(value)
     elif key == "log_level":
         value = str(value).upper()
+    elif key == "model_default":
+        value = str(value).strip()
     path = config_path if config_path is not None else default_config_path()
     data = _read_file(path, strict=True)
     data[key] = value

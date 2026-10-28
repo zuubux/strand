@@ -1,7 +1,6 @@
 """Context resolver: maps a prompt onto the entity graph and emits a compact, session-aware delta."""
 
 import asyncio
-import json
 import math
 import re
 from collections.abc import Iterable
@@ -9,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from cortext.common import MIN_EDGE_CONFIDENCE, aliases_of, clean_text
+from cortext.common import MIN_EDGE_CONFIDENCE, aliases_of, clean_text, is_private
 from cortext.db import DatabaseManager
 from cortext.embed import Embedder, EmbeddingUnavailable
 from cortext.logging import get_logger
@@ -136,19 +135,6 @@ def _first_match(haystack: str, term: str) -> int:
 def _aliases(raw_metadata: str | None) -> list[str]:
     """Aliases live in entity metadata as {"aliases": [...]}; tolerate anything else."""
     return aliases_of(raw_metadata)
-
-
-def is_private(archetype: str | None, raw_metadata: str | None) -> bool:
-    """Private entities have archetype "private" or metadata {"private": true}."""
-    if archetype == "private":
-        return True
-    if not raw_metadata or "private" not in raw_metadata:
-        return False
-    try:
-        meta = json.loads(raw_metadata)
-    except ValueError:
-        return False
-    return isinstance(meta, dict) and meta.get("private") is True
 
 
 def _is_active_edge(row: dict) -> bool:

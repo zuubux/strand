@@ -314,6 +314,13 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_daemon(args: argparse.Namespace) -> int:
+    from . import daemon
+
+    daemon.main(["--diag"] if args.diag else [])
+    return 0
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
     path = default_log_path()
     try:
@@ -424,6 +431,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("key")
     p.add_argument("value")
     config.set_defaults(func=cmd_config, local=True)
+
+    p = sub.add_parser("daemon", help="run the daemon in the foreground (quiet unless --diag)")
+    p.add_argument("--diag", "--debug", dest="diag", action="store_true", help="verbose colored logs on the terminal")
+    p.set_defaults(func=cmd_daemon, local=True)
 
     p = sub.add_parser("logs", help="print the end of the Cortext log file")
     p.add_argument("--tail", "-n", type=_positive, default=50, metavar="N", help="lines to show (default 50)")

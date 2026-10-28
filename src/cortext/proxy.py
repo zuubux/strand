@@ -17,12 +17,15 @@ from .config import Config
 from .distill import DistillationEngine
 from .logging import get_logger
 from .resolver import ContextResolver
+from .sanitize import sanitize_text
 from .session import MAX_SESSION_ID_LEN
 
 logger = get_logger("proxy")
 DEFAULT_SESSION_ID = "default"
 _UPSTREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 MAX_CONCURRENT_DISTILLATIONS = 4
+MAX_REQUEST_BYTES = 10 * 1024 * 1024  # POST /v1/chat/completions body cap (HTTP 413 beyond this)
+_QUERY_LOG_CHARS = 80
 _CONTEXT_ROLES = ("system", "developer")
 
 
@@ -70,6 +73,23 @@ def _completion_text(body: bytes) -> str:
         return ""
 
 
+def _delta_text(content: Any) -> str:
+    """Text of a streamed `delta.content`: a string, or a list of `{"type": "text", "text": ...}` parts.
+
+    Parts are joined with "" (stream fragments, unlike whole messages, carry their own spacing).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            part if isinstance(part, str) else part["text"]
+            for part in content
+            if isinstance(part, str)
+            or (isinstance(part, dict) and part.get("type", "text") == "text" and isinstance(part.get("text"), str))
+        )
+    return ""
+
+
 def _stream_text(raw: bytes) -> str:
     """Concatenate delta content from a collected SSE stream."""
     parts: list[str] = []
@@ -86,9 +106,7 @@ def _stream_text(raw: bytes) -> str:
             for choice in choices:
                 if not isinstance(choice, dict) or choice.get("index", 0) != 0:
                     continue
-                delta = choice["delta"]["content"]
-                if isinstance(delta, str):
-                    parts.append(delta)
+                parts.append(_delta_text(choice["delta"]["content"]))
         except (ValueError, KeyError, TypeError):
             continue
     return strip_think("".join(parts))
@@ -164,8 +182,15 @@ def create_app(
         async with distill_slots:
             await engine.process_exchange(session_id, query, response)
 
-    def schedule_distillation(session_id: str, query: str, response: str) -> None:
-        """Fire-and-forget; process_exchange swallows its own errors."""
+    def schedule_distillation(session_id: str, query: str, response: str, allow_private: bool = False) -> None:
+        """Fire-and-forget; process_exchange swallows its own errors.
+
+        Never distills an exchange served with private egress context (C1): the reply may quote
+        private facts, and distilling it would launder them into public, un-flagged entities.
+        """
+        if allow_private:
+            logger.info("Skipping distillation session=%r: private context allowed for this exchange", session_id)
+            return
         if not query or not response:
             return
         task = asyncio.create_task(_distill(session_id, query, response))
@@ -209,8 +234,20 @@ def create_app(
         if media_type != "application/json":
             return _error(415, "Content-Type must be application/json", "invalid_request_error")
         try:
-            payload = await request.json()
+            declared = int(request.headers.get("content-length", "0"))
         except ValueError:
+            declared = 0  # unparseable header: the streaming cap below still applies
+        too_large = _error(413, f"Request body exceeds {MAX_REQUEST_BYTES} bytes", "invalid_request_error")
+        if declared > MAX_REQUEST_BYTES:
+            return too_large
+        received = bytearray()
+        async for chunk in request.stream():  # also bounds chunked uploads that send no Content-Length
+            received += chunk
+            if len(received) > MAX_REQUEST_BYTES:
+                return too_large
+        try:
+            payload = json.loads(bytes(received))
+        except (ValueError, RecursionError):  # RecursionError: pathologically nested JSON
             return _error(400, "Request body must be valid JSON", "invalid_request_error")
         messages = payload.get("messages") if isinstance(payload, dict) else None
         if not isinstance(messages, list):
@@ -223,7 +260,10 @@ def create_app(
             return _error(400, f"session_id must be at most {MAX_SESSION_ID_LEN} characters", "invalid_request_error")
         query = _last_user_query(messages)
         allow_private = request.headers.get("x-cortext-allow-private", "").strip().lower() == "true"
-        logger.info("Incoming query session=%r chars=%d: %.80r", session_id, len(query), query)
+        # Sanitize the whole query before cutting the preview: truncating first could leave a
+        # partial secret too short for the redaction patterns to match.
+        preview = sanitize_text(query)[:_QUERY_LOG_CHARS]
+        logger.info("Incoming query session=%r chars=%d: %r", session_id, len(query), preview)
         try:
             delta = await resolver.resolve(query, session_id, allow_private) if query else ""
         except Exception:
@@ -278,7 +318,7 @@ def create_app(
                 logger.warning("Upstream error status=%d; session %r reset", upstream.status_code, session_id)
                 resolver.ledger.reset(session_id)
             else:
-                schedule_distillation(session_id, query, _completion_text(body))
+                schedule_distillation(session_id, query, _completion_text(body), allow_private)
             return Response(body, status_code=upstream.status_code, media_type=content_type)
 
         async def relay() -> AsyncIterator[bytes]:
@@ -313,7 +353,7 @@ def create_app(
                 )
                 resolver.ledger.reset(session_id)
                 return
-            schedule_distillation(session_id, query, _stream_text(raw))
+            schedule_distillation(session_id, query, _stream_text(raw), allow_private)
 
         return StreamingResponse(
             relay(),

@@ -6,7 +6,7 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .common import MAX_SUMMARY_LEN, MODEL_CONFIDENCE, aliases_of, load_metadata, strip_think
+from .common import MAX_SUMMARY_LEN, MODEL_CONFIDENCE, aliases_of, is_private, load_metadata, strip_think
 from .db import DatabaseManager
 from .logging import get_logger
 from .sanitize import is_secret_token, sanitize_text
@@ -405,12 +405,13 @@ class DistillationEngine:
             result = await result
         return result if isinstance(result, dict) else {}
 
-    async def _existing(self, name: str) -> tuple[str, str] | None:
+    async def _existing(self, name: str) -> tuple[int, str, str, bool] | None:
+        """(id, archetype, summary, is_private) of the entity stored under exactly `name`."""
         async with self.db.conn.execute(
-            "SELECT archetype, summary FROM entities WHERE name = ?", (name,)
+            "SELECT id, archetype, summary, metadata FROM entities WHERE name = ?", (name,)
         ) as cur:
             row = await cur.fetchone()
-        return (row[0], row[1] or "") if row else None
+        return (row[0], row[1], row[2] or "", is_private(row[1], row[3])) if row else None
 
     @staticmethod
     def _provenance(item: dict[str, Any]) -> tuple[str, float]:
@@ -461,7 +462,12 @@ class DistillationEngine:
             ids[name] = dup_id
             return dup_id
         existing = await self._existing(name)
-        old_archetype, old_summary = existing if existing else (DEFAULT_ARCHETYPE, "")
+        if existing and existing[3]:
+            # Distillation never rewrites a private entity (archetype, summary or metadata), so a
+            # public exchange can neither un-privatize it nor corrupt its flags.
+            ids[name] = existing[0]
+            return existing[0]
+        old_archetype, old_summary = (existing[1], existing[2]) if existing else (DEFAULT_ARCHETYPE, "")
         new_archetype = archetype if archetype in VALID_ARCHETYPES else old_archetype
         new_summary = summary.strip() if isinstance(summary, str) and summary.strip() else old_summary
         ids[name] = await self.db.upsert_entity(

@@ -56,6 +56,26 @@ _ACTIVE = (
     "AND COALESCE(json_extract({t}.metadata, '$.deprecated'), 0) != 1"
 )
 
+# SQL twin of `common.is_private` for the table alias `{t}`. A CASE (not OR/AND) because SQLite
+# does not guarantee short-circuiting and json_type() raises on malformed JSON; CASE evaluates in
+# order. Fails closed exactly like the Python predicate: corrupt or non-object metadata is private,
+# NULL/blank metadata is not, the archetype is matched case-insensitively and the flag may be
+# true, 1 / 1.0, or the strings "true" / "1" (any case).
+_TRIM_SQL = "char(32, 9, 10, 13)"
+PRIVATE_ENTITY_SQL = (
+    "(CASE "
+    "WHEN lower(trim({t}.archetype, " + _TRIM_SQL + ")) = 'private' THEN 1 "
+    "WHEN {t}.metadata IS NULL OR trim({t}.metadata, " + _TRIM_SQL + ") = '' THEN 0 "
+    "WHEN NOT json_valid({t}.metadata) THEN 1 "
+    "WHEN json_type({t}.metadata) != 'object' THEN 1 "
+    "WHEN json_type({t}.metadata, '$.private') = 'true' THEN 1 "
+    "WHEN json_type({t}.metadata, '$.private') IN ('integer', 'real') "
+    "AND json_extract({t}.metadata, '$.private') = 1 THEN 1 "
+    "WHEN json_type({t}.metadata, '$.private') = 'text' "
+    "AND lower(trim(json_extract({t}.metadata, '$.private'), " + _TRIM_SQL + ")) IN ('true', '1') THEN 1 "
+    "ELSE 0 END = 1)"
+)
+
 # Undirected walk from :root out to :max_hops. `reach` keeps the minimum hop at
 # which each node is first seen. An edge sits at hop min(endpoint hops) + 1 and
 # is only returned if that hop is within :max_hops.
@@ -69,9 +89,7 @@ WITH RECURSIVE walk(node_id, hop) AS (
     JOIN edges AS e ON e.source_id = w.node_id OR e.target_id = w.node_id
     JOIN entities AS en ON en.id = CASE WHEN e.source_id = w.node_id THEN e.target_id ELSE e.source_id END
     WHERE w.hop < :max_hops AND (:active_only = 0 OR (ACTIVE_E))
-      AND en.archetype != 'private'
-      AND (NOT json_valid(en.metadata)
-           OR COALESCE(json_extract(en.metadata, '$.private'), 0) NOT IN (1, 'true'))
+      AND NOT_PRIVATE_EN
 ),
 reach(node_id, hop) AS (
     SELECT node_id, MIN(hop) FROM walk GROUP BY node_id
@@ -113,8 +131,10 @@ WHERE MIN(rs.hop, rt.hop) < :max_hops AND (:active_only = 0 OR (ACTIVE_ED))
 ORDER BY hop ASC, ed.confidence DESC, ed.weight DESC, ed.id ASC
 LIMIT :limit
 """
-_SUBGRAPH_SQL = _SUBGRAPH_SQL.replace("ACTIVE_ED", _ACTIVE.format(t="ed")).replace(
-    "ACTIVE_E", _ACTIVE.format(t="e")
+_SUBGRAPH_SQL = (
+    _SUBGRAPH_SQL.replace("NOT_PRIVATE_EN", "NOT " + PRIVATE_ENTITY_SQL.format(t="en"))
+    .replace("ACTIVE_ED", _ACTIVE.format(t="ed"))
+    .replace("ACTIVE_E", _ACTIVE.format(t="e"))
 )
 
 

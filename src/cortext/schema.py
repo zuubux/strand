@@ -55,6 +55,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entity_embeddings USING vec0(
 );
 """
 
+ORPHAN_VECTOR_SWEEP_SQL = "DELETE FROM entity_embeddings WHERE entity_id NOT IN (SELECT id FROM entities)"
+
 # Columns added after the first release, as (table, column, DDL); applied to older databases.
 _MIGRATION_COLUMNS = (
     ("entities", "origin", "TEXT NOT NULL DEFAULT 'user_explicit'"),
@@ -76,6 +78,10 @@ async def run_migrations(conn: aiosqlite.Connection, vec_enabled: bool) -> None:
     await conn.executescript(SCHEMA_SQL)
     if vec_enabled:
         await conn.executescript(VEC_SCHEMA_SQL)
+        # Sweep vectors orphaned by historical drops, so a deleted entity leaves no embedding behind.
+        cur = await conn.execute(ORPHAN_VECTOR_SWEEP_SQL)
+        if cur.rowcount > 0:
+            logger.info("Migration: removed %d orphan embedding(s)", cur.rowcount)
     existing: dict[str, set[str]] = {}
     for table, column, ddl in _MIGRATION_COLUMNS:
         if table not in existing:
