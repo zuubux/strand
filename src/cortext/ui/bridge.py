@@ -11,8 +11,10 @@ import asyncio
 import codecs
 import json
 import os
+import re
 import stat
 import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -25,6 +27,55 @@ from cortext.config import Config, load_config
 DEFAULT_MODEL = "gpt-4o-mini"
 UDS_BASE_URL = "http://cortext"
 CHAT_PATH = "/v1/chat/completions"
+PRIVATE_HEADER = "X-Cortext-Allow-Private"
+HISTORY_LIMIT = 100
+COMMAND_RE = re.compile(r"^/([A-Za-z]+)(?:[ \t]+(.*))?$", re.DOTALL)
+FENCE_RE = re.compile(r"^[ \t]{0,3}```[ \t]*([\w+.#-]*)[ \t]*$")
+HELP_TEXT = (
+    "Commands: /new (fresh session), /private on|off (send X-Cortext-Allow-Private), "
+    "/model <name> (switch model), /help. Ctrl+L new session, Ctrl+D diagnostics, Esc stop/clear."
+)
+
+
+def parse_command(text: str) -> tuple[str, str] | None:
+    """Split a client-side slash command into `(name, argument)`, or None for normal prompts.
+
+    Only a single leading `/word` counts, so paths such as `/etc/hosts` are sent upstream.
+    """
+    match = COMMAND_RE.match(text.strip())
+    if not match:
+        return None
+    return match.group(1).lower(), (match.group(2) or "").strip()
+
+
+def split_markdown(text: str) -> list[dict[str, Any]]:
+    """Split text into `{code, lang, text}` segments on ``` fences.
+
+    An unclosed fence (a stream still in progress) stays a code segment to the end.
+    """
+    segments: list[dict[str, Any]] = []
+    buf: list[str] = []
+    in_code = False
+    lang = ""
+
+    def flush() -> None:
+        body = "\n".join(buf)
+        if in_code or body.strip():
+            segments.append({"code": in_code, "lang": lang if in_code else "", "text": body})
+        buf.clear()
+
+    for line in text.split("\n"):
+        fence = FENCE_RE.match(line)
+        if fence and not in_code:
+            flush()
+            in_code, lang = True, fence.group(1)
+        elif fence and in_code and not fence.group(1):
+            flush()
+            in_code, lang = False, ""
+        else:
+            buf.append(line)
+    flush()
+    return segments
 
 
 def resolve_model(
@@ -90,6 +141,12 @@ class Bridge(QObject):
     errorOccurred = Signal(str)
     statusChanged = Signal()
     busyChanged = Signal()
+    modelChanged = Signal()
+    sessionChanged = Signal()
+    privateChanged = Signal()
+    diagnosticsChanged = Signal()
+    streamAborted = Signal()
+    conversationReset = Signal()
 
     def __init__(
         self,
@@ -108,19 +165,54 @@ class Bridge(QObject):
         self._status = "Connecting…"
         self._busy = False
         self._lock = threading.Lock()
+        self._private = False
+        self._generation = 0
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._abort_requested = False
+        self._first_token_ms = 0
+        self._prompts: list[str] = []
+        self._prompt_index: int | None = None
+        self._turn: dict[str, Any] = {}
 
     # -- properties exposed to QML -------------------------------------------------
     @Property(str, notify=statusChanged)
     def status(self) -> str:
         return self._status
 
-    @Property(str, constant=True)
+    @Property(str, notify=modelChanged)
     def modelName(self) -> str:
         return self._model
 
-    @Property(str, constant=True)
+    @Property(str, notify=sessionChanged)
     def sessionId(self) -> str:
         return self._session_id
+
+    @Property(bool, notify=privateChanged)
+    def privateMode(self) -> bool:
+        return self._private
+
+    @Property(str, constant=True)
+    def transport(self) -> str:
+        return f"unix:{self._uds_path}" if self._uds_path else f"tcp:{self._base_url[7:]}"
+
+    @Property("QVariantMap", notify=diagnosticsChanged)
+    def diagnostics(self) -> dict[str, Any]:
+        """Session/model/transport plus metrics of the latest turn (empty values before one)."""
+        info: dict[str, Any] = {
+            "sessionId": self._session_id,
+            "model": self._model,
+            "transport": self.transport,
+            "status": self._status,
+            "private": self._private,
+            "promptChars": 0,
+            "replyChars": 0,
+            "latencyMs": 0,
+            "firstTokenMs": 0,
+            "outcome": "",
+        }
+        info.update(self._turn)
+        return info
 
     @Property(bool, notify=busyChanged)
     def busy(self) -> bool:
@@ -142,6 +234,8 @@ class Bridge(QObject):
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json", "X-Session-Id": self._session_id}
+        if self._private:
+            headers[PRIVATE_HEADER] = "true"
         if self._config.api_key:
             headers["Authorization"] = f"Bearer {self._config.api_key}"
         return headers
@@ -165,8 +259,12 @@ class Bridge(QObject):
             ok = False
         self._set_status(status_label(self._uds_path, self._base_url) if ok else "Disconnected")
 
-    async def _stream(self, messages: list[dict[str, str]]) -> None:
-        """Stream one completion; emits chunk/finished/error signals, never raises httpx errors."""
+    async def _stream(self, messages: list[dict[str, str]], generation: int | None = None) -> None:
+        """Stream one completion; emits chunk/finished/error/aborted signals, never raises httpx errors.
+
+        `generation` ties the turn to the conversation it started in: if the conversation was
+        reset meanwhile, history is left alone (the new session must stay clean).
+        """
         body: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
@@ -175,6 +273,9 @@ class Bridge(QObject):
         }
         parts: list[str] = []
         error: str | None = None
+        aborted = False
+        started = time.perf_counter()
+        self._first_token_ms = 0
         try:
             async with self.make_client() as client:
                 async with client.stream("POST", CHAT_PATH, json=body, headers=self._headers()) as resp:
@@ -182,22 +283,45 @@ class Bridge(QObject):
                         detail = (await resp.aread()).decode("utf-8", "replace").strip()
                         error = f"HTTP {resp.status_code}: {detail[:300]}" if detail else f"HTTP {resp.status_code}"
                     else:
-                        error = await self._consume(resp, parts)
+                        error = await self._consume(resp, parts, started)
                         self._set_status(status_label(self._uds_path, self._base_url))
+        except asyncio.CancelledError:
+            aborted = True
         except httpx.ConnectError as exc:
             self._set_status("Disconnected")
             error = f"Cannot reach Cortext daemon: {exc}"
         except httpx.HTTPError as exc:
             error = f"Request failed: {exc}"
+        current = generation is None or generation == self._generation
+        if current:
+            self._turn = {
+                "promptChars": len(messages[-1]["content"]) if messages else 0,
+                "replyChars": sum(len(p) for p in parts),
+                "latencyMs": int((time.perf_counter() - started) * 1000),
+                "firstTokenMs": self._first_token_ms,
+                "outcome": "aborted" if aborted else ("error" if error is not None else "ok"),
+            }
+            self.diagnosticsChanged.emit()
+        if aborted:
+            if current:
+                if parts:
+                    self._history.append({"role": "assistant", "content": "".join(parts)})
+                elif self._history and self._history[-1]["role"] == "user":
+                    self._history.pop()
+            self.streamAborted.emit()
+            return
         if error is not None:
-            if self._history and self._history[-1]["role"] == "user":
+            if current and self._history and self._history[-1]["role"] == "user":
                 self._history.pop()
             self.errorOccurred.emit(error)
             return
-        self._history.append({"role": "assistant", "content": "".join(parts)})
+        if current:
+            self._history.append({"role": "assistant", "content": "".join(parts)})
         self.streamFinished.emit()
 
-    async def _consume(self, resp: httpx.Response, parts: list[str]) -> str | None:
+    async def _consume(
+        self, resp: httpx.Response, parts: list[str], started: float | None = None
+    ) -> str | None:
         """Relay SSE tokens; returns an error message, or None on a clean finish."""
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         buffer = ""
@@ -208,6 +332,7 @@ class Bridge(QObject):
             for line in lines:
                 kind, value = parse_sse_line(line)
                 if kind == "token":
+                    self._note_first_token(parts, started)
                     parts.append(value)
                     self.chunkReceived.emit(value)
                 elif kind == "error":
@@ -217,19 +342,41 @@ class Bridge(QObject):
         buffer += decoder.decode(b"", final=True)
         kind, value = parse_sse_line(buffer)
         if kind == "token":
+            self._note_first_token(parts, started)
             parts.append(value)
             self.chunkReceived.emit(value)
         elif kind == "error":
             return value
         return None
 
+    def _note_first_token(self, parts: list[str], started: float | None) -> None:
+        if not parts and started is not None:
+            self._first_token_ms = int((time.perf_counter() - started) * 1000)
+
     def _run_async(
-        self, coro_factory: Callable[[], Any], on_done: Callable[[], None] | None = None
+        self,
+        coro_factory: Callable[[], Any],
+        on_done: Callable[[], None] | None = None,
+        cancellable: bool = False,
     ) -> threading.Thread:
+        async def runner() -> None:
+            if cancellable:
+                with self._lock:
+                    self._loop = asyncio.get_running_loop()
+                    self._task = asyncio.current_task()
+                    if self._abort_requested:
+                        self._task.cancel()  # abort arrived before the task existed
+            await coro_factory()
+
         def target() -> None:
             try:
-                asyncio.run(coro_factory())
+                asyncio.run(runner())
+            except asyncio.CancelledError:
+                pass
             finally:
+                if cancellable:
+                    with self._lock:
+                        self._loop = self._task = None
                 if on_done:
                     on_done()
 
@@ -246,17 +393,118 @@ class Bridge(QObject):
         with self._lock:
             if self._busy:
                 return
+            self._abort_requested = False
             self._set_busy(True)
+        self._remember(text)
         self._history.append({"role": "user", "content": text})
         messages = list(self._history)
-        self._run_async(lambda: self._stream(messages), on_done=lambda: self._set_busy(False))
+        generation = self._generation
+        self._run_async(
+            lambda: self._stream(messages, generation),
+            on_done=lambda: self._set_busy(False),
+            cancellable=True,
+        )
 
     @Slot()
     def checkConnection(self) -> None:
         self._run_async(self._check)
 
+    @Slot(result=bool)
+    def abort(self) -> bool:
+        """Cancel the in-flight stream (if any); partial output is kept. True if one was running."""
+        with self._lock:
+            if not self._busy:
+                return False
+            self._abort_requested = True
+            if self._loop is not None and self._task is not None:
+                self._loop.call_soon_threadsafe(self._task.cancel)
+            return True
+
     @Slot()
     def newConversation(self) -> None:
-        if not self._busy:
-            self._history.clear()
-            self._session_id = f"ui-{uuid.uuid4().hex[:12]}"
+        """Drop history, abort any running turn and start a fresh session id immediately."""
+        self._generation += 1
+        if self._busy:
+            self.abort()
+        self._history.clear()
+        self._turn = {}
+        self._session_id = f"ui-{uuid.uuid4().hex[:12]}"
+        self.sessionChanged.emit()
+        self.diagnosticsChanged.emit()
+        self.conversationReset.emit()
+
+    @Slot(str)
+    def setModel(self, name: str) -> None:
+        name = name.strip()
+        if name and name != self._model:
+            self._model = name
+            self.modelChanged.emit()
+            self.diagnosticsChanged.emit()
+
+    @Slot(bool)
+    def setPrivateMode(self, enabled: bool) -> None:
+        if enabled != self._private:
+            self._private = enabled
+            self.privateChanged.emit()
+            self.diagnosticsChanged.emit()
+
+    @Slot(str, result=str)
+    def runCommand(self, text: str) -> str:
+        """Execute a client-side slash command; returns its feedback, or "" for a normal prompt.
+
+        Commands never reach the daemon or the upstream model.
+        """
+        parsed = parse_command(text)
+        if parsed is None:
+            return ""
+        name, arg = parsed
+        self._remember(text.strip())
+        if name == "new":
+            self.newConversation()
+            return "Started a new session."
+        if name == "private":
+            value = arg.lower()
+            if value not in ("on", "off"):
+                state = "on" if self._private else "off"
+                return f"Private mode is {state}. Usage: /private on|off"
+            self.setPrivateMode(value == "on")
+            return f"Private context {'enabled' if self._private else 'disabled'}."
+        if name == "model":
+            if not arg:
+                return f"Model: {self._model}. Usage: /model <name>"
+            self.setModel(arg)
+            return f"Model set to {self._model}."
+        if name == "help":
+            return HELP_TEXT
+        return f"Unknown command /{name}. {HELP_TEXT}"
+
+    # -- input history (Up/Down in the input bar) ---------------------------------------
+    def _remember(self, text: str) -> None:
+        if text and (not self._prompts or self._prompts[-1] != text):
+            self._prompts.append(text)
+            del self._prompts[:-HISTORY_LIMIT]
+        self._prompt_index = None
+
+    @Slot(result=str)
+    def historyPrevious(self) -> str:
+        if not self._prompts:
+            return ""
+        if self._prompt_index is None:
+            self._prompt_index = len(self._prompts) - 1
+        else:
+            self._prompt_index = max(0, self._prompt_index - 1)
+        return self._prompts[self._prompt_index]
+
+    @Slot(result=str)
+    def historyNext(self) -> str:
+        if self._prompt_index is None:
+            return ""
+        self._prompt_index += 1
+        if self._prompt_index >= len(self._prompts):
+            self._prompt_index = None
+            return ""
+        return self._prompts[self._prompt_index]
+
+    @Slot(str, result="QVariantList")
+    def segments(self, text: str) -> list[dict[str, Any]]:
+        return split_markdown(text)

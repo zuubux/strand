@@ -19,12 +19,65 @@ ApplicationWindow {
     readonly property color textColor: "#E6E9ED"
     readonly property color dim: "#7F8A96"
     readonly property color accent: "#3DAEE9"
+    readonly property color codeBg: "#0E1114"
+    readonly property color codeBorder: "#3A4452"
+    readonly property string monoFamily: "monospace"
+
+    property bool drawerOpen: false
+    // True while Up/Down is stepping through previously sent prompts.
+    property bool browsingHistory: false
 
     ListModel { id: transcript }
 
+    function note(message) {
+        transcript.append({ role: "note", body: message, pending: false })
+    }
+
+    function newSession() {
+        // The bridge aborts a running turn, rotates session_id and emits conversationReset.
+        bridge.newConversation()
+        input.text = ""
+        input.forceActiveFocus()
+    }
+
+    function toggleDrawer() { drawerOpen = !drawerOpen }
+
+    // Esc: stop the running stream; otherwise clear the input.
+    function handleEscape() {
+        if (bridge.busy)
+            bridge.abort()
+        else
+            input.text = ""
+        browsingHistory = false
+    }
+
+    function historyStep(older) {
+        if (older && input.text.length > 0 && !browsingHistory)
+            return false
+        if (!older && !browsingHistory)
+            return false
+        var value = older ? bridge.historyPrevious() : bridge.historyNext()
+        browsingHistory = older || value.length > 0
+        input.text = value
+        input.cursorPosition = input.length
+        return true
+    }
+
     function send() {
         var text = input.text.trim()
-        if (text.length === 0 || bridge.busy)
+        if (text.length === 0)
+            return
+        browsingHistory = false
+        if (text.charAt(0) === "/") {
+            // Client-side commands never leave the machine.
+            var feedback = bridge.runCommand(text)
+            if (feedback.length > 0) {
+                input.text = ""
+                note(feedback)
+                return
+            }
+        }
+        if (bridge.busy)
             return
         transcript.append({ role: "user", body: text, pending: false })
         transcript.append({ role: "assistant", body: "", pending: true })
@@ -54,13 +107,114 @@ ApplicationWindow {
             var partial = last >= 0 ? transcript.get(last).body : ""
             root.finishPending((partial.length > 0 ? partial + "\n\n" : "") + "Error: " + message)
         }
+        function onStreamAborted() {
+            var last = transcript.count - 1
+            var partial = last >= 0 ? transcript.get(last).body : ""
+            root.finishPending(partial.length > 0 ? partial + "\n\n_[stopped]_" : "_[stopped]_")
+        }
+        function onConversationReset() { transcript.clear() }
         function onBusyChanged() { if (!bridge.busy) input.forceActiveFocus() }
     }
 
-    ColumnLayout {
+    Component {
+        id: textBlock
+        TextEdit {
+            readOnly: true
+            selectByMouse: true
+            wrapMode: TextEdit.Wrap
+            textFormat: TextEdit.MarkdownText
+            text: segment.text
+            color: root.textColor
+            selectionColor: root.accent
+            font.pixelSize: 14
+        }
+    }
+
+    Component {
+        id: codeBlock
+        Rectangle {
+            implicitHeight: codeText.implicitHeight + (langLabel.visible ? langLabel.height : 0) + 16
+            implicitWidth: codeText.implicitWidth + 20
+            radius: 6
+            color: root.codeBg
+            border.color: root.codeBorder
+            Label {
+                id: langLabel
+                visible: segment.lang.length > 0
+                x: 10
+                y: 4
+                text: segment.lang
+                color: root.accent
+                font.family: root.monoFamily
+                font.pixelSize: 10
+            }
+            TextEdit {
+                id: codeText
+                x: 10
+                y: (langLabel.visible ? langLabel.height + 4 : 0) + 8
+                width: parent.width - 20
+                readOnly: true
+                selectByMouse: true
+                wrapMode: TextEdit.WrapAnywhere
+                textFormat: TextEdit.PlainText
+                text: segment.text
+                color: "#D6DEE7"
+                selectionColor: root.accent
+                font.family: root.monoFamily
+                font.pixelSize: 13
+            }
+        }
+    }
+
+    Shortcut { sequence: "Ctrl+L"; context: Qt.WindowShortcut; onActivated: root.newSession() }
+    Shortcut { sequence: "Ctrl+D"; context: Qt.WindowShortcut; onActivated: root.toggleDrawer() }
+    Shortcut { sequence: "Escape"; context: Qt.WindowShortcut; onActivated: root.handleEscape() }
+
+    RowLayout {
         anchors.fill: parent
         anchors.margins: 1
         spacing: 0
+
+    ColumnLayout {
+        Layout.fillWidth: true
+        Layout.fillHeight: true
+        spacing: 0
+
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 26
+            color: "#12151A"
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 12
+                anchors.rightMargin: 6
+                Label {
+                    text: bridge.privateMode ? "Cortext  ·  private" : "Cortext"
+                    color: root.dim
+                    font.pixelSize: 11
+                }
+                Item { Layout.fillWidth: true }
+                ToolButton {
+                    id: drawerButton
+                    objectName: "drawerButton"
+                    Layout.preferredWidth: 26
+                    Layout.preferredHeight: 22
+                    text: "ⓘ"
+                    opacity: root.drawerOpen || hovered ? 1.0 : 0.55
+                    onClicked: root.toggleDrawer()
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Diagnostics (Ctrl+D)"
+                    contentItem: Label {
+                        text: drawerButton.text
+                        color: root.drawerOpen ? root.accent : root.dim
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                        font.pixelSize: 14
+                    }
+                    background: null
+                }
+            }
+        }
 
         ListView {
             id: list
@@ -99,26 +253,48 @@ ApplicationWindow {
 
                 Rectangle {
                     id: bubble
-                    x: row.isUser ? row.width - width - 16 : 16
+                    readonly property bool isNote: row.role === "note"
+                    x: isNote ? 16 : (row.isUser ? row.width - width - 16 : 16)
                     width: Math.min(row.width * 0.82, Math.max(60, content.implicitWidth + 28))
                     height: content.implicitHeight + 20
                     radius: 12
-                    color: row.isUser ? root.userBubble : root.botBubble
-                    border.color: row.isUser ? "transparent" : root.border
+                    color: isNote ? "transparent" : (row.isUser ? root.userBubble : root.botBubble)
+                    border.color: row.isUser || isNote ? "transparent" : root.border
 
-                    TextEdit {
+                    Column {
                         id: content
                         x: 14
                         y: 10
                         width: bubble.width - 28
-                        readOnly: true
-                        selectByMouse: true
-                        wrapMode: TextEdit.Wrap
-                        textFormat: row.isUser ? TextEdit.PlainText : TextEdit.MarkdownText
-                        text: row.pending && row.body.length === 0 ? "…" : row.body
-                        color: root.textColor
-                        selectionColor: root.accent
-                        font.pixelSize: 14
+                        spacing: 6
+
+                        // User text and local notes are plain text.
+                        TextEdit {
+                            id: plain
+                            visible: row.isUser || bubble.isNote
+                            width: visible ? parent.width : 0
+                            height: visible ? implicitHeight : 0
+                            readOnly: true
+                            selectByMouse: true
+                            wrapMode: TextEdit.Wrap
+                            textFormat: TextEdit.PlainText
+                            text: row.body
+                            color: bubble.isNote ? root.dim : root.textColor
+                            font.italic: bubble.isNote
+                            selectionColor: root.accent
+                            font.pixelSize: 14
+                        }
+
+                        // Assistant replies: markdown text blocks and fenced code blocks.
+                        Repeater {
+                            model: row.isUser || bubble.isNote ? [] : bridge.segments(row.pending && row.body.length === 0 ? "…" : row.body)
+                            delegate: Loader {
+                                required property var modelData
+                                width: content.width
+                                sourceComponent: modelData.code ? codeBlock : textBlock
+                                property var segment: modelData
+                            }
+                        }
                     }
                 }
             }
@@ -153,16 +329,22 @@ ApplicationWindow {
 
                     TextArea.flickable: TextArea {
                         id: input
+                        objectName: "messageInput"
                         placeholderText: "Message Cortext…  (Enter to send, Shift+Enter for newline)"
                         placeholderTextColor: root.dim
                         color: root.textColor
                         wrapMode: TextArea.Wrap
                         font.pixelSize: 14
                         enabled: !bridge.busy
+                        onTextChanged: if (text.length === 0) root.browsingHistory = false
                         background: null
 
                         Keys.onPressed: function(event) {
-                            if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+                            if (event.key === Qt.Key_Up && root.historyStep(true)) {
+                                event.accepted = true
+                            } else if (event.key === Qt.Key_Down && root.historyStep(false)) {
+                                event.accepted = true
+                            } else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
                                     && !(event.modifiers & Qt.ShiftModifier)) {
                                 event.accepted = true
                                 root.send()
@@ -197,6 +379,59 @@ ApplicationWindow {
                 Label { text: bridge.modelName; color: root.dim; font.pixelSize: 11 }
             }
         }
+    }
+
+    Rectangle { Layout.fillHeight: true; Layout.preferredWidth: root.drawerOpen ? 1 : 0; color: root.border }
+
+    Rectangle {
+        id: drawer
+        objectName: "drawer"
+        Layout.fillHeight: true
+        Layout.preferredWidth: root.drawerOpen ? 280 : 0
+        visible: Layout.preferredWidth > 0
+        clip: true
+        color: root.panel
+        Behavior on Layout.preferredWidth { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+
+        Column {
+            x: 14
+            y: 14
+            width: 252
+            spacing: 10
+            Label { text: "Diagnostics"; color: root.textColor; font.pixelSize: 14; font.bold: true }
+            Repeater {
+                model: [
+                    ["Session", bridge.diagnostics.sessionId],
+                    ["Model", bridge.diagnostics.model],
+                    ["Transport", bridge.diagnostics.transport],
+                    ["Status", bridge.diagnostics.status],
+                    ["Private context", bridge.diagnostics.private ? "on" : "off"],
+                    ["Last turn", bridge.diagnostics.outcome.length > 0 ? bridge.diagnostics.outcome : "—"],
+                    ["Prompt chars", String(bridge.diagnostics.promptChars)],
+                    ["Reply chars", String(bridge.diagnostics.replyChars)],
+                    ["First token", bridge.diagnostics.firstTokenMs + " ms"],
+                    ["Round trip", bridge.diagnostics.latencyMs + " ms"]
+                ]
+                delegate: Column {
+                    required property var modelData
+                    width: 252
+                    spacing: 1
+                    Label { text: modelData[0]; color: root.dim; font.pixelSize: 10 }
+                    TextEdit {
+                        width: parent.width
+                        readOnly: true
+                        selectByMouse: true
+                        wrapMode: TextEdit.WrapAnywhere
+                        text: modelData[1]
+                        color: root.textColor
+                        font.family: root.monoFamily
+                        font.pixelSize: 11
+                        selectionColor: root.accent
+                    }
+                }
+            }
+        }
+    }
     }
 
     Rectangle {

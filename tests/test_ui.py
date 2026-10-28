@@ -221,3 +221,270 @@ def test_bridge_uses_persisted_model_default(qapp, monkeypatch):
     assert Bridge(config=cfg).modelName == "gemini-3.6-flash"
     monkeypatch.setenv("CORTEXT_UI_MODEL", "override")
     assert Bridge(config=cfg).modelName == "override"
+
+
+# ---- slash commands, session reset, abort, input history, drawer -----------------------
+
+
+def test_parse_command():
+    from cortext.ui.bridge import parse_command
+
+    assert parse_command("/new") == ("new", "")
+    assert parse_command("  /Private   ON ") == ("private", "ON")
+    assert parse_command("/model gemini-3.6-flash") == ("model", "gemini-3.6-flash")
+    assert parse_command("hello /new") is None
+    assert parse_command("/etc/hosts is a file") is None  # paths are normal prompts
+    assert parse_command("/") is None
+
+
+def test_new_conversation_resets_session_and_history(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("ok")))
+    seen = []
+    b.sessionChanged.connect(lambda: seen.append(b.sessionId))
+    resets = []
+    b.conversationReset.connect(lambda: resets.append(1))
+    old = b.sessionId
+    b._history.append({"role": "user", "content": "x"})
+    b.newConversation()
+    assert b.sessionId != old and b.sessionId.startswith("ui-")
+    assert seen == [b.sessionId] and resets == [1]
+    assert b.history == []
+    assert b.diagnostics["sessionId"] == b.sessionId
+
+
+def test_run_command_new_private_model(qapp):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, content=sse("ok"))
+
+    b = make_bridge(handler)
+    old = b.sessionId
+    assert b.runCommand("/new") and b.sessionId != old
+    assert b.runCommand("hello") == ""  # not a command: caller sends it upstream
+    assert b.runCommand("/private") .startswith("Private mode is off")
+    assert b.runCommand("/private maybe").startswith("Private mode is off")
+    assert not b.privateMode
+
+    asyncio.run(b._stream([{"role": "user", "content": "a"}]))
+    assert "x-cortext-allow-private" not in requests[-1].headers
+    assert b.runCommand("/private on") and b.privateMode
+    asyncio.run(b._stream([{"role": "user", "content": "a"}]))
+    assert requests[-1].headers["x-cortext-allow-private"] == "true"
+    assert b.runCommand("/private OFF") and not b.privateMode
+    asyncio.run(b._stream([{"role": "user", "content": "a"}]))
+    assert "x-cortext-allow-private" not in requests[-1].headers
+
+    assert "test-model" in b.runCommand("/model")
+    assert "gemini-x" in b.runCommand("/model  gemini-x ")
+    assert b.modelName == "gemini-x"
+    asyncio.run(b._stream([{"role": "user", "content": "a"}]))
+    assert json.loads(requests[-1].content)["model"] == "gemini-x"
+    assert "Unknown command /bogus" in b.runCommand("/bogus")
+    assert len(requests) == 4  # commands never hit the transport
+
+
+def test_commands_are_never_sent_upstream(qapp):
+    requests = []
+    b = make_bridge(lambda r: requests.append(r) or httpx.Response(200, content=sse("ok")))
+    for text in ("/new", "/private on", "/model m2", "/help", "/nope"):
+        assert b.runCommand(text)
+    assert requests == [] and b.history == []
+
+
+def test_input_history_navigation(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("ok")))
+    assert b.historyPrevious() == "" and b.historyNext() == ""
+    for text in ("one", "two", "three"):
+        b._remember(text)
+    b._remember("three")  # consecutive duplicate ignored
+    assert [b.historyPrevious() for _ in range(4)] == ["three", "two", "one", "one"]
+    assert [b.historyNext() for _ in range(3)] == ["two", "three", ""]
+    assert b.historyNext() == ""
+    assert b.historyPrevious() == "three"  # restarts from the newest
+
+
+def test_diagnostics_record_latest_turn(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("Hel", "lo")))
+    changed = []
+    b.diagnosticsChanged.connect(lambda: changed.append(1))
+    assert b.diagnostics["outcome"] == "" and b.diagnostics["promptChars"] == 0
+    asyncio.run(b._stream([{"role": "user", "content": "hello!"}]))
+    d = b.diagnostics
+    assert d["promptChars"] == 6 and d["replyChars"] == 5 and d["outcome"] == "ok"
+    assert d["latencyMs"] >= d["firstTokenMs"] >= 0
+    assert d["model"] == "test-model" and d["transport"].startswith(("unix:", "tcp:"))
+    assert changed
+    asyncio.run(b._stream([{"role": "user", "content": "x"}]))
+    b2 = make_bridge(lambda r: httpx.Response(500, text="boom"))
+    asyncio.run(b2._stream([{"role": "user", "content": "x"}]))
+    assert b2.diagnostics["outcome"] == "error"
+
+
+def test_transport_property_reports_socket_path(tmp_path):
+    import socket as socketlib
+
+    path = str(tmp_path / "c.sock")
+    srv = socketlib.socket(socketlib.AF_UNIX)
+    srv.bind(path)
+    try:
+        b = Bridge(config=Config(socket_path=path), model="m")
+        assert b.transport == f"unix:{path}"
+    finally:
+        srv.close()
+    assert Bridge(config=Config(socket_path=str(tmp_path / "none")), model="m").transport.startswith("tcp:")
+
+
+class _HangingStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield sse("par", done=False)
+        await asyncio.sleep(30)
+        yield b""
+
+
+def _wait(predicate, timeout=5.0):
+    import time
+
+    end = time.time() + timeout
+    while time.time() < end and not predicate():
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_abort_stops_stream_keeps_partial_and_frees_input(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, stream=_HangingStream()))
+    events = collect(b)
+    aborted = []
+    b.streamAborted.connect(lambda: aborted.append(1))
+    assert b.abort() is False  # nothing running
+    b.sendMessage("hello")
+    assert _wait(lambda: any(e[0] == "chunk" for e in events))
+    assert b.busy and b.abort() is True
+    assert _wait(lambda: not b.busy)
+    QCoreApplication.processEvents()
+    assert aborted == [1]
+    assert not any(e[0] in ("done", "error") for e in events)
+    assert b.history[-1] == {"role": "assistant", "content": "par"}
+    assert b.diagnostics["outcome"] == "aborted"
+
+
+def test_new_conversation_during_stream_aborts_and_keeps_new_session_clean(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, stream=_HangingStream()))
+    events = collect(b)
+    b.sendMessage("hello")
+    assert _wait(lambda: any(e[0] == "chunk" for e in events))
+    b.newConversation()
+    assert _wait(lambda: not b.busy)
+    QCoreApplication.processEvents()
+    assert b.history == []  # the aborted turn did not leak into the new session
+
+
+def test_split_markdown_code_fences():
+    from cortext.ui.bridge import split_markdown
+
+    segs = split_markdown("Intro\n```python\nprint(1)\n```\nOutro")
+    assert [(s["code"], s["lang"], s["text"]) for s in segs] == [
+        (False, "", "Intro"),
+        (True, "python", "print(1)"),
+        (False, "", "Outro"),
+    ]
+    open_fence = split_markdown("a\n```\npartial")  # mid-stream: still a code block
+    assert [(s["code"], s["text"]) for s in open_fence] == [(False, "a"), (True, "partial")]
+    assert split_markdown("no code") == [{"code": False, "lang": "", "text": "no code"}]
+    assert split_markdown("") == []
+
+
+def test_geometry_roundtrip_with_qsettings(qapp, tmp_path):
+    from PySide6.QtCore import QSettings
+
+    from cortext.ui import app as app_mod
+
+    class Rect:
+        def intersects(self, other):
+            return True
+
+    class Screen:
+        def availableGeometry(self):
+            return Rect()
+
+    class Win:
+        def __init__(self, geom=(10, 20, 800, 600)):
+            self.geom = geom
+
+        x = lambda self: self.geom[0]  # noqa: E731
+        y = lambda self: self.geom[1]  # noqa: E731
+        width = lambda self: self.geom[2]  # noqa: E731
+        height = lambda self: self.geom[3]  # noqa: E731
+        minimumWidth = lambda self: 420  # noqa: E731
+        minimumHeight = lambda self: 360  # noqa: E731
+        screen = lambda self: Screen()  # noqa: E731
+
+        def setGeometry(self, *geom):
+            self.geom = geom
+
+    settings = QSettings(str(tmp_path / "s.ini"), QSettings.Format.IniFormat)
+    assert app_mod.restore_geometry(Win(), settings) is False  # nothing saved yet
+    app_mod.save_geometry(Win((11, 22, 900, 700)), settings)
+    reopened = QSettings(str(tmp_path / "s.ini"), QSettings.Format.IniFormat)
+    fresh = Win((0, 0, 1, 1))
+    assert app_mod.restore_geometry(fresh, reopened) is True
+    assert fresh.geom == (11, 22, 900, 700)
+    settings.setValue(app_mod.GEOMETRY_KEY, [0, 0, 10, 10])  # below the minimum size
+    assert app_mod.restore_geometry(Win(), settings) is False
+    settings.setValue(app_mod.GEOMETRY_KEY, "garbage")
+    assert app_mod.restore_geometry(Win(), settings) is False
+
+
+def _load_window(b):
+    from PySide6.QtCore import QUrl
+    from PySide6.QtQml import QQmlApplicationEngine
+    from PySide6.QtQuickControls2 import QQuickStyle
+
+    from cortext.ui.app import MAIN_QML
+
+    QQuickStyle.setStyle("Basic")
+    engine = QQmlApplicationEngine()
+    engine.rootContext().setContextProperty("bridge", b)
+    engine.load(QUrl.fromLocalFile(str(MAIN_QML)))
+    assert engine.rootObjects()
+    return engine, engine.rootObjects()[0]
+
+
+def test_qml_hotkey_actions_and_drawer(qapp):
+    from PySide6.QtCore import QMetaObject
+
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("ok")))
+    engine, win = _load_window(b)
+    assert win.property("drawerOpen") is False  # hidden by default
+    QMetaObject.invokeMethod(win, "toggleDrawer")
+    assert win.property("drawerOpen") is True
+    QMetaObject.invokeMethod(win, "toggleDrawer")
+    assert win.property("drawerOpen") is False
+
+    old = b.sessionId
+    QMetaObject.invokeMethod(win, "newSession")  # what Ctrl+L triggers
+    assert b.sessionId != old
+
+    input_item = win.findChild(object, "messageInput")
+    input_item.setProperty("text", "draft")
+    QMetaObject.invokeMethod(win, "handleEscape")  # idle Esc clears the input
+    assert input_item.property("text") == ""
+    engine.deleteLater()
+
+
+def test_qml_slash_command_is_handled_locally(qapp):
+    from PySide6.QtCore import QMetaObject
+
+    requests = []
+    b = make_bridge(lambda r: requests.append(r) or httpx.Response(200, content=sse("ok")))
+    engine, win = _load_window(b)
+    input_item = win.findChild(object, "messageInput")
+    assert input_item is not None
+    input_item.setProperty("text", "/model gemini-3.6-flash")
+    QMetaObject.invokeMethod(win, "send")
+    assert b.modelName == "gemini-3.6-flash"
+    assert input_item.property("text") == ""
+    assert b.history == [] and requests == []
+    engine.deleteLater()
