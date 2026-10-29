@@ -22,7 +22,33 @@ Check items off as they land. Every phase must keep `pytest -W error` green, ful
 - [x] **ROB-4 (D13, D14) Graph Traversal Privacy & Compactor Isolation**: `get_entity_subgraph` excludes private entities inside the recursive CTE, before `LIMIT`, so hidden nodes cannot consume hop/edge quota; the compactor's `_entities` omits private entities from the SLM prompt.
 - [x] **ROB-5 (D24, D27, D28) Concurrency Throttling & Numerical Stability Guards**: background distillation is bounded by `asyncio.Semaphore(4)`; `SessionLedger` caps active sessions (`max_sessions=1000`, LRU eviction) and `session_id` is limited to 128 chars (HTTP 400 beyond); `effective_priority` returns the undecayed `confidence * weight` for a non-finite or non-positive half-life.
 
-## Phase 4: Interface & Interaction Layer
-- [ ] **UI-1** Terminal REPL
-- [ ] **UI-2** Web Inspector
-- [ ] **UI-3** OmniBar Overlay
+## Phase 3b: Final Kernel Hardening
+- [x] **KRN-1 (C1) No private-context laundering**: an exchange served with `X-Cortext-Allow-Private: true` is never distilled (JSON and streaming); `DistillationEngine` also never rewrites an existing private entity.
+- [x] **KRN-2 (C2) Ingress & TCP hardening**: `POST /v1/chat/completions` bodies are capped at 10 MiB (`MAX_REQUEST_BYTES`, HTTP 413, enforced on `Content-Length` and while streaming chunked bodies); pathologically nested JSON is HTTP 400; `daemon.main` logs a security warning when TCP binds beyond loopback with no `api_key`.
+- [x] **KRN-3 (C3) Log leak prevention**: the "Incoming query" log line carries the length plus an 80-char preview of the *sanitized* query.
+- [x] **KRN-4 (C4) Orphan vector sweep**: `run_migrations` deletes `entity_embeddings` rows with no matching entity whenever vec is enabled.
+- [x] **KRN-5 (C6) Unified privacy predicate**: one `common.is_private(archetype, metadata)` (case-insensitive archetype, truthy `private` flag, fail-closed on corrupt metadata) used by `resolver`, `compactor` and `distill`; `db.PRIVATE_ENTITY_SQL` is its SQL twin inside the subgraph CTE, with a parity test.
+- [x] **KRN-6 (C5, D1) Stream parsing resilience & reasoning tags**: `strip_think` removes `<think>`, `<thinking>`, `<thought>` and `<reasoning>` blocks; `_stream_text` extracts text from list-form `delta.content` parts instead of dropping the chunk.
+
+## Phase 4: Interface & Interaction Layer (GUI)
+- [x] **UI-1 Desktop Workbench (`cortext-gui`)**: Native PySide6 / QML chat window communicating over UDS (`cortext.sock`) or TCP. Includes diagnostics drawer (`Ctrl+D`), session rotation (`Ctrl+L`), abort (`Esc`), command history (`Up`/`Down`), markdown/code styling, and window geometry persistence.
+- [x] **UI-2 Local Slash Commands**: `/new`, `/private <on|off>`, `/model <name>`, and `/help` intercepted client-side without polluting upstream context.
+- [ ] **UI-3 System Tray & Global Hotkey**: Ambient background daemon presence with global hotkey launcher.
+
+## Phase 5: The Personality Matrix & Interaction Tuning
+- [x] **PER-1 Matrix Archetypes (`trait`, `directive`, `preference`)**: End-to-end substrate for behavioral memory. Permitted in schema, extracted by Model B (with automatic edge deprecation for conflicting rules), tracked by `SessionLedger` (injected once per session), and categorized hierarchically in `resolver.py`.
+- [x] **PER-2 Bedrock Persona Anchor**: `persona_prompt` configured via `config.json` (`CORTEXT_PERSONA_PROMPT`), injected as synthetic entity `-1` on Turn 1 under `[Persona Stance]`.
+- [x] **PER-3 Structured Proxy Metric Logs**: Log line accurately reports `entities=X edges=Y traits=Z directives=A preferences=B` or `(empty)`.
+
+## Phase 6: Cognitive Partnership & Proactive Reasoning
+- [x] **COG-1 Proactive Contradiction & Reality Guard**:
+  - In `resolver.py`: Detect direct attribute conflicts between incoming prompt claims and grounded active edges (e.g. user specifies "5-speed clutch" for a car recorded with a 6-speed transmission).
+  - Inject a specialized `[Reality Check]` warning into the session context delta to prompt the model to clarify discrepancies rather than blindly agree.
+- [x] **COG-2 Conversational Grounding & Onboarding**:
+  - Ambient first-run detection or `/onboard` / `/bootstrap` command.
+  - Guided, organic conversational interview (subtle steering rather than rigid questionnaires) to seed the `User` (`Nic`) anchor node, hardware orbit (ONYX, Promethean), active projects, key collaborators, and core interaction stances.
+- [ ] **COG-3 Episodic Stitching & Project Continuity**:
+  - Cross-reference recent uncompacted episodes (last 7 days) matching queried entities to inject recent working context into new sessions.
+- [ ] **COG-4 Shared Lore & Episodic Vernacular**:
+  - Defer until > 200 operational episodes accumulate.
+  - Background compaction (`compactor.py`) distills shared debugging milestones and inside shorthand into entity lore metadata.

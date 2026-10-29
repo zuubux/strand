@@ -6,7 +6,15 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .common import MAX_SUMMARY_LEN, MODEL_CONFIDENCE, aliases_of, is_private, load_metadata, strip_think
+from .common import (
+    MAX_SUMMARY_LEN,
+    MODEL_CONFIDENCE,
+    VALID_ARCHETYPES,
+    aliases_of,
+    is_private,
+    load_metadata,
+    strip_think,
+)
 from .db import DatabaseManager
 from .logging import get_logger
 from .sanitize import is_secret_token, sanitize_text
@@ -23,7 +31,6 @@ Extraction = dict[str, Any]
 Extractor = Callable[[str, str], Extraction | Awaitable[Extraction]]
 
 DEFAULT_ARCHETYPE = "concept"
-VALID_ARCHETYPES = frozenset({"person", "project", "system", "vehicle", "concept"})
 
 USER_ORIGIN = "user_explicit"
 MODEL_ORIGIN = "model_inferred"

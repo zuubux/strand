@@ -2,6 +2,8 @@
 
 import re
 
+from .common import PERSONALITY_ARCHETYPES
+
 DISCOURSE_MARKERS = frozenset(
     """
     however therefore moreover furthermore nevertheless nonetheless meanwhile otherwise
@@ -73,13 +75,16 @@ def is_valid_entity_name(name: str, archetype: str = "concept") -> bool:
     - Single stop-words are rejected for the "concept" archetype (case-insensitive).
     - Single-word names shorter than 3 characters are rejected unless whitelisted.
     - Multi-word names (e.g. "BMW E34", "Database Migration") are always accepted.
+    - Personality archetypes (trait, directive, preference) accept any descriptive or
+      hyphenated rule identifier (e.g. "no-apologies", "Never apologize"); only names
+      without a word character are rejected.
     """
     if not isinstance(name, str):
         return False
     words = name.split()
     if not words or not _WORD_RE.search(name):
         return False
-    if len(words) > 1:
+    if len(words) > 1 or archetype in PERSONALITY_ARCHETYPES:
         return True
     word = words[0]
     folded = word.casefold()

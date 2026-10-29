@@ -9,6 +9,11 @@ import re
 from typing import Any
 
 EMBEDDING_DIM = 384
+
+# Personality Matrix archetypes: interaction rules stored as ordinary entity rows.
+PERSONALITY_ARCHETYPES = frozenset({"trait", "directive", "preference"})
+FACTUAL_ARCHETYPES = frozenset({"person", "project", "system", "vehicle", "concept"})
+VALID_ARCHETYPES = FACTUAL_ARCHETYPES | PERSONALITY_ARCHETYPES
 MIN_EDGE_CONFIDENCE = 0.2  # edges below this are treated as deprecated and never recalled
 MODEL_CONFIDENCE = 0.6  # default confidence for facts the assistant (not the user) asserted
 MAX_SUMMARY_LEN = 300

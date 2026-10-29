@@ -35,6 +35,7 @@ def build_app(config: Config):
         distance_threshold=config.distance_threshold,
         decay_enabled=config.decay_enabled,
         decay_half_life_days=config.decay_half_life_days,
+        persona_prompt=config.persona_prompt,
     )
     extractor = None
     if config.extractor_model:

@@ -437,6 +437,100 @@ def test_geometry_roundtrip_with_qsettings(qapp, tmp_path):
     assert app_mod.restore_geometry(Win(), settings) is False
 
 
+def test_size_persistence_roundtrip_and_clamp(qapp, tmp_path):
+    from PySide6.QtCore import QSettings
+
+    from cortext.ui import app as app_mod
+
+    class Win:
+        def __init__(self, w=800, h=700):
+            self.w, self.h = w, h
+
+        width = lambda self: self.w  # noqa: E731
+        height = lambda self: self.h  # noqa: E731
+
+        def setWidth(self, v):
+            self.w = v
+
+        def setHeight(self, v):
+            self.h = v
+
+    path = str(tmp_path / "size.ini")
+    settings = QSettings(path, QSettings.Format.IniFormat)
+    assert app_mod.restore_size(Win(), settings) is False  # nothing saved
+    app_mod.save_size(Win(910, 730), settings)
+    reopened = QSettings(path, QSettings.Format.IniFormat)  # proves the sync() flush
+    fresh = Win(1, 1)
+    assert app_mod.restore_size(fresh, reopened) is True
+    assert (fresh.w, fresh.h) == (910, 730)
+    app_mod.save_size(Win(10, 20), settings)
+    small = Win(1, 1)
+    assert app_mod.restore_size(small, settings) is True
+    assert (small.w, small.h) == (app_mod.MIN_WIDTH, app_mod.MIN_HEIGHT)
+    settings.setValue(app_mod.WIDTH_KEY, "junk")
+    assert app_mod.restore_size(Win(), settings) is False
+
+
+def test_restore_window_wayland_skips_position_and_survives_errors(qapp, tmp_path):
+    from PySide6.QtCore import QSettings
+
+    from cortext.ui import app as app_mod
+
+    class Win:
+        w, h = 1, 1
+        positioned = False
+
+        def setWidth(self, v):
+            self.w = v
+
+        def setHeight(self, v):
+            self.h = v
+
+        def setGeometry(self, *a):
+            self.positioned = True
+
+        def minimumWidth(self):
+            raise RuntimeError("compositor rejected")
+
+    settings = QSettings(str(tmp_path / "w.ini"), QSettings.Format.IniFormat)
+    settings.setValue(app_mod.WIDTH_KEY, 900)
+    settings.setValue(app_mod.HEIGHT_KEY, 800)
+    settings.setValue(app_mod.GEOMETRY_KEY, [5, 5, 900, 800])
+    win = Win()
+    app_mod.restore_window(win, settings, "wayland")
+    assert (win.w, win.h) == (900, 800) and not win.positioned
+    win = Win()
+    app_mod.restore_window(win, settings, "xcb")  # positioning raises: swallowed, size kept
+    assert (win.w, win.h) == (900, 800)
+
+
+class _ExplodingStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield sse("par", done=False)
+        raise RuntimeError("boom during teardown")
+
+
+def test_unexpected_stream_exception_is_isolated(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, stream=_ExplodingStream()))
+    events = collect(b)
+    b.sendMessage("hello")
+    assert _wait(lambda: any(e[0] == "error" for e in events))
+    assert _wait(lambda: not b.busy)
+    assert b.history == []  # rolled back like any failed turn
+
+
+def test_abort_after_loop_closed_is_silent(qapp):
+    class DeadLoop:
+        def call_soon_threadsafe(self, fn):
+            raise RuntimeError("Event loop is closed")
+
+    b = make_bridge(lambda r: httpx.Response(200))
+    b._busy = True
+    b._loop, b._task = DeadLoop(), type("T", (), {"cancel": lambda self: None})()
+    assert b.abort() is True  # no exception escapes
+    b._busy = False
+
+
 def _load_window(b):
     from PySide6.QtCore import QUrl
     from PySide6.QtQml import QQmlApplicationEngine
@@ -487,4 +581,42 @@ def test_qml_slash_command_is_handled_locally(qapp):
     assert b.modelName == "gemini-3.6-flash"
     assert input_item.property("text") == ""
     assert b.history == [] and requests == []
+    engine.deleteLater()
+
+
+def test_qml_note_bubbles_do_not_collapse(qapp):
+    """Local /help and /private feedback must wrap at a sane width, not one word per line."""
+    from PySide6.QtCore import QMetaObject, Qt, Q_ARG
+    from cortext.ui.bridge import HELP_TEXT
+
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    win.setWidth(760)
+    win.setHeight(640)
+    win.show()
+    for text in (b.runCommand("/help"), b.runCommand("/private on"), "ok"):
+        QMetaObject.invokeMethod(win, "note", Qt.ConnectionType.DirectConnection, Q_ARG("QVariant", text))
+    for _ in range(5):
+        QCoreApplication.processEvents()
+
+    def walk(item):
+        for child in item.childItems():
+            yield child
+            yield from walk(child)
+
+    bubbles = [i for i in walk(win.contentItem()) if i.objectName() == "bubble"]
+    assert len(bubbles) == 3
+    by_len = sorted(bubbles, key=lambda i: i.property("naturalWidth"))
+    short, medium, long_ = by_len[0], by_len[1], by_len[2]
+    list_width = 760 - 2
+    for bubble in bubbles:
+        assert 60 <= bubble.width() <= list_width  # valid, bounded by the list
+    assert long_.width() >= 400  # the long help text uses the available width
+    assert long_.width() > 4 * short.width() or short.width() >= 120
+    # Wrapped, so it is several lines tall but nowhere near one-word-per-line.
+    words = len(HELP_TEXT.split())
+    line_height = 14 * 1.2
+    assert long_.height() < words * line_height * 0.5
+    assert long_.height() > 2 * line_height  # it did wrap into multiple lines
+    win.hide()
     engine.deleteLater()

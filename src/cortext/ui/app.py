@@ -12,6 +12,11 @@ MAIN_QML = QML_DIR / "main.qml"
 SETTINGS_ORG = "cortext"
 SETTINGS_APP = "cortext-gui"
 GEOMETRY_KEY = "window/geometry"
+WIDTH_KEY = "window/width"
+HEIGHT_KEY = "window/height"
+MIN_WIDTH = 480
+MIN_HEIGHT = 500
+SAVE_DELAY_MS = 300
 
 
 def make_settings():
@@ -37,9 +42,46 @@ def restore_geometry(window, settings) -> bool:
     return True
 
 
+def save_size(window, settings) -> None:
+    """Persist width/height (the only geometry a Wayland compositor lets clients own)."""
+    settings.setValue(WIDTH_KEY, int(window.width()))
+    settings.setValue(HEIGHT_KEY, int(window.height()))
+    settings.sync()
+
+
+def restore_size(window, settings) -> bool:
+    """Apply saved width/height clamped to MIN_WIDTH/MIN_HEIGHT; False if absent or invalid."""
+    try:
+        width = int(settings.value(WIDTH_KEY))
+        height = int(settings.value(HEIGHT_KEY))
+    except (TypeError, ValueError):
+        return False
+    window.setWidth(max(width, MIN_WIDTH))
+    window.setHeight(max(height, MIN_HEIGHT))
+    return True
+
+
 def save_geometry(window, settings) -> None:
+    save_size(window, settings)
     settings.setValue(GEOMETRY_KEY, [window.x(), window.y(), window.width(), window.height()])
     settings.sync()
+
+
+def restore_window(window, settings, platform: str = "") -> None:
+    """Restore size everywhere; restore (x, y) only where the platform allows it.
+
+    Wayland compositors ignore client positioning, so position is skipped there, and any
+    failure while positioning is swallowed.
+    """
+    if platform.lower() != "wayland":
+        try:
+            restore_geometry(window, settings)
+        except Exception:  # noqa: BLE001 - positioning is best effort
+            pass
+    try:
+        restore_size(window, settings)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _rect(x: int, y: int, width: int, height: int):
@@ -49,7 +91,7 @@ def _rect(x: int, y: int, width: int, height: int):
 
 
 def main(argv: list[str] | None = None) -> int:
-    from PySide6.QtCore import QUrl
+    from PySide6.QtCore import QTimer, QUrl
     from PySide6.QtGui import QGuiApplication
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
@@ -70,8 +112,21 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     window = engine.rootObjects()[0]
     settings = make_settings()
-    restore_geometry(window, settings)
-    app.aboutToQuit.connect(lambda: save_geometry(window, settings))
+    restore_window(window, settings, app.platformName())
+
+    def persist() -> None:
+        try:
+            save_geometry(window, settings)
+        except Exception:  # noqa: BLE001 - never fail on shutdown or resize
+            pass
+
+    timer = QTimer(app)
+    timer.setSingleShot(True)
+    timer.setInterval(SAVE_DELAY_MS)
+    timer.timeout.connect(persist)
+    window.widthChanged.connect(timer.start)
+    window.heightChanged.connect(timer.start)
+    app.aboutToQuit.connect(persist)
     bridge.checkConnection()
     return app.exec()
 

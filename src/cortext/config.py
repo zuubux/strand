@@ -39,6 +39,7 @@ ENV_VARS = {
     "decay_half_life_days": "CORTEXT_DECAY_HALF_LIFE_DAYS",
     "compaction_threshold_hours": "CORTEXT_COMPACTION_THRESHOLD_HOURS",
     "model_default": "CORTEXT_MODEL_DEFAULT",
+    "persona_prompt": "CORTEXT_PERSONA_PROMPT",
 }
 
 
@@ -84,6 +85,8 @@ class Config:
     compaction_threshold_hours: float = DEFAULT_COMPACTION_THRESHOLD_HOURS
     # Default chat model for clients such as the GUI; empty = client-side fallback.
     model_default: str = ""
+    # Optional bedrock persona anchor, injected ahead of the personality matrix.
+    persona_prompt: str = ""
     # True when host or port came from the environment or config.json (forces TCP).
     tcp_explicit: bool = field(default=False, compare=False)
 
@@ -151,6 +154,7 @@ class Config:
                 pick("compaction_threshold_hours", DEFAULT_COMPACTION_THRESHOLD_HOURS)
             ),
             model_default=str(pick("model_default", "")).strip(),
+            persona_prompt=str(pick("persona_prompt", "")).strip(),
             tcp_explicit=bool(pick("host", "") or pick("port", "")),
         )
 

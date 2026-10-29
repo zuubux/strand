@@ -21,7 +21,7 @@ _MAX_INPUT_CHARS = 6000
 
 SYSTEM_PROMPT = (
     "You extract a knowledge graph from a conversation turn. Reply with strict JSON only, "
-    'shaped as {"entities": [{"name": str, "archetype": one of person|project|system|vehicle|concept, '
+    'shaped as {"entities": [{"name": str, "archetype": one of person|project|system|vehicle|concept|trait|directive|preference, '
     '"summary": str}], "edges": [{"source": str, "target": str, "relation": str}], '
     '"deprecated_edges": [{"source": str, "target": str, "relation": str, "reason": str}]}. '
     "Only include durable facts; edge endpoints must be entity names. "
@@ -32,6 +32,18 @@ SYSTEM_PROMPT = (
     "commands the system to forget, delete, scrub or erase an entity, concept or record "
     "(e.g. 'Forget my old address', 'Delete the entity for Project Titan', 'Forget X'); list the "
     "target entity names. Never also list a forgotten entity in entities or as an edge endpoint. "
+    "Also capture interaction updates: conversational adjustments, behavioral critiques and style "
+    "instructions the user gives about how the assistant should behave (e.g. 'be more terse', "
+    "'stop apologizing', 'give me unified diffs') are never physical concepts. "
+    'Tone or character critiques become archetype "trait"; hard rules and invariants become '
+    'archetype "directive"; formatting or style requests become archetype "preference". '
+    "Name each one with a short descriptive identifier and put the full rule in its summary. "
+    "Link each to the entity User with an edge (source User, target the rule) using relation "
+    "prefers for a preference, demands for a directive, or enforces for a trait or a standing rule. "
+    "If the user changes or contradicts an earlier preference, rule or trait (e.g. 'actually, "
+    "stop using diffs, send full files'), emit a deprecated_edges entry naming the same source, "
+    "target and relation of the old rule so it is cleanly deprecated, and add the new rule as "
+    "a new entity and edge. "
     'If nothing is worth keeping return {"entities": [], "edges": [], "deprecated_edges": [], '
     '"forgotten_entities": []}.'
 )

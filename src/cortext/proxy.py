@@ -15,7 +15,15 @@ from starlette.background import BackgroundTask
 from .common import strip_think
 from .config import Config
 from .distill import DistillationEngine
+from .host import get_host_context
 from .logging import get_logger
+from .onboarding import (
+    ONBOARD_TRIGGER,
+    ONBOARDING_MODE,
+    count_persons,
+    onboarding_directive,
+    seed_operator_anchor,
+)
 from .resolver import ContextResolver
 from .sanitize import sanitize_text
 from .session import MAX_SESSION_ID_LEN
@@ -24,6 +32,7 @@ logger = get_logger("proxy")
 DEFAULT_SESSION_ID = "default"
 _UPSTREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 MAX_CONCURRENT_DISTILLATIONS = 4
+MAX_ONBOARDING_SESSIONS = 1000
 MAX_REQUEST_BYTES = 10 * 1024 * 1024  # POST /v1/chat/completions body cap (HTTP 413 beyond this)
 _QUERY_LOG_CHARS = 80
 _CONTEXT_ROLES = ("system", "developer")
@@ -145,16 +154,42 @@ def _stream_outcome(raw: bytes) -> tuple[bool, bool]:
     return finished, errored
 
 
-def _delta_counts(delta: str) -> tuple[int, int]:
-    """(entity, edge) line counts in a formatted context delta."""
-    counts = {"Entities:": 0, "Relations:": 0}
+_DELTA_SECTIONS = {
+    "Entities:": "entities",
+    "Relations:": "edges",
+    "[Persona Stance]": "traits",
+    "[Operational Directives]": "directives",
+    "[Interaction Preferences]": "preferences",
+    "[Reality Check - Attribute Discrepancy]": "discrepancies",
+}
+
+
+def _delta_counts(delta: str) -> dict[str, int]:
+    """Per-category item counts in a formatted context delta.
+
+    `[Working Memory]` is only a label: its `Entities:`/`Relations:` blocks count as entities/edges.
+    Persona sections count every body line (the persona anchor line has no `- ` prefix).
+    """
+    counts = dict.fromkeys(_DELTA_SECTIONS.values(), 0)
     section = ""
     for line in delta.splitlines():
-        if line in counts:
-            section = line
-        elif section and line.startswith("- "):
+        if line in _DELTA_SECTIONS:
+            section = _DELTA_SECTIONS[line]
+        elif line == "[Working Memory]" or line.startswith("## "):
+            section = ""
+        elif section == "discrepancies":
+            counts[section] += line.startswith("- Discrepancy on ")
+        elif section and line.strip() and (line.startswith("- ") or section in ("traits", "directives", "preferences")):
             counts[section] += 1
-    return counts["Entities:"], counts["Relations:"]
+    return counts
+
+
+def _delta_log_fields(delta: str) -> str:
+    """`entities=X edges=Y` plus any non-zero personality counts."""
+    counts = _delta_counts(delta)
+    fields = [f"entities={counts['entities']}", f"edges={counts['edges']}"]
+    fields += [f"{key}={counts[key]}" for key in ("traits", "directives", "preferences", "discrepancies") if counts[key]]
+    return " ".join(fields)
 
 
 def _error(status: int, message: str, kind: str) -> JSONResponse:
@@ -176,6 +211,7 @@ def create_app(
         else DistillationEngine(resolver.db, ledger=resolver.ledger)
     )
     background_tasks: set[asyncio.Task[Any]] = set()
+    onboarding_sessions: dict[str, None] = {}  # insertion-ordered, bounded
     distill_slots = asyncio.Semaphore(MAX_CONCURRENT_DISTILLATIONS)
 
     async def _distill(session_id: str, query: str, response: str) -> None:
@@ -191,7 +227,7 @@ def create_app(
         if allow_private:
             logger.info("Skipping distillation session=%r: private context allowed for this exchange", session_id)
             return
-        if not query or not response:
+        if not query or not response or query == ONBOARD_TRIGGER:
             return
         task = asyncio.create_task(_distill(session_id, query, response))
         background_tasks.add(task)
@@ -264,21 +300,38 @@ def create_app(
         # partial secret too short for the redaction patterns to match.
         preview = sanitize_text(query)[:_QUERY_LOG_CHARS]
         logger.info("Incoming query session=%r chars=%d: %r", session_id, len(query), preview)
+        resolution_failed = False
         try:
             delta = await resolver.resolve(query, session_id, allow_private) if query else ""
         except Exception:
+            resolution_failed = True
             # Fail open: memory problems must never block the user's request.
             logger.error("Context resolution failed session=%r; forwarding without context", session_id, exc_info=True)
             resolver.ledger.reset(session_id)
             delta = ""
         if delta:
-            logger.info(
-                "Resolved delta session=%r entities=%d edges=%d",
-                session_id,
-                *_delta_counts(delta),
-            )
+            logger.info("Resolved delta session=%r %s", session_id, _delta_log_fields(delta))
         else:
             logger.info("Resolved delta session=%r entities=0 edges=0", session_id)
+        mode = request.headers.get("x-cortext-mode", "").strip().lower()
+        try:
+            explicit = mode == ONBOARDING_MODE
+            if resolution_failed:
+                pass  # fail open: forward the request untouched
+            elif explicit and session_id not in onboarding_sessions:
+                onboarding_sessions[session_id] = None
+            elif session_id not in onboarding_sessions and await count_persons(resolver.db) == 0:
+                logger.info("Day-zero: no person entities; flagging session=%r for onboarding", session_id)
+                onboarding_sessions[session_id] = None
+            while len(onboarding_sessions) > MAX_ONBOARDING_SESSIONS:
+                del onboarding_sessions[next(iter(onboarding_sessions))]
+            if session_id in onboarding_sessions and not resolution_failed:
+                host_info = get_host_context()
+                if explicit:  # day-zero only flags the session; Model B seeds people organically
+                    await seed_operator_anchor(resolver.db, host_info)
+                delta = f"{onboarding_directive(host_info)}\n\n{delta}" if delta else onboarding_directive(host_info)
+        except Exception:
+            logger.error("Onboarding setup failed session=%r; continuing without it", session_id, exc_info=True)
         if delta:
             payload["messages"] = _inject_delta(messages, delta)
 

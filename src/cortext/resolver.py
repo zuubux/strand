@@ -8,7 +8,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from cortext.common import MIN_EDGE_CONFIDENCE, aliases_of, clean_text, is_private
+from cortext.common import (
+    MIN_EDGE_CONFIDENCE,
+    PERSONALITY_ARCHETYPES,
+    aliases_of,
+    clean_text,
+    is_private,
+    load_metadata,
+)
 from cortext.db import DatabaseManager
 from cortext.embed import Embedder, EmbeddingUnavailable
 from cortext.logging import get_logger
@@ -22,6 +29,39 @@ ESTABLISHED_CONFIDENCE = 0.8  # facts at or above this are presented as establis
 MIN_EFFECTIVE_PRIORITY = 0.15  # with decay enabled, candidates below this are pruned
 MAX_FREQUENCY_FACTOR = 1.5  # cap on the access-frequency boost
 FREQUENCY_STEP = 0.05  # boost per recorded access
+MAX_PERSONALITY_ENTITIES = 20  # cap on always-on personality nodes recalled per turn
+PERSONA_ANCHOR_ID = -1  # sentinel ledger id: the configured persona prompt is injected once per session
+# Personality sections in presentation order, hierarchically above working memory.
+_PERSONALITY_SECTIONS = (
+    ("trait", "[Persona Stance]"),
+    ("directive", "[Operational Directives]"),
+    ("preference", "[Interaction Preferences]"),
+)
+_WORKING_MEMORY = "[Working Memory]"
+_REALITY_CHECK = "[Reality Check - Attribute Discrepancy]"
+_ATTRIBUTE_KEYWORDS = frozenset(
+    {"equipped", "runs", "model", "spec", "color", "type", "engine", "transmission", "os", "arch", "version"}
+)
+# COG-1 contradiction categories: (regex, canonical class of a match). Matches are case-insensitive
+# and token-bounded, so "v8" never fires inside "rev8" and "auto" only counts as a gearbox when
+# followed by transmission/gearbox (a bare "auto repair" is not a spec claim).
+_SPEC_CATEGORIES: tuple[tuple[re.Pattern[str], Callable[[re.Match[str]], str]], ...] = tuple(
+    (re.compile(pattern, re.IGNORECASE), label)
+    for pattern, label in (
+        (r"(?<!\w)(\d{1,2})[- ]speed(?!\w)", lambda m: m.group(1)),
+        (
+            r"(?<!\w)(?:manual|automatic|auto(?=[- ](?:transmission|gearbox|trans)\b))(?!\w)",
+            lambda m: "manual" if m.group(0).casefold() == "manual" else "automatic",
+        ),
+        (r"(?<!\w)(?:[vi]|inline[- ]?)(6|8|10|12)(?!\w)", lambda m: m.group(1)),
+        (r"(?<!\w)(intel|amd|arm)(?!\w)", lambda m: m.group(1).casefold()),
+        (r"(?<!\w)(fedora|ubuntu|debian)(?!\w)", lambda m: m.group(1).casefold()),
+        (
+            r"(?<!\w)(diesel|petrol|gasoline)(?!\w)",
+            lambda m: "diesel" if m.group(1).casefold() == "diesel" else "petrol",
+        ),
+    )
+)
 logger = get_logger("resolver")
 
 
@@ -157,29 +197,123 @@ def _marker(confidence: float) -> str:
     return f" [inferred, confidence: {confidence:.2f}]"
 
 
-def format_context_delta(entities: Iterable[Entity], edges: Iterable[Edge], delta: SessionDelta) -> str:
+@dataclass(frozen=True, slots=True)
+class Discrepancy:
+    """A query token that contradicts a stored attribute edge of a matched entity."""
+
+    entity: str
+    relation: str
+    target: str
+    token: str
+
+
+def _spec_classes(text: str) -> list[tuple[int, str, str]]:
+    """Per category index: (category, class label, matched text) for the first match of each class."""
+    found: list[tuple[int, str, str]] = []
+    for index, (pattern, label) in enumerate(_SPEC_CATEGORIES):
+        seen: set[str] = set()
+        for m in pattern.finditer(text):
+            klass = label(m)
+            if klass not in seen:
+                seen.add(klass)
+                found.append((index, klass, m.group(0)))
+    return found
+
+
+def _is_attribute_relation(relation: str) -> bool:
+    rel = relation.casefold()
+    return rel.startswith("has_") or bool(_ATTRIBUTE_KEYWORDS & set(re.split(r"[^a-z0-9]+", rel)))
+
+
+def detect_discrepancies(entities: Iterable[Entity], edges: Iterable[Edge], query: str) -> list[Discrepancy]:
+    """COG-1: attribute edges whose target (name + summary) contradicts a spec claimed in `query`.
+
+    A category conflicts only when the stored fact and the query both state a value in it and
+    share none ("manual transmission fluid" vs a stored 6-speed Manual is consistent).
+    """
+    by_id = {e.id: e for e in entities if e.archetype not in PERSONALITY_ARCHETYPES}
+    claimed = _spec_classes(query)
+    if not claimed:
+        return []
+    found: list[Discrepancy] = []
+    for edge in edges:
+        source, target = by_id.get(edge.source_id), by_id.get(edge.target_id)
+        if source is None or target is None or not _is_attribute_relation(edge.relation):
+            continue
+        stored = _spec_classes(f"{target.name} {target.summary}")
+        for index in dict.fromkeys(i for i, _, _ in stored):
+            held = {k for i, k, _ in stored if i == index}
+            asked = [(k, text) for i, k, text in claimed if i == index]
+            if asked and not held & {k for k, _ in asked}:
+                item = Discrepancy(_clean(source.name), _clean(edge.relation), _clean(target.name), _clean(asked[0][1]))
+                if item not in found:
+                    found.append(item)
+    return found
+
+
+def format_context_delta(
+    entities: Iterable[Entity],
+    edges: Iterable[Edge],
+    delta: SessionDelta,
+    persona_prompt: str = "",
+    discrepancies: Iterable[Discrepancy] = (),
+) -> str:
+    """Render a session delta.
+
+    Personality nodes (trait/directive/preference) are grouped under `[Persona Stance]`,
+    `[Operational Directives]` and `[Interaction Preferences]`, above the factual graph. When
+    any personality section is present the factual part is labelled `[Working Memory]`; with
+    none, the output is the plain `Entities:`/`Relations:` block. Empty sections are omitted.
+    """
     entities = list(entities)
     names = {e.id: _clean(e.name) for e in entities}
     new_entities = set(delta.entity_ids)
     new_edges = set(delta.edge_ids)
+    personality_ids = {e.id for e in entities if e.archetype in PERSONALITY_ARCHETYPES}
 
-    entity_lines = []
-    for entity in entities:
-        if entity.id not in new_entities:
-            continue
-        line = f"- {names[entity.id]} ({_clean(entity.archetype)})"
+    def describe(entity: Entity, with_archetype: bool) -> str:
+        line = f"- {names[entity.id]}"
+        if with_archetype:
+            line += f" ({_clean(entity.archetype)})"
         summary = _clean(entity.summary)
         line = f"{line}: {summary}" if summary else line
-        entity_lines.append(line + _marker(entity.confidence))
+        return line + _marker(entity.confidence)
 
+    entity_lines = [
+        describe(e, True) for e in entities if e.id in new_entities and e.id not in personality_ids
+    ]
     edge_lines = [
         f"- {names[edge.source_id]} -{_clean(edge.relation)}-> {names[edge.target_id]}"
         f"{_marker(edge.confidence)}"
         for edge in edges
         if edge.id in new_edges
+        and edge.source_id not in personality_ids
+        and edge.target_id not in personality_ids
     ]
 
+    sections: list[str] = []
+    anchor = _clean(persona_prompt) if PERSONA_ANCHOR_ID in new_entities else ""
+    for archetype, title in _PERSONALITY_SECTIONS:
+        body = [describe(e, False) for e in entities if e.id in new_entities and e.archetype == archetype]
+        if archetype == "trait" and anchor:
+            body.insert(0, anchor)
+        if body:
+            sections += [title, *body]
+
     lines = [_HEADER]
+    alerts = list(discrepancies)
+    if alerts:
+        lines.append(_REALITY_CHECK)
+        for d in alerts:
+            lines += [
+                f"- Discrepancy on {d.entity}:",
+                f"  * Stored fact: [{d.relation}] -> {d.target}",
+                f"  * Query phrasing: mentions '{d.token}'",
+            ]
+        lines.append("- Clarify or challenge this discrepancy rather than assuming the contradictory spec.")
+    lines += sections
+    if sections and (entity_lines or edge_lines):
+        lines.append(_WORKING_MEMORY)
     if entity_lines:
         lines += ["Entities:", *entity_lines]
     if edge_lines:
@@ -206,6 +340,7 @@ class ContextResolver:
         decay_enabled: bool = False,
         decay_half_life_days: float = 30.0,
         clock: Callable[[], datetime] | None = None,
+        persona_prompt: str = "",
     ) -> None:
         if not 1 <= max_hops <= MAX_HOPS_LIMIT:
             raise ValueError(f"max_hops must be between 1 and {MAX_HOPS_LIMIT}, got {max_hops}")
@@ -214,6 +349,7 @@ class ContextResolver:
         if decay_half_life_days <= 0:
             raise ValueError(f"decay_half_life_days must be positive, got {decay_half_life_days}")
         self.db = db
+        self.persona_prompt = persona_prompt.strip() if isinstance(persona_prompt, str) else ""
         self.decay_enabled = decay_enabled
         self.decay_half_life_days = float(decay_half_life_days)
         self._clock = clock if clock is not None else (lambda: datetime.now(UTC))
@@ -378,6 +514,45 @@ class ContextResolver:
                         entities[entity_id] = _entity_from_row(row, f"{side}_")
         return list(entities.values()), list(edges.values())
 
+    async def personality_entities(self, allow_private: bool = False) -> list[Entity]:
+        """Active trait/directive/preference nodes, recalled on every turn regardless of the query.
+
+        A node is active when it has no edges (seeded directly) or at least one live edge;
+        a node whose every edge was deprecated has been superseded and is omitted.
+        """
+        marks = ",".join("?" for _ in PERSONALITY_ARCHETYPES)
+        async with self.db.conn.execute(
+            "SELECT id, name, archetype, summary, metadata, origin, confidence, "
+            "access_count, last_accessed_at, created_at FROM entities "
+            f"WHERE archetype IN ({marks}) ORDER BY confidence DESC, id",
+            tuple(sorted(PERSONALITY_ARCHETYPES)),
+        ) as cur:
+            rows = await cur.fetchall()
+        if not allow_private:
+            rows = [r for r in rows if not is_private(r["archetype"], r["metadata"])]
+        if not rows:
+            return []
+        ids = [r["id"] for r in rows]
+        marks = ",".join("?" for _ in ids)
+        async with self.db.conn.execute(
+            "SELECT source_id, target_id, weight, confidence, metadata FROM edges "
+            f"WHERE source_id IN ({marks}) OR target_id IN ({marks})",
+            (*ids, *ids),
+        ) as cur:
+            edge_rows = await cur.fetchall()
+        has_edge: set[int] = set()
+        live: set[int] = set()
+        for e in edge_rows:
+            active = _is_active_edge(
+                {"weight": e["weight"], "confidence": e["confidence"], "metadata": load_metadata(e["metadata"])}
+            )
+            for end in (e["source_id"], e["target_id"]):
+                has_edge.add(end)
+                if active:
+                    live.add(end)
+        keep = [r for r in rows if r["id"] not in has_edge or r["id"] in live]
+        return [_entity_from_row(r) for r in keep[:MAX_PERSONALITY_ENTITIES]]
+
     async def resolve(self, query: str, session_id: str, allow_private: bool = False) -> str:
         """Markdown block of facts new to `session_id`, or "" if there is nothing to add.
 
@@ -385,16 +560,20 @@ class ContextResolver:
         inject the result into the prompt (or `ledger.reset` the session on failure).
         """
         entities, edges = await self.gather(query, allow_private)
-        if not entities:
+        discrepancies = detect_discrepancies(entities, edges, query)
+        known = {e.id for e in entities}
+        entities += [e for e in await self.personality_entities(allow_private) if e.id not in known]
+        if not entities and not self.persona_prompt:
             return ""
-        try:
-            await self.db.touch_access([e.id for e in entities], [e.id for e in edges])
-        except Exception:
-            logger.warning("touch_access failed; recall continues", exc_info=True)
+        if entities:
+            try:
+                await self.db.touch_access([e.id for e in entities], [e.id for e in edges])
+            except Exception:
+                logger.warning("touch_access failed; recall continues", exc_info=True)
+        anchor = [PERSONA_ANCHOR_ID] if self.persona_prompt else []
         delta = self.ledger.filter_new(
-            session_id, (e.id for e in entities), (e.id for e in edges)
+            session_id, [*anchor, *(e.id for e in entities)], (e.id for e in edges)
         )
-        if delta.is_empty:
-            return ""
-        return _format_delta(entities, edges, delta)
-
+        if delta.is_empty and not discrepancies:
+            return ""  # a discrepancy is re-flagged whenever the query repeats it, ledger unchanged
+        return format_context_delta(entities, edges, delta, self.persona_prompt, discrepancies)

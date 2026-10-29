@@ -142,3 +142,28 @@ def test_model_default_precedence_and_cli_persistence(home, monkeypatch, capsys)
     monkeypatch.setenv("CORTEXT_MODEL_DEFAULT", "env-model")
     assert load_config().model_default == "env-model"
     assert load_config({}).model_default == "gemini-3.6-flash"
+
+
+def test_uvicorn_records_use_server_component(tmp_path):
+    from cortext.logging import uvicorn_log_handler
+
+    log_path = tmp_path / "cortext.log"
+    setup_logging("INFO", log_path, debug=False)
+    handler = uvicorn_log_handler()
+    uv = logging.getLogger("uvicorn.error")
+    uv.addHandler(handler)
+    old_level = uv.level
+    uv.setLevel(logging.INFO)
+    try:
+        uv.info("Started server process")
+        uv.error("boom")
+        get_logger("proxy").info("hello")
+    finally:
+        uv.removeHandler(handler)
+        uv.setLevel(old_level)
+        shutdown_logging()
+    text = log_path.read_text()
+    assert "[INFO] [server] Started server process" in text
+    assert "[ERROR] [server] boom" in text
+    assert "[INFO] [proxy] hello" in text
+    assert "[error]" not in text

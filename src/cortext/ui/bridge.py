@@ -23,6 +23,7 @@ import httpx
 from PySide6.QtCore import Property, QObject, Signal, Slot
 
 from cortext.config import Config, load_config
+from cortext.onboarding import ONBOARD_TRIGGER, ONBOARDING_HEADER, ONBOARDING_MODE
 
 DEFAULT_MODEL = "gpt-4o-mini"
 UDS_BASE_URL = "http://cortext"
@@ -33,7 +34,7 @@ COMMAND_RE = re.compile(r"^/([A-Za-z]+)(?:[ \t]+(.*))?$", re.DOTALL)
 FENCE_RE = re.compile(r"^[ \t]{0,3}```[ \t]*([\w+.#-]*)[ \t]*$")
 HELP_TEXT = (
     "Commands: /new (fresh session), /private on|off (send X-Cortext-Allow-Private), "
-    "/model <name> (switch model), /help. Ctrl+L new session, Ctrl+D diagnostics, Esc stop/clear."
+    "/model <name> (switch model), /onboard (fresh session, Cortext opens the grounding conversation), /help. Ctrl+L new session, Ctrl+D diagnostics, Esc stop/clear."
 )
 
 
@@ -166,6 +167,7 @@ class Bridge(QObject):
         self._busy = False
         self._lock = threading.Lock()
         self._private = False
+        self._onboarding = False
         self._generation = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[None] | None = None
@@ -236,6 +238,8 @@ class Bridge(QObject):
         headers = {"Content-Type": "application/json", "X-Session-Id": self._session_id}
         if self._private:
             headers[PRIVATE_HEADER] = "true"
+        if self._onboarding:
+            headers[ONBOARDING_HEADER] = ONBOARDING_MODE
         if self._config.api_key:
             headers["Authorization"] = f"Bearer {self._config.api_key}"
         return headers
@@ -292,6 +296,11 @@ class Bridge(QObject):
             error = f"Cannot reach Cortext daemon: {exc}"
         except httpx.HTTPError as exc:
             error = f"Request failed: {exc}"
+        except Exception as exc:  # noqa: BLE001 - nothing may escape the worker thread
+            if self._abort_requested:
+                aborted = True  # teardown noise from a cancelled stream is silent
+            else:
+                error = f"Stream failed: {exc}"
         current = generation is None or generation == self._generation
         if current:
             self._turn = {
@@ -371,14 +380,17 @@ class Bridge(QObject):
         def target() -> None:
             try:
                 asyncio.run(runner())
-            except asyncio.CancelledError:
-                pass
+            except (asyncio.CancelledError, httpx.HTTPError, Exception):
+                pass  # never let a stream failure or abort reach the Qt runtime
             finally:
                 if cancellable:
                     with self._lock:
                         self._loop = self._task = None
                 if on_done:
-                    on_done()
+                    try:
+                        on_done()
+                    except Exception:  # noqa: BLE001
+                        pass
 
         thread = threading.Thread(target=target, name="cortext-ui-io", daemon=True)
         thread.start()
@@ -396,6 +408,16 @@ class Bridge(QObject):
             self._abort_requested = False
             self._set_busy(True)
         self._remember(text)
+        self._start_turn(text, locked=True)
+
+    def _start_turn(self, text: str, locked: bool = False) -> None:
+        """Append `text` as a user turn and stream the reply (no-op while busy)."""
+        if not locked:
+            with self._lock:
+                if self._busy:
+                    return
+                self._abort_requested = False
+                self._set_busy(True)
         self._history.append({"role": "user", "content": text})
         messages = list(self._history)
         generation = self._generation
@@ -417,7 +439,10 @@ class Bridge(QObject):
                 return False
             self._abort_requested = True
             if self._loop is not None and self._task is not None:
-                self._loop.call_soon_threadsafe(self._task.cancel)
+                try:
+                    self._loop.call_soon_threadsafe(self._task.cancel)
+                except (RuntimeError, asyncio.CancelledError):
+                    pass  # loop already closed: the turn is finishing on its own
             return True
 
     @Slot()
@@ -428,6 +453,7 @@ class Bridge(QObject):
             self.abort()
         self._history.clear()
         self._turn = {}
+        self._onboarding = False
         self._session_id = f"ui-{uuid.uuid4().hex[:12]}"
         self.sessionChanged.emit()
         self.diagnosticsChanged.emit()
@@ -462,6 +488,12 @@ class Bridge(QObject):
         if name == "new":
             self.newConversation()
             return "Started a new session."
+        if name == "onboard":
+            self.newConversation()
+            self._onboarding = True
+            self.diagnosticsChanged.emit()
+            self._start_turn(ONBOARD_TRIGGER)
+            return "Onboarding session started."
         if name == "private":
             value = arg.lower()
             if value not in ("on", "off"):

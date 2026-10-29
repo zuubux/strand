@@ -23,6 +23,8 @@ ApplicationWindow {
     readonly property color codeBorder: "#3A4452"
     readonly property string monoFamily: "monospace"
 
+    readonly property int bodyPixelSize: 14
+
     property bool drawerOpen: false
     // True while Up/Down is stepping through previously sent prompts.
     property bool browsingHistory: false
@@ -74,6 +76,8 @@ ApplicationWindow {
             if (feedback.length > 0) {
                 input.text = ""
                 note(feedback)
+                if (bridge.busy)  // /onboard: Cortext opens, so show its streaming reply
+                    transcript.append({ role: "assistant", body: "", pending: true })
                 return
             }
         }
@@ -126,7 +130,7 @@ ApplicationWindow {
             text: segment.text
             color: root.textColor
             selectionColor: root.accent
-            font.pixelSize: 14
+            font.pixelSize: root.bodyPixelSize
         }
     }
 
@@ -253,19 +257,38 @@ ApplicationWindow {
 
                 Rectangle {
                     id: bubble
+                    objectName: "bubble"
                     readonly property bool isNote: row.role === "note"
-                    x: isNote ? 16 : (row.isUser ? row.width - width - 16 : 16)
-                    width: Math.min(row.width * 0.82, Math.max(60, content.implicitWidth + 28))
-                    height: content.implicitHeight + 20
+                    // One-way geometry: bubble.width derives only from row.width and text metrics,
+                    // never from `content` (which wraps to bubble.width), so there are no layout loops.
+                    readonly property bool isThinking: row.pending && row.body.length === 0
+                    readonly property real hPad: root.bodyPixelSize
+                    readonly property real vPad: Math.round(root.bodyPixelSize * 0.7)
+                    readonly property real edge: Math.round(root.bodyPixelSize * 8 / 7)
+                    readonly property real maxWidth: row.width * 0.82
+                    // Replies with fenced code keep the full responsive width; the measured text
+                    // width cannot account for monospace blocks.
+                    readonly property bool hasCode: !row.isUser && row.body.indexOf("```") >= 0
+                    TextMetrics {
+                        id: textMetrics
+                        font.pixelSize: root.bodyPixelSize
+                        text: bubble.isNote ? "" : (bubble.isThinking ? "\u2026" : row.body)
+                    }
+                    readonly property real naturalWidth: Math.ceil(textMetrics.advanceWidth) + 2 * hPad + 2
+                    x: isNote ? edge : (row.isUser ? row.width - width - edge : edge)
+                    width: isNote ? Math.max(0, row.width - 2 * edge)
+                         : (hasCode ? maxWidth : Math.min(maxWidth, naturalWidth))
+                    height: content.implicitHeight + 2 * vPad
                     radius: 12
                     color: isNote ? "transparent" : (row.isUser ? root.userBubble : root.botBubble)
                     border.color: row.isUser || isNote ? "transparent" : root.border
 
                     Column {
                         id: content
-                        x: 14
-                        y: 10
-                        width: bubble.width - 28
+                        objectName: "content"
+                        x: bubble.hPad
+                        y: bubble.vPad
+                        width: bubble.width - 2 * bubble.hPad
                         spacing: 6
 
                         // User text and local notes are plain text.
@@ -282,7 +305,7 @@ ApplicationWindow {
                             color: bubble.isNote ? root.dim : root.textColor
                             font.italic: bubble.isNote
                             selectionColor: root.accent
-                            font.pixelSize: 14
+                            font.pixelSize: root.bodyPixelSize
                         }
 
                         // Assistant replies: markdown text blocks and fenced code blocks.
@@ -335,6 +358,13 @@ ApplicationWindow {
                         color: root.textColor
                         wrapMode: TextArea.Wrap
                         font.pixelSize: 14
+                        // Fixed alignment + padding: the placeholder inherits these, so the
+                        // text baseline never moves on focus/blur/typing.
+                        verticalAlignment: Text.AlignTop
+                        topPadding: 10
+                        bottomPadding: 10
+                        leftPadding: 8
+                        rightPadding: 8
                         enabled: !bridge.busy
                         onTextChanged: if (text.length === 0) root.browsingHistory = false
                         background: null

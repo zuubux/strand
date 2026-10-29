@@ -64,7 +64,11 @@ class _ColorFormatter(logging.Formatter):
 
 class _ComponentFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.component = record.name.rsplit(".", 1)[-1]
+        if record.name == "uvicorn" or record.name.startswith("uvicorn."):
+            # uvicorn.error is just uvicorn's general logger, not an error marker.
+            record.component = "server"
+        else:
+            record.component = record.name.rsplit(".", 1)[-1]
         return True
 
 

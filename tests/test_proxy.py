@@ -208,3 +208,17 @@ def test_config_from_env_defaults_and_overrides():
         }
     )
     assert custom == Config("http://x/v1", "k", "0.0.0.0", 9000, "/tmp/db")
+
+
+def test_delta_log_fields_count_personality_and_working_memory():
+    from cortext.proxy import _delta_log_fields
+
+    delta = (
+        "## Cortext Memory\n[Persona Stance]\nAnchor prompt\n- Dry Wit: calm\n"
+        "[Operational Directives]\n- a: x\n- b: y\n[Interaction Preferences]\n- Nm: z\n"
+        "[Working Memory]\nEntities:\n- BMW (vehicle): E34\nRelations:\n- User -drives-> BMW\n- A -b-> C"
+    )
+    assert _delta_log_fields(delta) == "entities=1 edges=2 traits=2 directives=2 preferences=1"
+    plain = "## Cortext Memory\nEntities:\n- A (person): x\n- B (person): y\nRelations:\n- A -knows-> B"
+    assert _delta_log_fields(plain) == "entities=2 edges=1"
+    assert _delta_log_fields("") == "entities=0 edges=0"
