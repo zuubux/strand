@@ -13,6 +13,7 @@ MAX_SESSION_ID_LEN = 128
 class SessionState:
     seen_entity_ids: set[int] = field(default_factory=set)
     seen_edge_ids: set[int] = field(default_factory=set)
+    seen_episode_ids: set[int] = field(default_factory=set)
     last_active: float = 0.0
 
 
@@ -62,10 +63,8 @@ class SessionLedger:
     def __contains__(self, session_id: object) -> bool:
         return session_id in self._sessions
 
-    def filter_new(
-        self, session_id: str, entity_ids: Iterable[int], edge_ids: Iterable[int]
-    ) -> SessionDelta:
-        """Return only the candidates this session has not seen, and mark them as seen."""
+    def _touch(self, session_id: str) -> SessionState:
+        """Fetch or create the session, mark it most recently used and evict stale/LRU ones."""
         if len(session_id) > MAX_SESSION_ID_LEN:
             raise ValueError(f"session_id longer than {MAX_SESSION_ID_LEN} characters")
         now = self._clock()
@@ -78,7 +77,22 @@ class SessionLedger:
                 del self._sessions[next(iter(self._sessions))]
         self._sessions[session_id] = state
         state.last_active = now
+        return state
 
+    def seen_episode_ids(self, session_id: str) -> frozenset[int]:
+        """Episode ids already injected into `session_id` (empty for an unknown session)."""
+        state = self._sessions.get(session_id)
+        return frozenset(state.seen_episode_ids) if state is not None else frozenset()
+
+    def mark_episodes_seen(self, session_id: str, episode_ids: Iterable[int]) -> None:
+        """Record episode ids as injected into `session_id`."""
+        self._touch(session_id).seen_episode_ids.update(episode_ids)
+
+    def filter_new(
+        self, session_id: str, entity_ids: Iterable[int], edge_ids: Iterable[int]
+    ) -> SessionDelta:
+        """Return only the candidates this session has not seen, and mark them as seen."""
+        state = self._touch(session_id)
         new_entities = _novel(entity_ids, state.seen_entity_ids)
         new_edges = _novel(edge_ids, state.seen_edge_ids)
         state.seen_entity_ids.update(new_entities)

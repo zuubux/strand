@@ -187,6 +187,14 @@ async def cmd_prune_stale(db: DatabaseManager, args: argparse.Namespace) -> int:
     return 0
 
 
+async def cmd_prune_decayed(db: DatabaseManager, args: argparse.Namespace) -> int:
+    """Remove deprecated and cold (unaccessed for `--days`, rarely used) edges atomically."""
+    edges, entities = await db.prune_decayed_edges(args.days, dry_run=args.dry_run)
+    verb = "would prune" if args.dry_run else "pruned"
+    print(f"{verb} {edges} decayed edge(s) and {entities} orphaned entit(y/ies) (older than {args.days:g} days)")
+    return 0
+
+
 async def cmd_embed_backfill(
     db: DatabaseManager, args: argparse.Namespace, embedder: Embedder | None = None
 ) -> int:
@@ -377,6 +385,13 @@ def _confidence(value: str) -> float:
     return number
 
 
+def _positive_float(value: str) -> float:
+    number = float(value)
+    if not (number > 0 and number != float("inf")):
+        raise argparse.ArgumentTypeError("must be a finite number > 0")
+    return number
+
+
 def _positive(value: str) -> int:
     number = int(value)
     if number < 1:
@@ -408,6 +423,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("prune-stale", help="purge low-confidence model-inferred facts")
     p.add_argument("--confidence-below", type=_confidence, default=0.5, metavar="X")
     p.set_defaults(func=cmd_prune_stale)
+
+    p = sub.add_parser("prune-decayed", help="remove deprecated and cold, rarely used edges")
+    p.add_argument("--days", type=_positive_float, default=90.0, metavar="DAYS", help="idle age (default 90)")
+    p.add_argument("--dry-run", action="store_true", help="report without deleting")
+    p.set_defaults(func=cmd_prune_decayed)
 
     sub.add_parser("embed-backfill", help="embed entities missing from entity_embeddings").set_defaults(
         func=cmd_embed_backfill

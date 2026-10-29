@@ -38,6 +38,9 @@ _PERSONALITY_SECTIONS = (
     ("preference", "[Interaction Preferences]"),
 )
 _WORKING_MEMORY = "[Working Memory]"
+_CONTINUITY = "[Recent Continuity]"
+CONTINUITY_OVERFETCH = 20  # spare candidates so seen/private episodes cannot starve the result
+MAX_CONTINUITY_CHARS = 240  # cap on one episode narrative rendered into the prompt
 _REALITY_CHECK = "[Reality Check - Attribute Discrepancy]"
 _ATTRIBUTE_KEYWORDS = frozenset(
     {"equipped", "runs", "model", "spec", "color", "type", "engine", "transmission", "os", "arch", "version"}
@@ -123,7 +126,11 @@ def effective_priority(
     treated as fresh.
     """
     base = confidence * weight
-    if not decay_enabled or not math.isfinite(half_life_days) or half_life_days <= 0:
+    try:
+        half_life_ok = math.isfinite(half_life_days) and half_life_days > 0
+    except TypeError:
+        half_life_ok = False
+    if not decay_enabled or not half_life_ok:
         return base
     ref = _parse_time(last_accessed_at) or _parse_time(created_at)
     delta_days = (now - ref).total_seconds() / 86400.0 if ref is not None else 0.0
@@ -257,6 +264,7 @@ def format_context_delta(
     delta: SessionDelta,
     persona_prompt: str = "",
     discrepancies: Iterable[Discrepancy] = (),
+    continuity: Iterable[tuple[str, str]] = (),
 ) -> str:
     """Render a session delta.
 
@@ -312,7 +320,10 @@ def format_context_delta(
             ]
         lines.append("- Clarify or challenge this discrepancy rather than assuming the contradictory spec.")
     lines += sections
-    if sections and (entity_lines or edge_lines):
+    recent = [f"- {day}: {text}" for day, text in continuity]
+    if recent:
+        lines += [_CONTINUITY, *recent]
+    if (sections or recent) and (entity_lines or edge_lines):
         lines.append(_WORKING_MEMORY)
     if entity_lines:
         lines += ["Entities:", *entity_lines]
@@ -341,6 +352,8 @@ class ContextResolver:
         decay_half_life_days: float = 30.0,
         clock: Callable[[], datetime] | None = None,
         persona_prompt: str = "",
+        continuity_horizon_days: float = 7.0,
+        continuity_max_episodes: int = 2,
     ) -> None:
         if not 1 <= max_hops <= MAX_HOPS_LIMIT:
             raise ValueError(f"max_hops must be between 1 and {MAX_HOPS_LIMIT}, got {max_hops}")
@@ -350,6 +363,8 @@ class ContextResolver:
             raise ValueError(f"decay_half_life_days must be positive, got {decay_half_life_days}")
         self.db = db
         self.persona_prompt = persona_prompt.strip() if isinstance(persona_prompt, str) else ""
+        self.continuity_horizon_days = float(continuity_horizon_days)
+        self.continuity_max_episodes = int(continuity_max_episodes)
         self.decay_enabled = decay_enabled
         self.decay_half_life_days = float(decay_half_life_days)
         self._clock = clock if clock is not None else (lambda: datetime.now(UTC))
@@ -489,6 +504,12 @@ class ContextResolver:
 
         Unless `allow_private`, private entities and every edge touching them are omitted.
         """
+        entities, edges, _ = await self._gather_with_roots(query, allow_private)
+        return entities, edges
+
+    async def _gather_with_roots(
+        self, query: str, allow_private: bool
+    ) -> tuple[list[Entity], list[Edge], list[Entity]]:
         roots = await self.match_entities(query, allow_private)
         hidden = set() if allow_private else await self._private_ids()
         entities = {e.id: e for e in roots}
@@ -512,7 +533,43 @@ class ContextResolver:
                     entity_id = row[f"{side}_id"]
                     if entity_id not in entities:
                         entities[entity_id] = _entity_from_row(row, f"{side}_")
-        return list(entities.values()), list(edges.values())
+        return list(entities.values()), list(edges.values()), roots
+
+    async def recent_continuity(
+        self, roots: list[Entity], session_id: str, allow_private: bool
+    ) -> tuple[list[int], list[tuple[str, str]]]:
+        """Novel recent episodes for the matched `roots`: (episode ids, (date, narrative) pairs).
+
+        Episodes already shown to `session_id` and, unless `allow_private`, episodes that touch
+        any private entity are dropped. Fails open to "no continuity" on a database error.
+        """
+        if not roots or self.continuity_max_episodes < 1 or self.continuity_horizon_days <= 0:
+            return [], []
+        seen = self.ledger.seen_episode_ids(session_id)
+        try:
+            rows = await self.db.get_recent_episodes_for_entities(
+                [e.id for e in roots],
+                max_age_days=self.continuity_horizon_days,
+                limit=self.continuity_max_episodes + len(seen) + CONTINUITY_OVERFETCH,
+                exclude_session_id=session_id,
+            )
+            hidden = set() if allow_private else await self._private_ids()
+        except Exception:
+            logger.warning("episodic lookup failed; continuity skipped", exc_info=True)
+            return [], []
+        ids: list[int] = []
+        lines: list[tuple[str, str]] = []
+        for row in rows:
+            if row["id"] in seen or hidden.intersection(i for i in row["entities"] if isinstance(i, int)):
+                continue
+            text = _clean(row["narrative"])
+            if len(text) > MAX_CONTINUITY_CHARS:
+                text = text[: MAX_CONTINUITY_CHARS - 3].rstrip() + "..."
+            ids.append(row["id"])
+            lines.append((str(row["created_at"])[:10], text))
+            if len(ids) >= self.continuity_max_episodes:
+                break
+        return ids, lines
 
     async def personality_entities(self, allow_private: bool = False) -> list[Entity]:
         """Active trait/directive/preference nodes, recalled on every turn regardless of the query.
@@ -559,7 +616,7 @@ class ContextResolver:
         Facts are marked as seen as soon as they are returned, so callers should
         inject the result into the prompt (or `ledger.reset` the session on failure).
         """
-        entities, edges = await self.gather(query, allow_private)
+        entities, edges, roots = await self._gather_with_roots(query, allow_private)
         discrepancies = detect_discrepancies(entities, edges, query)
         known = {e.id for e in entities}
         entities += [e for e in await self.personality_entities(allow_private) if e.id not in known]
@@ -574,6 +631,11 @@ class ContextResolver:
         delta = self.ledger.filter_new(
             session_id, [*anchor, *(e.id for e in entities)], (e.id for e in edges)
         )
-        if delta.is_empty and not discrepancies:
+        episode_ids, continuity = await self.recent_continuity(roots, session_id, allow_private)
+        if episode_ids:
+            self.ledger.mark_episodes_seen(session_id, episode_ids)
+        if delta.is_empty and not discrepancies and not continuity:
             return ""  # a discrepancy is re-flagged whenever the query repeats it, ledger unchanged
-        return format_context_delta(entities, edges, delta, self.persona_prompt, discrepancies)
+        return format_context_delta(
+            entities, edges, delta, self.persona_prompt, discrepancies, continuity
+        )

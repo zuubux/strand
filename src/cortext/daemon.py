@@ -36,6 +36,8 @@ def build_app(config: Config):
         decay_enabled=config.decay_enabled,
         decay_half_life_days=config.decay_half_life_days,
         persona_prompt=config.persona_prompt,
+        continuity_horizon_days=config.continuity_horizon_days,
+        continuity_max_episodes=config.continuity_max_episodes,
     )
     extractor = None
     if config.extractor_model:

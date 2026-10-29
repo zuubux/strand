@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import time
+from datetime import UTC, datetime, timedelta
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -596,6 +597,10 @@ class DatabaseManager:
                     continue
                 meta = load_metadata(raw)
                 if meta.get("deprecated") is True:
+                    logger.info(
+                        "edge %s -[%s]-> %s already deprecated; nothing to do",
+                        source_id, relation, target_id,
+                    )
                     continue
                 meta["deprecated"] = True
                 meta["deprecation_reason"] = reason
@@ -606,6 +611,64 @@ class DatabaseManager:
                 )
                 return True
         return False
+
+    async def prune_decayed_edges(
+        self, days: float = 90.0, dry_run: bool = False, max_access_count: int = 2
+    ) -> tuple[int, int]:
+        """Delete deprecated edges and cold, rarely used edges in one atomic transaction.
+
+        An edge is pruned when `metadata.deprecated` is true, or when its last access
+        (else `updated_at`) is older than `days` and `access_count <= max_access_count`.
+        `model_inferred` entities left with no edges by the prune are deleted with their
+        embeddings, so no orphans leak. With `dry_run` nothing is written. Returns
+        `(edges, entities)` removed (or that would be removed).
+        """
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+
+        async def plan(conn: aiosqlite.Connection) -> tuple[list[int], list[int]]:
+            async with conn.execute(
+                "SELECT id, source_id, target_id, metadata, access_count, "
+                "COALESCE(last_accessed_at, updated_at) FROM edges"
+            ) as cur:
+                rows = await cur.fetchall()
+            doomed: set[int] = set()
+            for edge_id, _, _, raw, access_count, ref in rows:
+                if load_metadata(raw).get("deprecated") is True:
+                    doomed.add(edge_id)
+                    continue
+                try:
+                    stamp = datetime.fromisoformat(str(ref)) if ref else None
+                except ValueError:
+                    stamp = None
+                if stamp is None:
+                    continue
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=UTC)
+                if stamp < cutoff and (access_count or 0) <= max_access_count:
+                    doomed.add(edge_id)
+            touched = {i for r in rows if r[0] in doomed for i in (r[1], r[2])}
+            alive = {i for r in rows if r[0] not in doomed for i in (r[1], r[2])}
+            orphans: list[int] = []
+            for entity_id in sorted(touched - alive):
+                async with conn.execute(
+                    "SELECT 1 FROM entities WHERE id = ? AND origin = 'model_inferred'", (entity_id,)
+                ) as cur:
+                    if await cur.fetchone():
+                        orphans.append(entity_id)
+            return sorted(doomed), orphans
+
+        if dry_run:
+            edge_ids, orphan_ids = await plan(self.conn)
+            return len(edge_ids), len(orphan_ids)
+        async with self.transaction() as conn:
+            edge_ids, orphan_ids = await plan(conn)
+            for edge_id in edge_ids:
+                await conn.execute("DELETE FROM edges WHERE id = ?", (edge_id,))
+            for entity_id in orphan_ids:
+                if self.vec_enabled:
+                    await conn.execute("DELETE FROM entity_embeddings WHERE entity_id = ?", (entity_id,))
+                await conn.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
+        return len(edge_ids), len(orphan_ids)
 
     async def get_entity_subgraph(
         self, entity_id: int, max_hops: int = 1, limit: int = 10, active_only: bool = False
@@ -668,6 +731,48 @@ class DatabaseManager:
                 row = await cur.fetchone()
         return int(row[0])
 
+
+    async def get_recent_episodes_for_entities(
+        self,
+        entity_ids: Sequence[int],
+        max_age_days: float = 7.0,
+        limit: int = 2,
+        exclude_session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Newest episodes within `max_age_days` that mention any of `entity_ids`.
+
+        `created_at` is the episode timestamp rendered as a UTC `YYYY-MM-DD HH:MM:SS` string and
+        `entities` is the episode's full decoded `extracted_entities` list. Episodes of
+        `exclude_session_id` are skipped (the live transcript already carries them).
+        """
+        ids = [int(i) for i in dict.fromkeys(entity_ids)]
+        if not ids or limit < 1 or max_age_days <= 0:
+            return []
+        marks = ",".join("?" for _ in ids)
+        sql = (
+            "SELECT id, narrative, extracted_entities, "
+            "datetime(timestamp, 'unixepoch') AS created_at FROM episodes "
+            "WHERE timestamp >= ? AND CASE WHEN json_valid(extracted_entities) THEN EXISTS ("
+            f"SELECT 1 FROM json_each(episodes.extracted_entities) WHERE json_each.value IN ({marks})"
+            ") ELSE 0 END"
+        )
+        params: list[Any] = [time.time() - max_age_days * 86400.0, *ids]
+        if exclude_session_id is not None:
+            sql += " AND session_id != ?"
+            params.append(exclude_session_id)
+        sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+        params.append(int(limit))
+        async with self.conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [
+            {
+                "id": row["id"],
+                "narrative": row["narrative"],
+                "created_at": row["created_at"],
+                "entities": json.loads(row["extracted_entities"]),
+            }
+            for row in rows
+        ]
 
     async def get_uncompacted_sessions(self, older_than_seconds: float) -> list[str]:
         """Session ids whose newest uncompacted episode is older than the cutoff (oldest first)."""

@@ -1,6 +1,7 @@
 """Daemon configuration: environment variables > ~/.config/cortext/config.json > defaults."""
 
 import json
+import math
 import os
 import tempfile
 from collections.abc import Mapping
@@ -20,6 +21,8 @@ DEFAULT_DISTANCE_THRESHOLD = 1.0
 DEFAULT_DEDUP_DISTANCE_THRESHOLD = 0.45
 DEFAULT_DECAY_HALF_LIFE_DAYS = 30.0
 DEFAULT_COMPACTION_THRESHOLD_HOURS = 24.0
+DEFAULT_CONTINUITY_HORIZON_DAYS = 7.0
+DEFAULT_CONTINUITY_MAX_EPISODES = 2
 
 # config.json key -> environment variable
 ENV_VARS = {
@@ -38,6 +41,8 @@ ENV_VARS = {
     "decay_enabled": "CORTEXT_DECAY_ENABLED",
     "decay_half_life_days": "CORTEXT_DECAY_HALF_LIFE_DAYS",
     "compaction_threshold_hours": "CORTEXT_COMPACTION_THRESHOLD_HOURS",
+    "continuity_horizon_days": "CORTEXT_CONTINUITY_HORIZON_DAYS",
+    "continuity_max_episodes": "CORTEXT_CONTINUITY_MAX_EPISODES",
     "model_default": "CORTEXT_MODEL_DEFAULT",
     "persona_prompt": "CORTEXT_PERSONA_PROMPT",
 }
@@ -53,6 +58,17 @@ def _as_bool(value: Any) -> bool:
     if text in ("0", "false", "no", "off", ""):
         return False
     raise ValueError(f"invalid boolean {value!r}; use true or false")
+
+
+def _validate_half_life(value: Any) -> float:
+    """Return `value` as a finite positive float, else raise a descriptive ValueError."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"decay_half_life_days must be a finite number > 0, got {value!r}") from None
+    if not (math.isfinite(number) and number > 0):
+        raise ValueError(f"decay_half_life_days must be a finite number > 0, got {value!r}")
+    return number
 
 
 def default_config_path() -> Path:
@@ -83,6 +99,9 @@ class Config:
     decay_half_life_days: float = DEFAULT_DECAY_HALF_LIFE_DAYS
     # A session is compactable once its newest uncompacted episode is this many hours old.
     compaction_threshold_hours: float = DEFAULT_COMPACTION_THRESHOLD_HOURS
+    # Episodic stitching (COG-3): look-back window and cap for [Recent Continuity].
+    continuity_horizon_days: float = DEFAULT_CONTINUITY_HORIZON_DAYS
+    continuity_max_episodes: int = DEFAULT_CONTINUITY_MAX_EPISODES
     # Default chat model for clients such as the GUI; empty = client-side fallback.
     model_default: str = ""
     # Optional bedrock persona anchor, injected ahead of the personality matrix.
@@ -113,6 +132,11 @@ class Config:
         """("uds", path) in socket mode, else ("tcp", host); port is `self.port`."""
         path = self.effective_socket_path(env)
         return ("uds", path) if path else ("tcp", self.host)
+
+    def validate(self) -> "Config":
+        """Raise ValueError for settings that would only fail later at runtime; return self."""
+        _validate_half_life(self.decay_half_life_days)
+        return self
 
     @classmethod
     def from_env(
@@ -153,6 +177,12 @@ class Config:
             compaction_threshold_hours=float(
                 pick("compaction_threshold_hours", DEFAULT_COMPACTION_THRESHOLD_HOURS)
             ),
+            continuity_horizon_days=float(
+                pick("continuity_horizon_days", DEFAULT_CONTINUITY_HORIZON_DAYS)
+            ),
+            continuity_max_episodes=int(
+                pick("continuity_max_episodes", DEFAULT_CONTINUITY_MAX_EPISODES)
+            ),
             model_default=str(pick("model_default", "")).strip(),
             persona_prompt=str(pick("persona_prompt", "")).strip(),
             tcp_explicit=bool(pick("host", "") or pick("port", "")),
@@ -183,16 +213,32 @@ def load_config(
     A bad file is ignored unless `strict` (used by the daemon), which raises ValueError.
     """
     path = config_path if config_path is not None else default_config_path()
-    return Config.from_env(env, _read_file(path, strict=strict))
+    file_values = _read_file(path, strict=strict)
+    if strict:
+        environ = os.environ if env is None else env
+        raw = environ.get(ENV_VARS["decay_half_life_days"])
+        if raw is None or raw == "":
+            raw = file_values.get("decay_half_life_days")
+        if raw is not None:
+            _validate_half_life(raw)
+    config = Config.from_env(env, file_values)
+    return config.validate() if strict else config
 
 
 def save_config_value(key: str, value: Any, config_path: Path | None = None) -> None:
     """Persist one setting to config.json (atomic write, mode 0600, parents created)."""
     if key not in ENV_VARS:
         raise KeyError(f"unknown config key {key!r}; valid keys: {', '.join(ENV_VARS)}")
-    if key == "port":
+    if key == "decay_half_life_days":
+        value = _validate_half_life(value)
+    elif key in ("port", "continuity_max_episodes"):
         value = int(value)
-    elif key in ("distance_threshold", "dedup_distance_threshold", "decay_half_life_days", "compaction_threshold_hours"):
+    elif key in (
+        "distance_threshold",
+        "dedup_distance_threshold",
+        "compaction_threshold_hours",
+        "continuity_horizon_days",
+    ):
         value = float(value)
     elif key == "decay_enabled":
         value = _as_bool(value)

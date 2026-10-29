@@ -1,6 +1,7 @@
 """Temporal access decay, frequency reinforcement and touch_access (offline)."""
 
 import asyncio
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
@@ -287,3 +288,76 @@ def test_resolve_survives_touch_failure(db_path):
             return await r.resolve("Hub", "s1")
 
     assert "Hub" in run(scenario())
+
+
+# --- strict half-life validation / defensive clamping --------------------------------
+
+
+@pytest.mark.parametrize("bad", [0, -1, -0.5, "nan", "inf", "-inf", "abc"])
+def test_strict_config_rejects_invalid_half_life(tmp_path, bad):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"decay_half_life_days": bad}))
+    with pytest.raises(ValueError, match="decay_half_life_days"):
+        load_config({}, path, strict=True)
+    with pytest.raises(ValueError, match="decay_half_life_days"):
+        load_config({"CORTEXT_DECAY_HALF_LIFE_DAYS": str(bad)}, tmp_path / "none.json", strict=True)
+    with pytest.raises(ValueError, match="decay_half_life_days"):
+        save_config_value("decay_half_life_days", bad, tmp_path / "saved.json")
+    assert not (tmp_path / "saved.json").exists()
+
+
+def test_strict_config_accepts_valid_half_life(tmp_path):
+    assert load_config({"CORTEXT_DECAY_HALF_LIFE_DAYS": "0.5"}, tmp_path / "n.json", strict=True).decay_half_life_days == 0.5
+    assert load_config({}, tmp_path / "n.json", strict=True).decay_half_life_days == 30.0
+
+
+@pytest.mark.parametrize("bad", [0.0, -3.0, float("nan"), float("inf"), float("-inf")])
+def test_effective_priority_falls_back_to_undecayed_on_bad_half_life(bad):
+    value = effective_priority(0.8, 0.5, 9, _ts(0), _ts(300), now=NOW, decay_enabled=True, half_life_days=bad)
+    assert value == pytest.approx(0.4)
+
+
+async def _backdate_edge(db, edge_id, days_ago, access_count=0):
+    await db.conn.execute(
+        "UPDATE edges SET last_accessed_at = ?, updated_at = ?, access_count = ? WHERE id = ?",
+        (_ts(days_ago), _ts(days_ago), access_count, edge_id),
+    )
+    await db.conn.commit()
+
+
+def _stamp(days_ago):
+    return (datetime.now(UTC) - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def test_prune_decayed_edges_atomic_and_dry_run(tmp_path):
+    async def scenario():
+        async with DatabaseManager(tmp_path / "p.db") as db:
+            hub = await db.upsert_entity("Hub", "concept", "")
+            cold = await db.upsert_entity("Cold", "concept", "", origin="model_inferred", confidence=0.6)
+            warm = await db.upsert_entity("Warm", "concept", "")
+            busy = await db.upsert_entity("Busy", "concept", "")
+            e_cold = await db.upsert_edge(hub, cold, "mentions")
+            e_warm = await db.upsert_edge(hub, warm, "mentions")
+            e_busy = await db.upsert_edge(hub, busy, "mentions")
+            for edge_id, days, count in ((e_cold, 200, 0), (e_warm, 5, 0), (e_busy, 200, 50)):
+                await db.conn.execute(
+                    "UPDATE edges SET last_accessed_at = ?, updated_at = ?, access_count = ? WHERE id = ?",
+                    (_stamp(days), _stamp(days), count, edge_id),
+                )
+            await db.conn.commit()
+            dry = await db.prune_decayed_edges(90, dry_run=True)
+            async with db.conn.execute("SELECT COUNT(*) FROM edges") as cur:
+                after_dry = (await cur.fetchone())[0]
+            real = await db.prune_decayed_edges(90)
+            async with db.conn.execute("SELECT id FROM edges ORDER BY id") as cur:
+                left = [r[0] for r in await cur.fetchall()]
+            async with db.conn.execute("SELECT name FROM entities ORDER BY id") as cur:
+                names = [r[0] for r in await cur.fetchall()]
+            again = await db.prune_decayed_edges(90)
+            return dry, after_dry, real, left, names, again, (e_warm, e_busy)
+
+    dry, after_dry, real, left, names, again, kept = run(scenario())
+    assert dry == (1, 1) and after_dry == 3
+    assert real == (1, 1) and left == list(kept)
+    assert names == ["Hub", "Warm", "Busy"]  # orphaned model_inferred entity swept, others kept
+    assert again == (0, 0)

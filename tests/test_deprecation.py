@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 
+import pytest
+
 from cortext.db import DatabaseManager
 from cortext.distill import DistillationEngine, heuristic_extract
 from cortext.extractors import SYSTEM_PROMPT, parse_extraction
@@ -169,3 +171,53 @@ def test_heuristic_extract_detects_negation_and_defaults_to_empty():
     stopped = heuristic_extract("I no longer use Postgres at all.", "Understood, thanks for sharing.")
     assert [(e["target"], e["relation"]) for e in stopped["deprecated_edges"]] == [("Postgres", "uses")]
     assert heuristic_extract("Marcus manages Atlas.", "Ok, noted that fact.")["deprecated_edges"] == []
+
+
+def test_deprecate_edge_is_idempotent_and_logs_cleanly(tmp_path, caplog):
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            a = await db.upsert_entity("Nic", "person", "")
+            b = await db.upsert_entity("Subaru", "vehicle", "")
+            await db.upsert_edge(a, b, "owns")
+            return [await db.deprecate_edge("Nic", "Subaru", "owns", reason="sold") for _ in range(3)]
+
+    with caplog.at_level(logging.INFO):
+        assert run(scenario()) == [True, False, False]
+
+
+def test_extractor_prompt_emphasizes_state_transitions():
+    for token in ("sold", "switched from", "no longer using", "superseded"):
+        assert token in SYSTEM_PROMPT
+
+
+def test_cli_prune_decayed_removes_deprecated_edges_and_honors_dry_run(tmp_path, capsys):
+    from cortext.cli import main
+
+    path = tmp_path / "m.db"
+
+    async def seed():
+        async with DatabaseManager(path) as db:
+            a = await db.upsert_entity("Nic", "person", "")
+            b = await db.upsert_entity("Subaru", "vehicle", "", origin="model_inferred", confidence=0.6)
+            c = await db.upsert_entity("Atlas", "project", "")
+            await db.upsert_edge(a, b, "owns")
+            await db.upsert_edge(a, c, "leads")
+            await db.deprecate_edge("Nic", "Subaru", "owns", reason="sold")
+
+    async def counts():
+        async with DatabaseManager(path) as db:
+            async with db.conn.execute("SELECT COUNT(*) FROM edges") as cur:
+                e = (await cur.fetchone())[0]
+            async with db.conn.execute("SELECT COUNT(*) FROM entities") as cur:
+                n = (await cur.fetchone())[0]
+            return e, n
+
+    run(seed())
+    assert main(["--db", str(path), "prune-decayed", "--dry-run"]) == 0
+    assert "would prune 1 decayed edge(s) and 1 orphaned" in capsys.readouterr().out
+    assert run(counts()) == (2, 3)
+    assert main(["--db", str(path), "prune-decayed", "--days", "30"]) == 0
+    assert "pruned 1 decayed edge(s) and 1 orphaned" in capsys.readouterr().out
+    assert run(counts()) == (1, 2)
+    with pytest.raises(SystemExit):
+        main(["--db", str(path), "prune-decayed", "--days", "0"])
