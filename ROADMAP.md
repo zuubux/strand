@@ -46,7 +46,7 @@ Check items off as they land. Every phase must keep `pytest -W error` green, ful
   - Inject a specialized `[Reality Check]` warning into the session context delta to prompt the model to clarify discrepancies rather than blindly agree.
 - [x] **COG-2 Conversational Grounding & Onboarding**:
   - Ambient first-run detection or `/onboard` / `/bootstrap` command.
-  - Guided, organic conversational interview (subtle steering rather than rigid questionnaires) to seed the `User` (`Nic`) anchor node, hardware orbit (ONYX, Promethean), active projects, key collaborators, and core interaction stances.
+  - Guided, organic conversational interview (subtle steering rather than rigid questionnaires) to seed the `User` (`Operator`) anchor node, hardware orbit (WORKSTATION, Cluster-Node-01), active projects, key collaborators, and core interaction stances.
 - [x] **COG-3 Episodic Stitching & Project Continuity**:
   - Cross-reference recent uncompacted episodes (last 7 days) matching queried entities to inject recent working context into new sessions.
 - [ ] **COG-4 Shared Lore & Episodic Vernacular**:

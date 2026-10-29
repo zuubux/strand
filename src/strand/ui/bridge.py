@@ -176,6 +176,7 @@ class Bridge(QObject):
         self._prompts: list[str] = []
         self._prompt_index: int | None = None
         self._turn: dict[str, Any] = {}
+        self._workers: dict[threading.Thread, tuple[asyncio.AbstractEventLoop, asyncio.Task[None]]] = {}
 
     # -- properties exposed to QML -------------------------------------------------
     @Property(str, notify=statusChanged)
@@ -369,6 +370,11 @@ class Bridge(QObject):
         cancellable: bool = False,
     ) -> threading.Thread:
         async def runner() -> None:
+            with self._lock:
+                self._workers[threading.current_thread()] = (
+                    asyncio.get_running_loop(),
+                    asyncio.current_task(),
+                )
             if cancellable:
                 with self._lock:
                     self._loop = asyncio.get_running_loop()
@@ -383,8 +389,9 @@ class Bridge(QObject):
             except (asyncio.CancelledError, httpx.HTTPError, Exception):
                 pass  # never let a stream failure or abort reach the Qt runtime
             finally:
-                if cancellable:
-                    with self._lock:
+                with self._lock:
+                    self._workers.pop(threading.current_thread(), None)
+                    if cancellable:
                         self._loop = self._task = None
                 if on_done:
                     try:
@@ -444,6 +451,22 @@ class Bridge(QObject):
                 except (RuntimeError, asyncio.CancelledError):
                     pass  # loop already closed: the turn is finishing on its own
             return True
+
+    def shutdown(self, timeout: float = 2.0) -> None:
+        """Cancel every in-flight worker (stream and connection check) and join its thread.
+
+        Called when the window closes so no `strand-ui-io` thread outlives the GUI.
+        """
+        with self._lock:
+            self._abort_requested = True
+            workers = list(self._workers.items())
+        for thread, (loop, task) in workers:
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass  # loop already closed: the worker is finishing on its own
+        for thread, _ in workers:
+            thread.join(timeout)
 
     @Slot()
     def newConversation(self) -> None:

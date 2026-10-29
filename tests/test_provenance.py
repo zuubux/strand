@@ -24,7 +24,7 @@ async def _all(db, sql):
 def test_defaults_on_fresh_entity_and_edge(tmp_path):
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
-            a = await db.upsert_entity("Nic", "person", "")
+            a = await db.upsert_entity("Operator", "person", "")
             b = await db.upsert_entity("Atlas", "project", "")
             await db.upsert_edge(a, b, "works_on")
             return (

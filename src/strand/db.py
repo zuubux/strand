@@ -14,7 +14,7 @@ from typing import Any
 import aiosqlite
 import sqlite_vec
 
-from .common import EMBEDDING_DIM, MIN_EDGE_CONFIDENCE, aliases_of, load_metadata
+from .common import DEFAULT_DEDUP_DISTANCE_THRESHOLD, EMBEDDING_DIM, MIN_EDGE_CONFIDENCE, aliases_of, load_metadata
 from .embed import Embedder, EmbeddingUnavailable
 from .logging import get_logger
 from .schema import run_migrations
@@ -320,7 +320,7 @@ class DatabaseManager:
         name: str,
         archetype: str | None = None,
         summary: str = "",
-        distance_threshold: float = 0.45,
+        distance_threshold: float = DEFAULT_DEDUP_DISTANCE_THRESHOLD,
     ) -> int | None:
         """Id of an existing entity that `name` duplicates, else None.
 
@@ -488,7 +488,7 @@ class DatabaseManager:
         embedding: Sequence[float] | None = None,
         origin: str = "user_explicit",
         confidence: float = 1.0,
-        distance_threshold: float = 0.45,
+        distance_threshold: float = DEFAULT_DEDUP_DISTANCE_THRESHOLD,
     ) -> int:
         """Like `upsert_entity`, but a near-duplicate of an existing entity is merged into it.
 

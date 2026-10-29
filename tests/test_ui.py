@@ -620,3 +620,31 @@ def test_qml_note_bubbles_do_not_collapse(qapp):
     assert long_.height() > 2 * line_height  # it did wrap into multiple lines
     win.hide()
     engine.deleteLater()
+
+
+def test_shutdown_cancels_hanging_stream_and_joins_worker(qapp):
+    class Hang(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            await asyncio.sleep(60)
+            yield b""
+
+    b = make_bridge(lambda r: httpx.Response(200, stream=Hang()))
+    threads = []
+    orig = b._run_async
+    b._run_async = lambda *a, **k: threads.append(orig(*a, **k)) or threads[-1]
+    b.sendMessage("hello")
+    import time
+
+    deadline = time.time() + 5
+    while not b._workers and time.time() < deadline:
+        time.sleep(0.01)
+    assert threads[0].is_alive()
+    b.shutdown()
+    assert not threads[0].is_alive()
+    assert not b._workers
+    b.shutdown()  # idempotent
+
+
+def test_shutdown_without_workers_is_noop(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("ok")))
+    b.shutdown()

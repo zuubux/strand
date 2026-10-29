@@ -7,6 +7,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .common import (
+    DEFAULT_DEDUP_DISTANCE_THRESHOLD,
     MAX_SUMMARY_LEN,
     MODEL_CONFIDENCE,
     VALID_ARCHETYPES,
@@ -35,7 +36,6 @@ DEFAULT_ARCHETYPE = "concept"
 USER_ORIGIN = "user_explicit"
 MODEL_ORIGIN = "model_inferred"
 USER_CONFIDENCE = 1.0
-DEFAULT_DEDUP_DISTANCE_THRESHOLD = 0.45  # L2 (~cosine 0.90); mirrors config.py
 
 _NAME = r"[A-Z][\w\-]*(?:\s+[A-Z][\w\-]*)*"
 _RELATIONS = (

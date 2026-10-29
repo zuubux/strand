@@ -6,7 +6,10 @@ Talks to SQLite directly (WAL mode), so the daemon does not need to be running.
 import argparse
 import asyncio
 import json
+import os
+import stat
 import sys
+import uuid
 from collections import deque
 from collections.abc import Sequence
 from typing import Any
@@ -378,6 +381,171 @@ async def cmd_compact(db: DatabaseManager, args: argparse.Namespace) -> int:
     return 0
 
 
+CHAT_PATH = "/v1/chat/completions"
+CHAT_FALLBACK_MODEL = "gpt-4o-mini"
+PRIVATE_HEADER = "X-Strand-Allow-Private"
+CHAT_HELP = (
+    "/help             show this help\n"
+    "/new              start a fresh session\n"
+    "/private on|off   send (or stop sending) X-Strand-Allow-Private\n"
+    "/stats            show memory entity/edge/episode counts\n"
+    "exit | quit       leave the chat (Ctrl+C aborts a stream; twice exits)"
+)
+
+
+def _chat_client(config) -> httpx.Client:
+    """HTTP client for the daemon: its UNIX socket when present, else loopback TCP."""
+    timeout = httpx.Timeout(None, connect=5.0)
+    path = config.effective_socket_path()
+    if path:
+        try:
+            if stat.S_ISSOCK(os.stat(path).st_mode):
+                return httpx.Client(transport=httpx.HTTPTransport(uds=path), base_url="http://strand", timeout=timeout)
+        except OSError:
+            pass
+    return httpx.Client(base_url=f"http://{config.host}:{config.port}", timeout=timeout)
+
+
+def _sse_token(line: str) -> tuple[str, str]:
+    """Classify one SSE line as ("token", text), ("done", ""), ("error", msg) or ("skip", "")."""
+    line = line.strip()
+    if not line.startswith("data:"):
+        return "skip", ""
+    payload = line[5:].strip()
+    if payload == "[DONE]":
+        return "done", ""
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        return "skip", ""
+    if not isinstance(data, dict):
+        return "skip", ""
+    err = data.get("error")
+    if err:
+        return "error", str(err.get("message") if isinstance(err, dict) else err) or "upstream error"
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        delta = choices[0].get("delta") or {}
+        content = delta.get("content") if isinstance(delta, dict) else None
+        if isinstance(content, str) and content:
+            return "token", content
+    return "skip", ""
+
+
+def _chat_stream(client: httpx.Client, body: dict[str, Any], headers: dict[str, str]) -> tuple[str, str | None]:
+    """Stream one turn to stdout; returns (reply_text, error). KeyboardInterrupt propagates."""
+    parts: list[str] = []
+    with client.stream("POST", CHAT_PATH, json=body, headers=headers) as resp:
+        if resp.status_code >= 400:
+            detail = resp.read().decode("utf-8", "replace").strip()
+            return "", f"HTTP {resp.status_code}: {detail[:300]}" if detail else f"HTTP {resp.status_code}"
+        for line in resp.iter_lines():
+            kind, text = _sse_token(line)
+            if kind == "token":
+                parts.append(text)
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            elif kind == "error":
+                return "".join(parts), text
+            elif kind == "done":
+                break
+    return "".join(parts), None
+
+
+def run_chat(args: argparse.Namespace, client: httpx.Client, config, read=input) -> int:
+    """Interactive REPL. `read` is the line reader (injectable for tests)."""
+    model = (args.model or config.model_default or CHAT_FALLBACK_MODEL).strip()
+    private = bool(args.private)
+    session_id = f"cli-{uuid.uuid4().hex[:12]}"
+    history: list[dict[str, str]] = []
+    interrupts = 0
+    print(f"strand chat: model {model}, session {session_id}. /help for commands.")
+    while True:
+        try:
+            line = read("you> ").strip()
+        except EOFError:
+            print()
+            return 0
+        except KeyboardInterrupt:
+            print()
+            interrupts += 1
+            if interrupts >= 2:
+                return 0
+            print("(press Ctrl+C again or type exit to quit)")
+            continue
+        interrupts = 0
+        if not line:
+            continue
+        if line.lower() in ("exit", "quit"):
+            return 0
+        if line.startswith("/") and " " not in line[1:2] and line[1:2].isalpha():
+            name, _, arg = line[1:].partition(" ")
+            name, arg = name.lower(), arg.strip().lower()
+            if name == "help":
+                print(CHAT_HELP)
+            elif name == "new":
+                history.clear()
+                session_id = f"cli-{uuid.uuid4().hex[:12]}"
+                print(f"Started a new session ({session_id}).")
+            elif name == "private":
+                if arg in ("on", "off"):
+                    private = arg == "on"
+                    print(f"Private context {'enabled' if private else 'disabled'}.")
+                else:
+                    print(f"Private mode is {'on' if private else 'off'}. Usage: /private on|off")
+            elif name == "stats":
+                try:
+                    asyncio.run(_chat_stats(args))
+                except Exception as exc:  # noqa: BLE001 - the REPL must survive a bad DB
+                    print(f"error: cannot read stats: {exc}", file=sys.stderr)
+            else:
+                print(f"Unknown command /{name}.\n{CHAT_HELP}")
+            continue
+        history.append({"role": "user", "content": line})
+        headers = {"Content-Type": "application/json", "X-Session-Id": session_id}
+        if private:
+            headers[PRIVATE_HEADER] = "true"
+        if config.api_key:
+            headers["Authorization"] = f"Bearer {config.api_key}"
+        body = {"model": model, "messages": list(history), "stream": True, "session_id": session_id}
+        try:
+            reply, error = _chat_stream(client, body, headers)
+        except KeyboardInterrupt:
+            history.pop()
+            interrupts = 1
+            print("\n[aborted]")
+            continue
+        except httpx.ConnectError as exc:
+            history.pop()
+            print(f"error: cannot reach Strand daemon: {exc}", file=sys.stderr)
+            continue
+        except httpx.HTTPError as exc:
+            history.pop()
+            print(f"error: request failed: {exc}", file=sys.stderr)
+            continue
+        print()
+        if error is not None:
+            history.pop()
+            print(f"error: {error}", file=sys.stderr)
+        elif reply:
+            history.append({"role": "assistant", "content": reply})
+
+
+async def _chat_stats(args: argparse.Namespace) -> None:
+    async with DatabaseManager(args.db or load_config().db_path) as db:
+        await cmd_stats(db, args)
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    config = load_config()
+    try:
+        import readline  # noqa: F401 - enables line editing and history for input()
+    except ImportError:
+        pass
+    with _chat_client(config) as client:
+        return run_chat(args, client, config)
+
+
 def _confidence(value: str) -> float:
     number = float(value)
     if not 0.0 <= number <= 1.0:
@@ -455,6 +623,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("daemon", help="run the daemon in the foreground (quiet unless --diag)")
     p.add_argument("--diag", "--debug", dest="diag", action="store_true", help="verbose colored logs on the terminal")
     p.set_defaults(func=cmd_daemon, local=True)
+
+    p = sub.add_parser("chat", help="interactive terminal chat with the running daemon")
+    p.add_argument("--model", help="model name (default: config model_default)")
+    p.add_argument("--private", action="store_true", help="start with private context enabled")
+    p.set_defaults(func=cmd_chat, local=True)
 
     p = sub.add_parser("logs", help="print the end of the Strand log file")
     p.add_argument("--tail", "-n", type=_positive, default=50, metavar="N", help="lines to show (default 50)")

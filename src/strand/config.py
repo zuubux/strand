@@ -9,6 +9,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .common import (
+    DEFAULT_COMPACTION_THRESHOLD_HOURS,
+    DEFAULT_CONTINUITY_HORIZON_DAYS,
+    DEFAULT_CONTINUITY_MAX_EPISODES,
+    DEFAULT_DEDUP_DISTANCE_THRESHOLD,
+)
+
 DEFAULT_UPSTREAM_URL = "https://api.openai.com/v1"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8088
@@ -17,12 +24,7 @@ DEFAULT_LOG_LEVEL = "INFO"
 # sqlite-vec returns L2 distance: unit vectors at cosine distance ~0.35 sit at L2 ~0.83,
 # orthogonal (unrelated) ones at >= 1.414.
 DEFAULT_DISTANCE_THRESHOLD = 1.0
-# Tight L2 cutoff (~cosine similarity 0.90) for merging near-duplicate entities on ingestion.
-DEFAULT_DEDUP_DISTANCE_THRESHOLD = 0.45
 DEFAULT_DECAY_HALF_LIFE_DAYS = 30.0
-DEFAULT_COMPACTION_THRESHOLD_HOURS = 24.0
-DEFAULT_CONTINUITY_HORIZON_DAYS = 7.0
-DEFAULT_CONTINUITY_MAX_EPISODES = 2
 
 # config.json key -> environment variable
 ENV_VARS = {
@@ -78,13 +80,13 @@ def default_config_path() -> Path:
 @dataclass(frozen=True, slots=True)
 class Config:
     upstream_url: str = DEFAULT_UPSTREAM_URL
-    upstream_api_key: str = ""
+    upstream_api_key: str = field(default="", repr=False)
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     db_path: str = DEFAULT_DB_PATH
     log_level: str = DEFAULT_LOG_LEVEL
     # Inbound key clients must present to Strand (distinct from upstream_api_key).
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
     # UNIX domain socket path; empty means "not explicitly configured".
     socket_path: str = ""
     # Local OpenAI-compatible SLM used for structured extraction; empty model = heuristic.

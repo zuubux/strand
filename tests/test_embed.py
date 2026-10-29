@@ -74,8 +74,8 @@ def test_manager_rejects_wrong_dimension():
 def test_upsert_stores_vector_and_replaces(db_path):
     async def go():
         async with DatabaseManager(db_path) as db:
-            eid = await db.upsert_entity("Nic", "person", "", embedding=unit(0))
-            await db.upsert_entity("Nic", "person", "", embedding=unit(1))
+            eid = await db.upsert_entity("Operator", "person", "", embedding=unit(0))
+            await db.upsert_entity("Operator", "person", "", embedding=unit(1))
             async with db.conn.execute("SELECT COUNT(*) FROM entity_embeddings") as cur:
                 count = (await cur.fetchone())[0]
             return eid, count, await db.find_similar_entities(unit(1), limit=1)

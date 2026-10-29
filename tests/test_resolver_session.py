@@ -208,7 +208,7 @@ def test_match_entities_tolerates_malformed_alias_metadata(db_path):
             await db.conn.commit()
             resolver = ContextResolver(db)
             queries = ["bad count", "zed", "solo", "broken", "7", "5"]
-            return [[e.name for e in await resolver.match_entities(q)] for q in queries]
+            return [[e.name for e in await resolver.match_entities(q, allow_private=True)] for q in queries]
 
     assert run(scenario()) == [["Bad Count"], ["Mixed"], ["Single"], ["Broken"], [], []]
 

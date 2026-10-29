@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from strand.common import (
+    DEFAULT_CONTINUITY_HORIZON_DAYS,
+    DEFAULT_CONTINUITY_MAX_EPISODES,
     MIN_EDGE_CONFIDENCE,
     PERSONALITY_ARCHETYPES,
     aliases_of,
@@ -352,8 +354,8 @@ class ContextResolver:
         decay_half_life_days: float = 30.0,
         clock: Callable[[], datetime] | None = None,
         persona_prompt: str = "",
-        continuity_horizon_days: float = 7.0,
-        continuity_max_episodes: int = 2,
+        continuity_horizon_days: float = DEFAULT_CONTINUITY_HORIZON_DAYS,
+        continuity_max_episodes: int = DEFAULT_CONTINUITY_MAX_EPISODES,
     ) -> None:
         if not 1 <= max_hops <= MAX_HOPS_LIMIT:
             raise ValueError(f"max_hops must be between 1 and {MAX_HOPS_LIMIT}, got {max_hops}")
@@ -388,7 +390,7 @@ class ContextResolver:
             half_life_days=self.decay_half_life_days,
         )
 
-    async def match_entities(self, query: str, allow_private: bool = True) -> list[Entity]:
+    async def match_entities(self, query: str, allow_private: bool = False) -> list[Entity]:
         """Entities whose name or metadata alias appears in `query` (case-insensitive, whole word).
 
         Results are ordered by first mention in the query and capped at `max_entities`.
@@ -499,7 +501,7 @@ class ContextResolver:
             row["edge_updated_at"],
         )
 
-    async def gather(self, query: str, allow_private: bool = True) -> tuple[list[Entity], list[Edge]]:
+    async def gather(self, query: str, allow_private: bool = False) -> tuple[list[Entity], list[Edge]]:
         """Matched entities plus their `max_hops` neighbourhood, de-duplicated across roots.
 
         Unless `allow_private`, private entities and every edge touching them are omitted.

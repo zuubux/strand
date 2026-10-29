@@ -19,8 +19,8 @@ from strand.session import SessionLedger  # noqa: E402
 from tests.test_ui import make_bridge, sse  # noqa: E402
 
 HOST = {
-    "user": "nic",
-    "hostname": "ONYX",
+    "user": "operator",
+    "hostname": "workstation-01",
     "os": "Fedora Linux 44",
     "desktop": "KDE",
     "session": "wayland",
@@ -86,7 +86,7 @@ def test_host_os_falls_back_to_platform(monkeypatch):
 
 def test_format_host_context():
     text = format_host_context(HOST)
-    assert "ONYX" in text and "Fedora Linux 44" in text and "KDE / wayland" in text and "32 GB RAM" in text
+    assert "workstation-01" in text and "Fedora Linux 44" in text and "KDE / wayland" in text and "32 GB RAM" in text
     assert format_host_context({}) == "unknown host"
 
 
@@ -105,7 +105,7 @@ def test_seed_operator_anchor_creates_and_is_idempotent(tmp_path):
 
     first, second, entities, edges = run(go())
     assert first == second
-    assert [(e[0], e[1]) for e in entities] == [("Nic", "person"), ("ONYX", "system")]
+    assert [(e[0], e[1]) for e in entities] == [("Operator", "person"), ("workstation-01", "system")]
     assert "User" in json.loads(entities[0][3])["aliases"]
     assert entities[0][2] == "Primary operator of this workstation"
     assert entities[1][2] == "Primary workstation running Fedora Linux 44"
@@ -115,22 +115,22 @@ def test_seed_operator_anchor_creates_and_is_idempotent(tmp_path):
 def test_seed_operator_anchor_keeps_existing_operator(tmp_path):
     async def go():
         async with DatabaseManager(tmp_path / "m.db") as db:
-            nic = await db.upsert_entity("Nic", "person", "Custom summary")
+            operator = await db.upsert_entity("Operator", "person", "Custom summary")
             user_id, host_id = await seed_operator_anchor(db, HOST)
             again = await seed_operator_anchor(db, HOST)
-            async with db.conn.execute("SELECT summary FROM entities WHERE id = ?", (nic,)) as cur:
+            async with db.conn.execute("SELECT summary FROM entities WHERE id = ?", (operator,)) as cur:
                 summary = (await cur.fetchone())[0]
-            return nic, user_id, host_id, again, summary
+            return operator, user_id, host_id, again, summary
 
-    nic, user_id, host_id, again, summary = run(go())
-    assert user_id == nic and again == (user_id, host_id)
+    operator, user_id, host_id, again, summary = run(go())
+    assert user_id == operator and again == (user_id, host_id)
     assert summary == "Custom summary"
 
 
 def test_directive_text():
     text = onboarding_directive(HOST)
     assert text.startswith("[Onboarding Directive: Grounding & Resonance]")
-    assert "Ambient Host Context: user nic, host ONYX" in text
+    assert "Ambient Host Context: user operator, host workstation-01" in text
     assert "exactly ONE question per turn" in text
 
 
@@ -178,14 +178,14 @@ def test_header_triggers_onboarding_directive_and_seeds(tmp_path, pinned_host):
     seen, names = _post(tmp_path, {"X-Strand-Mode": "onboarding"}, with_person=True)
     system = _system_text(seen[0])
     assert "[Onboarding Directive: Grounding & Resonance]" in system
-    assert "host ONYX, Fedora Linux 44" in system
-    assert {"Nic", "ONYX"} <= set(names)
+    assert "host workstation-01, Fedora Linux 44" in system
+    assert {"Operator", "workstation-01"} <= set(names)
 
 
 def test_day_zero_flags_first_session_without_seeding(tmp_path, pinned_host):
     seen, names = _post(tmp_path)
     assert "[Onboarding Directive" in _system_text(seen[0])
-    assert "Nic" not in names
+    assert "Operator" not in names
 
 
 def test_no_directive_when_person_exists_and_no_header(tmp_path, pinned_host):
@@ -204,7 +204,7 @@ def test_onboard_command_resets_session_and_sends_trigger(qapp):
 
     def handler(request):
         requests.append(request)
-        return httpx.Response(200, content=sse("Hello, ", "Nic."))
+        return httpx.Response(200, content=sse("Hello, ", "Operator."))
 
     b = make_bridge(handler)
     old = b.sessionId

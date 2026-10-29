@@ -17,6 +17,11 @@ VALID_ARCHETYPES = FACTUAL_ARCHETYPES | PERSONALITY_ARCHETYPES
 MIN_EDGE_CONFIDENCE = 0.2  # edges below this are treated as deprecated and never recalled
 MODEL_CONFIDENCE = 0.6  # default confidence for facts the assistant (not the user) asserted
 MAX_SUMMARY_LEN = 300
+# Tight L2 cutoff (~cosine similarity 0.90) for merging near-duplicate entities on ingestion.
+DEFAULT_DEDUP_DISTANCE_THRESHOLD = 0.45
+DEFAULT_COMPACTION_THRESHOLD_HOURS = 24.0
+DEFAULT_CONTINUITY_HORIZON_DAYS = 7.0
+DEFAULT_CONTINUITY_MAX_EPISODES = 2
 
 
 def clean_text(text: object) -> str:

@@ -103,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     app = QGuiApplication(args)
     app.setApplicationName("Strand")
     app.setDesktopFileName("strand")
+    app.setQuitOnLastWindowClosed(True)  # closing the window ends app.exec()
     bridge = Bridge()
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("bridge", bridge)
@@ -127,8 +128,13 @@ def main(argv: list[str] | None = None) -> int:
     window.widthChanged.connect(timer.start)
     window.heightChanged.connect(timer.start)
     app.aboutToQuit.connect(persist)
+    app.aboutToQuit.connect(bridge.shutdown)  # cancel and join every strand-ui-io worker
+    window.closing.connect(lambda _event: app.quit())
     bridge.checkConnection()
-    return app.exec()
+    code = app.exec()
+    bridge.shutdown()  # idempotent; guarantees no worker thread outlives exec()
+    engine.deleteLater()
+    return code
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from .common import MAX_SUMMARY_LEN, MODEL_CONFIDENCE, extract_json, is_private
+from .common import DEFAULT_COMPACTION_THRESHOLD_HOURS, MAX_SUMMARY_LEN, MODEL_CONFIDENCE, extract_json, is_private
 from .db import DatabaseManager
 from .extractors import DEFAULT_EXTRACTOR_URL
 from .logging import get_logger
@@ -18,7 +18,7 @@ from .sanitize import sanitize_text
 
 logger = get_logger("compactor")
 
-DEFAULT_THRESHOLD_HOURS = 24.0
+DEFAULT_THRESHOLD_HOURS = DEFAULT_COMPACTION_THRESHOLD_HOURS
 COMPACTION_ORIGIN = "model_inferred"
 SLM_CONFIDENCE = MODEL_CONFIDENCE
 HEURISTIC_CONFIDENCE = 0.5

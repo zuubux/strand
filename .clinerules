@@ -7,7 +7,7 @@
 ## 1. Linear Protocol: Read First -> Surgical Code -> Test
 - **READ FIRST:** Always inspect `ARCHITECTURE.md` before making assumptions.
 - **SURGICAL CODE:** Minimal diffs. Zero bloated frameworks (no LangChain, no LlamaIndex, no Docker).
-- **TEST INTEGRITY:** Fix code, never relax tests. Keep dependencies strictly to `aiosqlite`, `sqlite-vec`, and `fastapi`.
+- **TEST INTEGRITY:** Fix code, never relax tests. Keep runtime dependencies strictly to those declared in `pyproject.toml`: `aiosqlite`, `sqlite-vec`, `fastapi`, `uvicorn`, `httpx`, `fastembed`, and `PySide6` (GUI only). Add nothing else.
 
 ## 2. Architectural Boundaries
 - Strand is a headless system daemon running at `127.0.0.1:8088`.

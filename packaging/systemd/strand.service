@@ -14,17 +14,17 @@
 # (not the journal). It serves on $XDG_RUNTIME_DIR/strand/strand.sock (0600).
 [Unit]
 Description=Strand cognitive working-memory daemon
-After=network.target
 
 [Service]
 Type=simple
 # Uses the python3 on the user's PATH, where `pip install --user` put the strand package.
-ExecStart=/home/nic/Projects/strand/.venv/bin/python3 -m strand.daemon
+ExecStart=/usr/bin/env python3 -m strand.daemon
 Restart=on-failure
 RestartSec=3
 ProtectSystem=strict
 ProtectHome=read-only
 RuntimeDirectory=strand
+RuntimeDirectoryMode=0700
 ReadWritePaths=%h/.config/strand %h/.local/share/strand %t/strand
 PrivateTmp=true
 NoNewPrivileges=true

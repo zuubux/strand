@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import copy
+import ipaddress
 import os
 import socket
 import stat
@@ -138,7 +139,12 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 def _is_loopback_host(host: str) -> bool:
     host = host.strip().lower()
-    return host in _LOOPBACK_HOSTS or host.startswith("127.")
+    if host in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]").split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
 
 
 def warn_if_exposed(config: Config, log=None) -> bool:

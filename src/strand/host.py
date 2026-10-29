@@ -19,7 +19,10 @@ def _user() -> str:
 
 
 def _hostname() -> str:
-    return platform.node() or socket.gethostname() or "localhost"
+    try:
+        return platform.node() or socket.gethostname() or "localhost"
+    except OSError:
+        return "localhost"
 
 
 def _os_release() -> str:
@@ -28,7 +31,7 @@ def _os_release() -> str:
         pretty = release.get("PRETTY_NAME") or release.get("NAME")
         if pretty:
             return str(pretty)
-    except (OSError, AttributeError):
+    except (OSError, AttributeError, ValueError, KeyError):
         pass
     return platform.platform()
 
