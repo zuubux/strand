@@ -21,7 +21,7 @@ from .schema import run_migrations
 
 logger = get_logger("db")
 
-DEFAULT_DB_PATH = Path("~/.config/cortext/memory.db")
+DEFAULT_DB_PATH = Path("~/.config/strand/memory.db")
 
 VEC_UNAVAILABLE_MESSAGE = "sqlite-vec extension failed to load; vector indexing disabled."
 

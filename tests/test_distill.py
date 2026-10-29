@@ -4,12 +4,12 @@ import logging
 
 import httpx
 
-from cortext.config import Config
-from cortext.db import DatabaseManager
-from cortext.distill import DistillationEngine, is_substantive_exchange, strip_markdown_structure
-from cortext.proxy import create_app
-from cortext.resolver import ContextResolver
-from cortext.session import SessionLedger
+from strand.config import Config
+from strand.db import DatabaseManager
+from strand.distill import DistillationEngine, is_substantive_exchange, strip_markdown_structure
+from strand.proxy import create_app
+from strand.resolver import ContextResolver
+from strand.session import SessionLedger
 
 QUERY = "Tell me about Marcus."
 RESPONSE = "Marcus is a staff engineer. Marcus manages Atlas. Atlas is the billing project."
@@ -78,7 +78,7 @@ def test_extractor_failure_is_logged_not_raised(tmp_path, caplog):
             result = await DistillationEngine(db, boom).process_exchange("s", "q", "r")
             return result, await _rows(db, "SELECT id FROM episodes")
 
-    with caplog.at_level(logging.WARNING, logger="cortext.distill"):
+    with caplog.at_level(logging.WARNING, logger="strand.distill"):
         result, episodes = run(scenario())
     assert result is None and episodes == []
     assert "Distillation failed" in caplog.text
@@ -157,7 +157,7 @@ def _proxy_scenario(tmp_path, upstream_handler, payload):
                 upstream,
             )
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://cortext") as client:
+            async with httpx.AsyncClient(transport=transport, base_url="http://strand") as client:
                 response = await client.post("/v1/chat/completions", json=payload)
                 await asyncio.gather(*app.state.background_tasks)
             await upstream.aclose()
@@ -362,7 +362,7 @@ def test_ungrounded_and_filler_model_entities_are_dropped(tmp_path):
 
 
 def test_grounded_assistant_entity_linked_to_user_topic_is_kept():
-    from cortext.distill import heuristic_extract
+    from strand.distill import heuristic_extract
 
     result = heuristic_extract("Tell me about Marcus.", "Marcus manages Atlas. Capacity is key.")
     assert {e["name"] for e in result["entities"]} == {"Marcus", "Atlas"}
@@ -389,7 +389,7 @@ def test_markdown_headings_and_bold_labels_do_not_become_entities(tmp_path):
 
 
 def test_structural_section_terms_are_filler():
-    from cortext.stopwords import is_filler_name
+    from strand.stopwords import is_filler_name
 
     for name in ("Torque Specification", "Torque Specifications", "Tips", "Overview", "Instructions", "Recommendations"):
         assert is_filler_name(name), name

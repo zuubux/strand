@@ -2,9 +2,9 @@ import asyncio
 
 import aiosqlite
 
-from cortext.db import DatabaseManager
-from cortext.distill import DistillationEngine, heuristic_extract
-from cortext.resolver import ContextResolver
+from strand.db import DatabaseManager
+from strand.distill import DistillationEngine, heuristic_extract
+from strand.resolver import ContextResolver
 
 
 def run(coro):

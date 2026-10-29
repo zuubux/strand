@@ -7,10 +7,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from cortext.config import ENV_VARS, Config, load_config, save_config_value
-from cortext.db import DatabaseManager
-from cortext.resolver import ContextResolver, effective_priority
-from cortext.session import SessionLedger
+from strand.config import ENV_VARS, Config, load_config, save_config_value
+from strand.db import DatabaseManager
+from strand.resolver import ContextResolver, effective_priority
+from strand.session import SessionLedger
 
 NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
 
@@ -128,11 +128,11 @@ def test_touch_access_handles_empty_and_unknown_ids(db_path):
 
 def test_decay_config_defaults_env_and_file(tmp_path):
     assert Config().decay_enabled is False and Config().decay_half_life_days == 30.0
-    assert ENV_VARS["decay_enabled"] == "CORTEXT_DECAY_ENABLED"
-    assert ENV_VARS["decay_half_life_days"] == "CORTEXT_DECAY_HALF_LIFE_DAYS"
-    cfg = Config.from_env({"CORTEXT_DECAY_ENABLED": "true", "CORTEXT_DECAY_HALF_LIFE_DAYS": "0.5"}, {})
+    assert ENV_VARS["decay_enabled"] == "STRAND_DECAY_ENABLED"
+    assert ENV_VARS["decay_half_life_days"] == "STRAND_DECAY_HALF_LIFE_DAYS"
+    cfg = Config.from_env({"STRAND_DECAY_ENABLED": "true", "STRAND_DECAY_HALF_LIFE_DAYS": "0.5"}, {})
     assert cfg.decay_enabled is True and cfg.decay_half_life_days == 0.5
-    assert Config.from_env({"CORTEXT_DECAY_ENABLED": "false"}, {"decay_enabled": True}).decay_enabled is False
+    assert Config.from_env({"STRAND_DECAY_ENABLED": "false"}, {"decay_enabled": True}).decay_enabled is False
     path = tmp_path / "config.json"
     save_config_value("decay_enabled", "true", path)
     save_config_value("decay_half_life_days", "7", path)
@@ -300,14 +300,14 @@ def test_strict_config_rejects_invalid_half_life(tmp_path, bad):
     with pytest.raises(ValueError, match="decay_half_life_days"):
         load_config({}, path, strict=True)
     with pytest.raises(ValueError, match="decay_half_life_days"):
-        load_config({"CORTEXT_DECAY_HALF_LIFE_DAYS": str(bad)}, tmp_path / "none.json", strict=True)
+        load_config({"STRAND_DECAY_HALF_LIFE_DAYS": str(bad)}, tmp_path / "none.json", strict=True)
     with pytest.raises(ValueError, match="decay_half_life_days"):
         save_config_value("decay_half_life_days", bad, tmp_path / "saved.json")
     assert not (tmp_path / "saved.json").exists()
 
 
 def test_strict_config_accepts_valid_half_life(tmp_path):
-    assert load_config({"CORTEXT_DECAY_HALF_LIFE_DAYS": "0.5"}, tmp_path / "n.json", strict=True).decay_half_life_days == 0.5
+    assert load_config({"STRAND_DECAY_HALF_LIFE_DAYS": "0.5"}, tmp_path / "n.json", strict=True).decay_half_life_days == 0.5
     assert load_config({}, tmp_path / "n.json", strict=True).decay_half_life_days == 30.0
 
 

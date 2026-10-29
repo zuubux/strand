@@ -5,7 +5,7 @@ import sqlite3
 import pytest
 import sqlite_vec
 
-from cortext.db import EMBEDDING_DIM, DatabaseManager
+from strand.db import EMBEDDING_DIM, DatabaseManager
 
 
 def run(coro):
@@ -48,7 +48,7 @@ def test_setup_creates_wal_fk_vec_and_schema(db_path):
 def test_default_path_is_under_config_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     manager = DatabaseManager()
-    assert manager.db_path == tmp_path / ".config" / "cortext" / "memory.db"
+    assert manager.db_path == tmp_path / ".config" / "strand" / "memory.db"
 
     async def scenario():
         async with manager:

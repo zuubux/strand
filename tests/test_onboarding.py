@@ -8,14 +8,14 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from cortext import host as host_mod  # noqa: E402
-from cortext.config import Config  # noqa: E402
-from cortext.db import DatabaseManager  # noqa: E402
-from cortext.host import format_host_context, get_host_context  # noqa: E402
-from cortext.onboarding import ONBOARD_TRIGGER, onboarding_directive, seed_operator_anchor  # noqa: E402
-from cortext.proxy import create_app  # noqa: E402
-from cortext.resolver import ContextResolver  # noqa: E402
-from cortext.session import SessionLedger  # noqa: E402
+from strand import host as host_mod  # noqa: E402
+from strand.config import Config  # noqa: E402
+from strand.db import DatabaseManager  # noqa: E402
+from strand.host import format_host_context, get_host_context  # noqa: E402
+from strand.onboarding import ONBOARD_TRIGGER, onboarding_directive, seed_operator_anchor  # noqa: E402
+from strand.proxy import create_app  # noqa: E402
+from strand.resolver import ContextResolver  # noqa: E402
+from strand.session import SessionLedger  # noqa: E402
 from tests.test_ui import make_bridge, sse  # noqa: E402
 
 HOST = {
@@ -136,7 +136,7 @@ def test_directive_text():
 
 @pytest.fixture
 def pinned_host(monkeypatch):
-    import cortext.proxy as proxy
+    import strand.proxy as proxy
 
     monkeypatch.setattr(proxy, "get_host_context", lambda: dict(HOST))
 
@@ -156,7 +156,7 @@ def _post(tmp_path, headers=None, with_person=False, times=1):
             resolver = ContextResolver(db, SessionLedger())
             app = create_app(Config(upstream_url="http://upstream.test/v1"), resolver, upstream)
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://cortext") as client:
+            async with httpx.AsyncClient(transport=transport, base_url="http://strand") as client:
                 for _ in range(times):
                     payload = {"messages": [{"role": "user", "content": "hello there"}], "session_id": "s1"}
                     await client.post("/v1/chat/completions", json=payload, headers=headers or {})
@@ -175,7 +175,7 @@ def _system_text(request):
 
 
 def test_header_triggers_onboarding_directive_and_seeds(tmp_path, pinned_host):
-    seen, names = _post(tmp_path, {"X-Cortext-Mode": "onboarding"}, with_person=True)
+    seen, names = _post(tmp_path, {"X-Strand-Mode": "onboarding"}, with_person=True)
     system = _system_text(seen[0])
     assert "[Onboarding Directive: Grounding & Resonance]" in system
     assert "host ONYX, Fedora Linux 44" in system
@@ -194,7 +194,7 @@ def test_no_directive_when_person_exists_and_no_header(tmp_path, pinned_host):
 
 
 def test_onboarding_session_persists_without_header(tmp_path, pinned_host):
-    seen, _ = _post(tmp_path, {"X-Cortext-Mode": "onboarding"}, with_person=True, times=2)
+    seen, _ = _post(tmp_path, {"X-Strand-Mode": "onboarding"}, with_person=True, times=2)
     assert len(seen) == 2
     assert all("[Onboarding Directive" in _system_text(r) for r in seen)
 
@@ -218,7 +218,7 @@ def test_onboard_command_resets_session_and_sends_trigger(qapp):
         time.sleep(0.01)
     assert len(requests) == 1
     request = requests[0]
-    assert request.headers["x-cortext-mode"] == "onboarding"
+    assert request.headers["x-strand-mode"] == "onboarding"
     assert request.headers["x-session-id"] == b.sessionId
     assert json.loads(request.content)["messages"] == [{"role": "user", "content": ONBOARD_TRIGGER}]
 
@@ -227,4 +227,4 @@ def test_new_command_clears_onboarding_mode(qapp):
     b = make_bridge(lambda r: httpx.Response(200, content=sse("ok")))
     b._onboarding = True
     assert b.runCommand("/new")
-    assert "X-Cortext-Mode" not in b._headers()
+    assert "X-Strand-Mode" not in b._headers()

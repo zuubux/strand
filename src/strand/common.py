@@ -1,6 +1,6 @@
-"""Shared constants and small helpers used across Cortext modules.
+"""Shared constants and small helpers used across Strand modules.
 
-This module must not import from other `cortext` modules (it sits at the bottom of the
+This module must not import from other `strand` modules (it sits at the bottom of the
 dependency graph).
 """
 

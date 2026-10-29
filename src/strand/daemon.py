@@ -151,7 +151,7 @@ def warn_if_exposed(config: Config, log=None) -> bool:
     (log or get_logger("daemon")).warning(
         "SECURITY: binding to non-loopback host %s:%d with no api_key configured; anyone who can "
         "reach this port can read your memory graph and use your upstream credentials. "
-        "Set CORTEXT_API_KEY or bind to 127.0.0.1.",
+        "Set STRAND_API_KEY or bind to 127.0.0.1.",
         config.host,
         config.port,
     )
@@ -159,7 +159,7 @@ def warn_if_exposed(config: Config, log=None) -> bool:
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="python -m cortext.daemon", description="Run the Cortext daemon.")
+    parser = argparse.ArgumentParser(prog="python -m strand.daemon", description="Run the Strand daemon.")
     parser.add_argument(
         "--diag",
         "--debug",
@@ -172,9 +172,9 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 @contextlib.contextmanager
 def _quiet_uvicorn_logging():
-    """Route uvicorn's own logs into the cortext log file instead of the terminal."""
+    """Route uvicorn's own logs into the strand log file instead of the terminal."""
     original = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
-    handler = {"()": "cortext.logging.uvicorn_log_handler"}
+    handler = {"()": "strand.logging.uvicorn_log_handler"}
     quiet = copy.deepcopy(original)
     quiet["formatters"] = {}
     quiet["handlers"] = {"default": handler, "access": handler}
@@ -191,7 +191,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     """Run the daemon. uvicorn traps SIGINT/SIGTERM and runs the app lifespan shutdown,
     which closes the HTTP client and the SQLite connection cleanly.
 
-    Quiet by default (logs go to the cortext log file only); `--diag`/`--debug` streams
+    Quiet by default (logs go to the strand log file only); `--diag`/`--debug` streams
     verbose colored logs to the terminal as well."""
     args = _parse_args([] if argv is None else argv)
     if args.diag:
@@ -205,7 +205,7 @@ def _run(args: argparse.Namespace) -> None:
     try:
         config = load_config(strict=True)
     except ValueError as exc:
-        raise SystemExit(f"cortext: configuration error: {exc}") from exc
+        raise SystemExit(f"strand: configuration error: {exc}") from exc
     if args.diag:
         setup_logging("DEBUG", debug=True)
     else:
@@ -217,8 +217,8 @@ def _run(args: argparse.Namespace) -> None:
         try:
             prepare_socket(socket_path)
         except RuntimeError as exc:
-            raise SystemExit(f"cortext: {exc}") from exc
-        log.info("Starting Cortext on unix:%s", socket_path)
+            raise SystemExit(f"strand: {exc}") from exc
+        log.info("Starting Strand on unix:%s", socket_path)
         try:
             asyncio.run(_serve_uds(app, socket_path))
         except (KeyboardInterrupt, asyncio.CancelledError):
@@ -227,7 +227,7 @@ def _run(args: argparse.Namespace) -> None:
             pass
     else:
         warn_if_exposed(config, log)
-        log.info("Starting Cortext on %s:%d", config.host, config.port)
+        log.info("Starting Strand on %s:%d", config.host, config.port)
         uvicorn.run(app, host=config.host, port=config.port)
 
 

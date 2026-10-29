@@ -3,10 +3,10 @@ import time
 
 import pytest
 
-from cortext.config import ENV_VARS, Config
-from cortext.db import DatabaseManager
-from cortext.resolver import ContextResolver
-from cortext.session import SessionLedger
+from strand.config import ENV_VARS, Config
+from strand.db import DatabaseManager
+from strand.resolver import ContextResolver
+from strand.session import SessionLedger
 
 DAY = 86400.0
 
@@ -67,7 +67,7 @@ def test_resolver_injects_then_dedupes_per_session(tmp_path):
 
     t1, t2, other, same = run(scenario())
     today = time.strftime("%Y-%m-%d", time.gmtime())
-    assert t1.startswith("## Cortext Memory\n[Recent Continuity]\n")
+    assert t1.startswith("## Strand Memory\n[Recent Continuity]\n")
     assert f"- {today}: Re-pinned the connector block." in t1
     assert t1.index("[Recent Continuity]") < t1.index("Entities:")
     assert t2 == ""
@@ -126,9 +126,9 @@ def test_ledger_tracks_episodes():
 
 
 def test_config_continuity_keys(tmp_path):
-    assert ENV_VARS["continuity_horizon_days"] == "CORTEXT_CONTINUITY_HORIZON_DAYS"
-    assert ENV_VARS["continuity_max_episodes"] == "CORTEXT_CONTINUITY_MAX_EPISODES"
+    assert ENV_VARS["continuity_horizon_days"] == "STRAND_CONTINUITY_HORIZON_DAYS"
+    assert ENV_VARS["continuity_max_episodes"] == "STRAND_CONTINUITY_MAX_EPISODES"
     cfg = Config()
     assert cfg.continuity_horizon_days == 7.0 and cfg.continuity_max_episodes == 2
-    cfg = Config.from_env({"CORTEXT_CONTINUITY_HORIZON_DAYS": "3.5"}, {"continuity_max_episodes": 4})
+    cfg = Config.from_env({"STRAND_CONTINUITY_HORIZON_DAYS": "3.5"}, {"continuity_max_episodes": 4})
     assert cfg.continuity_horizon_days == 3.5 and cfg.continuity_max_episodes == 4

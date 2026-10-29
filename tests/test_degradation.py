@@ -5,11 +5,11 @@ import sys
 import pytest
 import sqlite_vec
 
-from cortext import cli, daemon, embed
-from cortext.config import Config
-from cortext.db import DatabaseManager
-from cortext.embed import EmbeddingManager, EmbeddingUnavailable
-from cortext.resolver import ContextResolver
+from strand import cli, daemon, embed
+from strand.config import Config
+from strand.db import DatabaseManager
+from strand.embed import EmbeddingManager, EmbeddingUnavailable
+from strand.resolver import ContextResolver
 from tests.test_embed import MockEmbeddingManager, unit
 
 FASTEMBED_WARNING = "fastembed unavailable; falling back to lexical-only matching."
@@ -34,7 +34,7 @@ class _Collector(logging.Handler):
 
 @pytest.fixture
 def logs():
-    logger = logging.getLogger("cortext")
+    logger = logging.getLogger("strand")
     handler = _Collector()
     old_level = logger.level
     logger.addHandler(handler)
@@ -199,18 +199,18 @@ def test_embed_backfill_reports_unavailable_embedder(tmp_path, monkeypatch, caps
     assert FASTEMBED_WARNING in capsys.readouterr().err
 
 
-# --- cortext doctor ----------------------------------------------------------
+# --- strand doctor ----------------------------------------------------------
 
 
 @pytest.fixture
 def doctor_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in (
-        "CORTEXT_HOST",
-        "CORTEXT_PORT",
-        "CORTEXT_SOCKET_PATH",
-        "CORTEXT_EXTRACTOR_MODEL",
-        "CORTEXT_EXTRACTOR_URL",
+        "STRAND_HOST",
+        "STRAND_PORT",
+        "STRAND_SOCKET_PATH",
+        "STRAND_EXTRACTOR_MODEL",
+        "STRAND_EXTRACTOR_URL",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
@@ -243,7 +243,7 @@ def test_doctor_healthy_checklist(doctor_env, monkeypatch, capsys):
     assert "fastembed: installed" in out
     assert "model cache: BAAI/bge-small-en-v1.5 cached at" in out
     assert "extractor SLM: http://127.0.0.1:11434/v1" in out and "reachable" in out
-    assert f"transport: uds {tmp_path}/run/cortext/cortext.sock" in out
+    assert f"transport: uds {tmp_path}/run/strand/strand.sock" in out
     assert pings == ["http://127.0.0.1:11434/v1/models"]
     assert "[fail]" not in out
 
@@ -251,9 +251,9 @@ def test_doctor_healthy_checklist(doctor_env, monkeypatch, capsys):
 def test_doctor_reports_degraded_components(doctor_env, no_vec, monkeypatch, capsys):
     tmp_path, _ = doctor_env
     monkeypatch.setattr(cli, "fastembed_available", lambda: False)
-    monkeypatch.setenv("CORTEXT_HOST", "0.0.0.0")
-    monkeypatch.setenv("CORTEXT_PORT", "9000")
-    monkeypatch.setenv("CORTEXT_EXTRACTOR_MODEL", "qwen")
+    monkeypatch.setenv("STRAND_HOST", "0.0.0.0")
+    monkeypatch.setenv("STRAND_PORT", "9000")
+    monkeypatch.setenv("STRAND_EXTRACTOR_MODEL", "qwen")
     assert cli.main(["--db", str(tmp_path / "doc.db"), "doctor"]) == 0
     out = capsys.readouterr().out
     assert "[fail] sqlite-vec: not loaded; vector indexing disabled" in out

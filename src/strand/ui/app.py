@@ -1,4 +1,4 @@
-"""Launcher for the Cortext desktop chat window (`cortext-gui` / `python -m cortext.ui`)."""
+"""Launcher for the Strand desktop chat window (`strand-gui` / `python -m strand.ui`)."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ QML_DIR = Path(__file__).parent / "qml"
 MAIN_QML = QML_DIR / "main.qml"
 
 
-SETTINGS_ORG = "cortext"
-SETTINGS_APP = "cortext-gui"
+SETTINGS_ORG = "strand"
+SETTINGS_APP = "strand-gui"
 GEOMETRY_KEY = "window/geometry"
 WIDTH_KEY = "window/width"
 HEIGHT_KEY = "window/height"
@@ -96,19 +96,19 @@ def main(argv: list[str] | None = None) -> int:
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
 
-    from cortext.ui.bridge import Bridge
+    from strand.ui.bridge import Bridge
 
     args = sys.argv if argv is None else argv
     QQuickStyle.setStyle("Basic")  # fully custom-styled controls; no native-style overrides
     app = QGuiApplication(args)
-    app.setApplicationName("Cortext")
-    app.setDesktopFileName("cortext")
+    app.setApplicationName("Strand")
+    app.setDesktopFileName("strand")
     bridge = Bridge()
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("bridge", bridge)
     engine.load(QUrl.fromLocalFile(str(MAIN_QML)))
     if not engine.rootObjects():
-        print("cortext-gui: failed to load main.qml", file=sys.stderr)
+        print("strand-gui: failed to load main.qml", file=sys.stderr)
         return 1
     window = engine.rootObjects()[0]
     settings = make_settings()

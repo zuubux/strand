@@ -3,8 +3,8 @@ import sys
 
 import pytest
 
-from cortext.db import EMBEDDING_DIM, DatabaseManager
-from cortext.embed import Embedder, EmbeddingManager
+from strand.db import EMBEDDING_DIM, DatabaseManager
+from strand.embed import Embedder, EmbeddingManager
 
 
 def unit(axis: int) -> list[float]:
@@ -117,7 +117,7 @@ def test_find_similar_rejects_wrong_dimension(db_path):
 
 
 def test_drop_removes_vector(db_path):
-    from cortext.cli import _delete_entities
+    from strand.cli import _delete_entities
 
     async def go():
         async with DatabaseManager(db_path) as db:
@@ -143,7 +143,7 @@ def _embedding_ids(path):
 
 
 def test_embed_backfill_cli_embeds_only_missing(db_path, monkeypatch, capsys):
-    from cortext import cli
+    from strand import cli
 
     async def seed():
         async with DatabaseManager(db_path) as db:

@@ -1,4 +1,4 @@
-# Cortext Roadmap
+# Strand Roadmap
 
 Check items off as they land. Every phase must keep `pytest -W error` green, fully offline, at $0 API cost.
 
@@ -23,7 +23,7 @@ Check items off as they land. Every phase must keep `pytest -W error` green, ful
 - [x] **ROB-5 (D24, D27, D28) Concurrency Throttling & Numerical Stability Guards**: background distillation is bounded by `asyncio.Semaphore(4)`; `SessionLedger` caps active sessions (`max_sessions=1000`, LRU eviction) and `session_id` is limited to 128 chars (HTTP 400 beyond); `effective_priority` returns the undecayed `confidence * weight` for a non-finite or non-positive half-life.
 
 ## Phase 3b: Final Kernel Hardening
-- [x] **KRN-1 (C1) No private-context laundering**: an exchange served with `X-Cortext-Allow-Private: true` is never distilled (JSON and streaming); `DistillationEngine` also never rewrites an existing private entity.
+- [x] **KRN-1 (C1) No private-context laundering**: an exchange served with `X-Strand-Allow-Private: true` is never distilled (JSON and streaming); `DistillationEngine` also never rewrites an existing private entity.
 - [x] **KRN-2 (C2) Ingress & TCP hardening**: `POST /v1/chat/completions` bodies are capped at 10 MiB (`MAX_REQUEST_BYTES`, HTTP 413, enforced on `Content-Length` and while streaming chunked bodies); pathologically nested JSON is HTTP 400; `daemon.main` logs a security warning when TCP binds beyond loopback with no `api_key`.
 - [x] **KRN-3 (C3) Log leak prevention**: the "Incoming query" log line carries the length plus an 80-char preview of the *sanitized* query.
 - [x] **KRN-4 (C4) Orphan vector sweep**: `run_migrations` deletes `entity_embeddings` rows with no matching entity whenever vec is enabled.
@@ -31,13 +31,13 @@ Check items off as they land. Every phase must keep `pytest -W error` green, ful
 - [x] **KRN-6 (C5, D1) Stream parsing resilience & reasoning tags**: `strip_think` removes `<think>`, `<thinking>`, `<thought>` and `<reasoning>` blocks; `_stream_text` extracts text from list-form `delta.content` parts instead of dropping the chunk.
 
 ## Phase 4: Interface & Interaction Layer (GUI)
-- [x] **UI-1 Desktop Workbench (`cortext-gui`)**: Native PySide6 / QML chat window communicating over UDS (`cortext.sock`) or TCP. Includes diagnostics drawer (`Ctrl+D`), session rotation (`Ctrl+L`), abort (`Esc`), command history (`Up`/`Down`), markdown/code styling, and window geometry persistence.
+- [x] **UI-1 Desktop Workbench (`strand-gui`)**: Native PySide6 / QML chat window communicating over UDS (`strand.sock`) or TCP. Includes diagnostics drawer (`Ctrl+D`), session rotation (`Ctrl+L`), abort (`Esc`), command history (`Up`/`Down`), markdown/code styling, and window geometry persistence.
 - [x] **UI-2 Local Slash Commands**: `/new`, `/private <on|off>`, `/model <name>`, and `/help` intercepted client-side without polluting upstream context.
 - [ ] **UI-3 System Tray & Global Hotkey**: Ambient background daemon presence with global hotkey launcher.
 
 ## Phase 5: The Personality Matrix & Interaction Tuning
 - [x] **PER-1 Matrix Archetypes (`trait`, `directive`, `preference`)**: End-to-end substrate for behavioral memory. Permitted in schema, extracted by Model B (with automatic edge deprecation for conflicting rules), tracked by `SessionLedger` (injected once per session), and categorized hierarchically in `resolver.py`.
-- [x] **PER-2 Bedrock Persona Anchor**: `persona_prompt` configured via `config.json` (`CORTEXT_PERSONA_PROMPT`), injected as synthetic entity `-1` on Turn 1 under `[Persona Stance]`.
+- [x] **PER-2 Bedrock Persona Anchor**: `persona_prompt` configured via `config.json` (`STRAND_PERSONA_PROMPT`), injected as synthetic entity `-1` on Turn 1 under `[Persona Stance]`.
 - [x] **PER-3 Structured Proxy Metric Logs**: Log line accurately reports `entities=X edges=Y traits=Z directives=A preferences=B` or `(empty)`.
 
 ## Phase 6: Cognitive Partnership & Proactive Reasoning
@@ -47,7 +47,7 @@ Check items off as they land. Every phase must keep `pytest -W error` green, ful
 - [x] **COG-2 Conversational Grounding & Onboarding**:
   - Ambient first-run detection or `/onboard` / `/bootstrap` command.
   - Guided, organic conversational interview (subtle steering rather than rigid questionnaires) to seed the `User` (`Nic`) anchor node, hardware orbit (ONYX, Promethean), active projects, key collaborators, and core interaction stances.
-- [ ] **COG-3 Episodic Stitching & Project Continuity**:
+- [x] **COG-3 Episodic Stitching & Project Continuity**:
   - Cross-reference recent uncompacted episodes (last 7 days) matching queried entities to inject recent working context into new sessions.
 - [ ] **COG-4 Shared Lore & Episodic Vernacular**:
   - Defer until > 200 operational episodes accumulate.

@@ -2,9 +2,9 @@ import asyncio
 
 import pytest
 
-from cortext.db import DatabaseManager
-from cortext.resolver import ContextResolver
-from cortext.session import SessionLedger
+from strand.db import DatabaseManager
+from strand.resolver import ContextResolver
+from strand.session import SessionLedger
 
 
 def run(coro):
@@ -132,7 +132,7 @@ def test_multi_turn_deltas_full_then_empty_then_only_new_entity(db_path):
     turn1, turn2, turn3, turn4 = run(scenario())
 
     # Turn 1: full delta for the Marcus/Atlas neighbourhood (2 hops reaches Postgres).
-    assert turn1.startswith("## Cortext Memory")
+    assert turn1.startswith("## Strand Memory")
     for line in (
         "- Marcus (person): Staff engineer",
         "- Atlas Migration (project): Move billing to Postgres",
@@ -249,7 +249,7 @@ def test_resolve_renders_compact_markdown(db_path):
     (turn,) = _turns(db_path, ["Priya"])
     assert turn == "\n".join(
         [
-            "## Cortext Memory",
+            "## Strand Memory",
             "Entities:",
             "- Priya (person): Finance lead",
             "- Billing Audit (project): Quarterly audit",
@@ -270,7 +270,7 @@ def test_resolve_emits_only_new_edge_between_already_seen_entities(db_path):
 
     first, delta, again = run(scenario())
     assert first
-    assert delta == "## Cortext Memory\nRelations:\n- Dana -approved-> Postgres"
+    assert delta == "## Strand Memory\nRelations:\n- Dana -approved-> Postgres"
     assert again == ""
 
 
@@ -302,7 +302,7 @@ def test_resolve_entity_without_edges_renders_entities_only(db_path):
 
     first, second = run(scenario())
     assert first == "\n".join(
-        ["## Cortext Memory", "Entities:", "- Loner (concept): Line one line two !", "- Blank (concept)"]
+        ["## Strand Memory", "Entities:", "- Loner (concept): Line one line two !", "- Blank (concept)"]
     )
     assert "Relations:" not in first
     assert second == ""

@@ -11,14 +11,14 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from cortext import daemon
-from cortext.common import strip_think
-from cortext.compactor import SessionCompactor
-from cortext.config import Config, save_config_value
-from cortext.db import DatabaseManager
-from cortext.proxy import _inject_delta, _stream_text, create_app
-from cortext.resolver import ContextResolver, effective_priority
-from cortext.session import SessionLedger
+from strand import daemon
+from strand.common import strip_think
+from strand.compactor import SessionCompactor
+from strand.config import Config, save_config_value
+from strand.db import DatabaseManager
+from strand.proxy import _inject_delta, _stream_text, create_app
+from strand.resolver import ContextResolver, effective_priority
+from strand.session import SessionLedger
 
 
 def run(coro):
@@ -128,7 +128,7 @@ async def drive(tmp_path, stream, session="s1"):
             Config(upstream_url="http://upstream.test/v1"), ContextResolver(db, ledger), upstream, engine
         )
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://cortext") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://strand") as client:
             try:
                 result = await client.post(
                     "/v1/chat/completions",

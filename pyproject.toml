@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cortext"
+name = "strand"
 version = "0.1.0"
 description = "Headless local cognitive working-memory daemon"
 requires-python = ">=3.11"
@@ -14,10 +14,15 @@ dependencies = [
     "uvicorn",
     "httpx",
     "fastembed",
+    "PySide6",
 ]
 
 [project.scripts]
-cortext = "cortext.cli:main"
+strand = "strand.cli:main"
+strand-gui = "strand.ui.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"strand.ui" = ["qml/*.qml"]

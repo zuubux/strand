@@ -4,14 +4,14 @@ import stat
 
 import pytest
 
-from cortext import daemon
-from cortext.config import Config, load_config
+from strand import daemon
+from strand.config import Config, load_config
 
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
-    for name in ("CORTEXT_HOST", "CORTEXT_PORT", "CORTEXT_SOCKET_PATH", "XDG_RUNTIME_DIR"):
+    for name in ("STRAND_HOST", "STRAND_PORT", "STRAND_SOCKET_PATH", "XDG_RUNTIME_DIR"):
         monkeypatch.delenv(name, raising=False)
     return tmp_path
 
@@ -24,15 +24,15 @@ def test_default_is_tcp_without_xdg(home):
 
 
 def test_explicit_socket_path_selects_uds(home, monkeypatch):
-    monkeypatch.setenv("CORTEXT_SOCKET_PATH", "/tmp/x/c.sock")
-    monkeypatch.setenv("CORTEXT_PORT", "9000")
+    monkeypatch.setenv("STRAND_SOCKET_PATH", "/tmp/x/c.sock")
+    monkeypatch.setenv("STRAND_PORT", "9000")
     config = load_config()
     assert config.is_socket_mode()
     assert config.get_bind_target() == ("uds", "/tmp/x/c.sock")
 
 
 def test_socket_path_from_config_file(home):
-    path = home / ".config" / "cortext" / "config.json"
+    path = home / ".config" / "strand" / "config.json"
     path.parent.mkdir(parents=True)
     path.write_text('{"socket_path": "/tmp/f.sock"}')
     assert load_config().effective_socket_path() == "/tmp/f.sock"
@@ -42,10 +42,10 @@ def test_xdg_runtime_dir_defaults_to_uds(home, monkeypatch):
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
     config = load_config()
     assert config.is_socket_mode()
-    assert config.get_bind_target() == ("uds", "/run/user/1000/cortext/cortext.sock")
+    assert config.get_bind_target() == ("uds", "/run/user/1000/strand/strand.sock")
 
 
-@pytest.mark.parametrize("name,value", [("CORTEXT_HOST", "0.0.0.0"), ("CORTEXT_PORT", "8088")])
+@pytest.mark.parametrize("name,value", [("STRAND_HOST", "0.0.0.0"), ("STRAND_PORT", "8088")])
 def test_host_or_port_override_forces_tcp(home, monkeypatch, name, value):
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
     monkeypatch.setenv(name, value)
@@ -56,7 +56,7 @@ def test_host_or_port_override_forces_tcp(home, monkeypatch, name, value):
 
 def test_file_port_forces_tcp(home, monkeypatch):
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
-    path = home / ".config" / "cortext" / "config.json"
+    path = home / ".config" / "strand" / "config.json"
     path.parent.mkdir(parents=True)
     path.write_text('{"port": 9001}')
     assert not load_config().is_socket_mode()
@@ -67,7 +67,7 @@ def test_plain_config_has_no_socket():
 
 
 def test_prepare_socket_creates_private_dir_and_unlinks_stale(tmp_path):
-    sock = tmp_path / "run" / "cortext" / "cortext.sock"
+    sock = tmp_path / "run" / "strand" / "strand.sock"
     sock.parent.mkdir(parents=True, mode=0o755)
     import socket
 
@@ -123,13 +123,13 @@ def test_serve_uds_sets_0600_and_cleans_up(tmp_path, monkeypatch):
 def test_daemon_quiet_by_default_and_diag_flag(monkeypatch, tmp_path):
     import logging
 
-    from cortext.logging import shutdown_logging
+    from strand.logging import shutdown_logging
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    for key in ("XDG_RUNTIME_DIR", "CORTEXT_SOCKET_PATH", "CORTEXT_PORT", "CORTEXT_API_KEY"):
+    for key in ("XDG_RUNTIME_DIR", "STRAND_SOCKET_PATH", "STRAND_PORT", "STRAND_API_KEY"):
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("CORTEXT_HOST", "127.0.0.1")
-    monkeypatch.setenv("CORTEXT_LOG_PATH", str(tmp_path / "c.log"))
+    monkeypatch.setenv("STRAND_HOST", "127.0.0.1")
+    monkeypatch.setenv("STRAND_LOG_PATH", str(tmp_path / "c.log"))
     monkeypatch.setattr(daemon, "build_app", lambda config: object())
     seen = []
     monkeypatch.setattr(
@@ -138,10 +138,10 @@ def test_daemon_quiet_by_default_and_diag_flag(monkeypatch, tmp_path):
         lambda app, **kw: seen.append(dict(daemon.uvicorn.config.LOGGING_CONFIG["handlers"]["default"])),
     )
     original = dict(daemon.uvicorn.config.LOGGING_CONFIG["handlers"]["default"])
-    logger = logging.getLogger("cortext")
+    logger = logging.getLogger("strand")
     try:
         daemon.main([])
-        assert seen[0] == {"()": "cortext.logging.uvicorn_log_handler"}
+        assert seen[0] == {"()": "strand.logging.uvicorn_log_handler"}
         assert daemon.uvicorn.config.LOGGING_CONFIG["handlers"]["default"] == original
         assert not any(type(h) is logging.StreamHandler for h in logger.handlers)
         daemon.main(["--diag"])
@@ -150,4 +150,4 @@ def test_daemon_quiet_by_default_and_diag_flag(monkeypatch, tmp_path):
         assert any(type(h) is logging.StreamHandler for h in logger.handlers)
     finally:
         shutdown_logging()
-    assert "Starting Cortext" in (tmp_path / "c.log").read_text()
+    assert "Starting Strand" in (tmp_path / "c.log").read_text()

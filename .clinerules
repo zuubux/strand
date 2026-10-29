@@ -1,4 +1,4 @@
-# Cortext Engineering Charter & Rules
+# Strand Engineering Charter & Rules
 
 ## 0. Strict Git & Repository Invariant
 - NEVER run any `git` commands (zero `git add`, `commit`, `push`, etc.). Version control belongs strictly to the human developer.
@@ -10,7 +10,7 @@
 - **TEST INTEGRITY:** Fix code, never relax tests. Keep dependencies strictly to `aiosqlite`, `sqlite-vec`, and `fastapi`.
 
 ## 2. Architectural Boundaries
-- Cortext is a headless system daemon running at `127.0.0.1:8088`.
+- Strand is a headless system daemon running at `127.0.0.1:8088`.
 - It exposes a standard `/v1/chat/completions` proxy endpoint.
 - Database: Embedded SQLite in WAL mode with `sqlite-vec`.
 - Storage is Entity-Relationship Triples (entities, edges, episodes), not raw markdown files.

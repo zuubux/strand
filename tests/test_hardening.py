@@ -6,15 +6,15 @@ import time
 import httpx
 import pytest
 
-from cortext.common import MODEL_CONFIDENCE
-from cortext.config import Config, load_config
-from cortext.db import DatabaseManager
-from cortext.distill import DistillationEngine, heuristic_extract
-from cortext.extractors import parse_extraction
-from cortext.proxy import _stream_text, create_app
-from cortext.resolver import ContextResolver
-from cortext.sanitize import REDACTED, sanitize_text
-from cortext.session import SessionLedger
+from strand.common import MODEL_CONFIDENCE
+from strand.config import Config, load_config
+from strand.db import DatabaseManager
+from strand.distill import DistillationEngine, heuristic_extract
+from strand.extractors import parse_extraction
+from strand.proxy import _stream_text, create_app
+from strand.resolver import ContextResolver
+from strand.sanitize import REDACTED, sanitize_text
+from strand.session import SessionLedger
 
 from .test_proxy import SSE_BODY, body_of, ok_json, proxy_client, run
 
@@ -137,7 +137,7 @@ def test_resolver_failure_fails_open(tmp_path, caplog):
             resolver.resolve = boom  # type: ignore[method-assign]
             app = create_app(Config(upstream_url="http://upstream.test/v1"), resolver, upstream)
             transport = httpx.ASGITransport(app=app)
-            async with httpx.AsyncClient(transport=transport, base_url="http://cortext") as client:
+            async with httpx.AsyncClient(transport=transport, base_url="http://strand") as client:
                 payload = {"messages": [{"role": "user", "content": "Tell me about Marcus"}]}
                 return await client.post("/v1/chat/completions", json=payload)
 
@@ -251,8 +251,8 @@ def test_pick_preserves_explicit_falsy_file_values():
 
 
 def test_pick_env_overrides_file_and_empty_env_falls_through():
-    assert Config.from_env({"CORTEXT_PORT": "7"}, {"port": 9}).port == 7
-    assert Config.from_env({"CORTEXT_PORT": ""}, {"port": 9}).port == 9
+    assert Config.from_env({"STRAND_PORT": "7"}, {"port": 9}).port == 7
+    assert Config.from_env({"STRAND_PORT": ""}, {"port": 9}).port == 9
 
 
 def test_strict_load_raises_on_corrupt_config(tmp_path):
@@ -264,10 +264,10 @@ def test_strict_load_raises_on_corrupt_config(tmp_path):
 
 
 def test_daemon_main_exits_on_corrupt_config(tmp_path, monkeypatch):
-    from cortext import daemon
+    from strand import daemon
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    path = tmp_path / ".config" / "cortext" / "config.json"
+    path = tmp_path / ".config" / "strand" / "config.json"
     path.parent.mkdir(parents=True)
     path.write_text("{not json")
     with pytest.raises(SystemExit, match="configuration error"):

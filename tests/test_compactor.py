@@ -7,10 +7,10 @@ import time
 import httpx
 import pytest
 
-from cortext.cli import main
-from cortext.compactor import SessionCompactor, parse_compaction
-from cortext.config import ENV_VARS, Config
-from cortext.db import DatabaseManager
+from strand.cli import main
+from strand.compactor import SessionCompactor, parse_compaction
+from strand.config import ENV_VARS, Config
+from strand.db import DatabaseManager
 
 HOUR = 3600.0
 
@@ -48,9 +48,9 @@ async def summary(db, name):
 
 
 def test_config_key_and_default():
-    assert ENV_VARS["compaction_threshold_hours"] == "CORTEXT_COMPACTION_THRESHOLD_HOURS"
+    assert ENV_VARS["compaction_threshold_hours"] == "STRAND_COMPACTION_THRESHOLD_HOURS"
     assert Config().compaction_threshold_hours == 24.0
-    cfg = Config.from_env({"CORTEXT_COMPACTION_THRESHOLD_HOURS": "2.5"}, {})
+    cfg = Config.from_env({"STRAND_COMPACTION_THRESHOLD_HOURS": "2.5"}, {})
     assert cfg.compaction_threshold_hours == 2.5
 
 
@@ -260,8 +260,8 @@ def test_heuristic_fallback_without_model(tmp_path):
 
 def test_cli_compact(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("CORTEXT_EXTRACTOR_MODEL", raising=False)
-    monkeypatch.delenv("CORTEXT_COMPACTION_THRESHOLD_HOURS", raising=False)
+    monkeypatch.delenv("STRAND_EXTRACTOR_MODEL", raising=False)
+    monkeypatch.delenv("STRAND_COMPACTION_THRESHOLD_HOURS", raising=False)
     path = tmp_path / "cli.db"
 
     async def setup():
@@ -285,7 +285,7 @@ def test_cli_compact(tmp_path, monkeypatch, capsys):
 @pytest.mark.parametrize("hours", ["0"])
 def test_cli_compact_hours_override(tmp_path, monkeypatch, capsys, hours):
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("CORTEXT_EXTRACTOR_MODEL", raising=False)
+    monkeypatch.delenv("STRAND_EXTRACTOR_MODEL", raising=False)
     path = tmp_path / "cli2.db"
 
     async def setup():

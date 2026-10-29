@@ -1,6 +1,6 @@
 import pytest
 
-from cortext.sanitize import REDACTED, is_secret_token, sanitize_text
+from strand.sanitize import REDACTED, is_secret_token, sanitize_text
 
 SECRETS = {
     "openai": "sk-" + "a1B2c3D4e5" * 3,

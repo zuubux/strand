@@ -1,4 +1,4 @@
-"""Operator CLI: inspect and administer the Cortext memory database without raw SQL.
+"""Operator CLI: inspect and administer the Strand memory database without raw SQL.
 
 Talks to SQLite directly (WAL mode), so the daemon does not need to be running.
 """
@@ -248,7 +248,7 @@ async def cmd_doctor(db: DatabaseManager, args: argparse.Namespace) -> int:
     config = load_config()
     async with db.conn.execute("PRAGMA journal_mode") as cur:
         mode = str((await cur.fetchone())[0]).lower()
-    print("Cortext doctor")
+    print("Strand doctor")
     print(f"{_check(mode == 'wal')} database: {db.db_path} (journal_mode={mode})")
     vec = db.vec_enabled
     print(f"{_check(vec)} sqlite-vec: {'loaded' if vec else 'not loaded; vector indexing disabled'}")
@@ -400,8 +400,8 @@ def _positive(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="cortext", description="Inspect and administer Cortext memory.")
-    parser.add_argument("--db", help="database path (default: $CORTEXT_DB_PATH or ~/.config/cortext/memory.db)")
+    parser = argparse.ArgumentParser(prog="strand", description="Inspect and administer Strand memory.")
+    parser.add_argument("--db", help="database path (default: $STRAND_DB_PATH or ~/.config/strand/memory.db)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("stats", help="show entity/edge/episode counts").set_defaults(func=cmd_stats)
@@ -456,7 +456,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--diag", "--debug", dest="diag", action="store_true", help="verbose colored logs on the terminal")
     p.set_defaults(func=cmd_daemon, local=True)
 
-    p = sub.add_parser("logs", help="print the end of the Cortext log file")
+    p = sub.add_parser("logs", help="print the end of the Strand log file")
     p.add_argument("--tail", "-n", type=_positive, default=50, metavar="N", help="lines to show (default 50)")
     p.set_defaults(func=cmd_logs, local=True)
     return parser

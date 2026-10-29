@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from cortext.common import (
+from strand.common import (
     MIN_EDGE_CONFIDENCE,
     PERSONALITY_ARCHETYPES,
     aliases_of,
@@ -16,15 +16,15 @@ from cortext.common import (
     is_private,
     load_metadata,
 )
-from cortext.db import DatabaseManager
-from cortext.embed import Embedder, EmbeddingUnavailable
-from cortext.logging import get_logger
-from cortext.session import SessionDelta, SessionLedger
-from cortext.stopwords import FUNCTION_WORDS, is_stop_word
+from strand.db import DatabaseManager
+from strand.embed import Embedder, EmbeddingUnavailable
+from strand.logging import get_logger
+from strand.session import SessionDelta, SessionLedger
+from strand.stopwords import FUNCTION_WORDS, is_stop_word
 
 MAX_HOPS_LIMIT = 2
 MIN_TOKEN_LENGTH = 3  # shortest whole-word token allowed in the token-overlap fallback
-_HEADER = "## Cortext Memory"
+_HEADER = "## Strand Memory"
 ESTABLISHED_CONFIDENCE = 0.8  # facts at or above this are presented as established
 MIN_EFFECTIVE_PRIORITY = 0.15  # with decay enabled, candidates below this are pruned
 MAX_FREQUENCY_FACTOR = 1.5  # cap on the access-frequency boost

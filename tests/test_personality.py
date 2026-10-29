@@ -5,13 +5,13 @@ import json
 
 import httpx
 
-from cortext.cli import main
-from cortext.config import Config
-from cortext.db import DatabaseManager
-from cortext.distill import DistillationEngine
-from cortext.extractors import SYSTEM_PROMPT, LLMExtractor
-from cortext.resolver import ContextResolver
-from cortext.stopwords import is_valid_entity_name
+from strand.cli import main
+from strand.config import Config
+from strand.db import DatabaseManager
+from strand.distill import DistillationEngine
+from strand.extractors import SYSTEM_PROMPT, LLMExtractor
+from strand.resolver import ContextResolver
+from strand.stopwords import is_valid_entity_name
 
 QUERY = "Stop apologizing, be more terse, and give me unified diffs for every code change."
 RESPONSE = "Understood. I will keep replies terse and send every code change as a unified diff."
@@ -68,7 +68,7 @@ def test_personality_names_accept_descriptive_and_hyphenated_identifiers():
 def test_config_persona_prompt_env_and_file():
     assert Config().persona_prompt == ""
     assert Config.from_env({}, {"persona_prompt": " Calm peer. "}).persona_prompt == "Calm peer."
-    env = {"CORTEXT_PERSONA_PROMPT": "Env wins"}
+    env = {"STRAND_PERSONA_PROMPT": "Env wins"}
     assert Config.from_env(env, {"persona_prompt": "file"}).persona_prompt == "Env wins"
 
 
@@ -167,7 +167,7 @@ def test_hierarchical_formatting_and_session_dedup(tmp_path):
     order = ["[Persona Stance]", "[Operational Directives]", "[Interaction Preferences]", "[Working Memory]"]
     positions = [turn1.index(t) for t in order]
     assert positions == sorted(positions)
-    assert turn1.startswith("## Cortext Memory\n[Persona Stance]\n- Dry Wit: Sovereign systems peer, dry wit, calm")
+    assert turn1.startswith("## Strand Memory\n[Persona Stance]\n- Dry Wit: Sovereign systems peer, dry wit, calm")
     assert "[Operational Directives]\n- no-apologies: Never apologize or use filler" in turn1
     assert "[Interaction Preferences]\n- Torque in Nm: Torque specs in Nm" in turn1
     working = turn1.split("[Working Memory]")[1]
@@ -177,7 +177,7 @@ def test_hierarchical_formatting_and_session_dedup(tmp_path):
     # Turn 2+: the personality delta is empty, and so is everything else (SessionLedger dedup).
     assert turn2 == "" and turn3 == ""
     # A different session gets the personality nodes once, with no working-memory section.
-    assert other.startswith("## Cortext Memory\n[Persona Stance]")
+    assert other.startswith("## Strand Memory\n[Persona Stance]")
     assert "[Working Memory]" not in other
 
 
@@ -195,9 +195,9 @@ def test_empty_sections_are_omitted_and_plain_output_unchanged(tmp_path):
         return only_rule, plain
 
     only_rule, plain = run(scenario())
-    assert only_rule == "## Cortext Memory\n[Operational Directives]\n- no-filler: No conversational filler"
+    assert only_rule == "## Strand Memory\n[Operational Directives]\n- no-filler: No conversational filler"
     assert "[Persona Stance]" not in only_rule and "[Interaction Preferences]" not in only_rule
-    assert plain.startswith("## Cortext Memory\nEntities:") and "[Working Memory]" not in plain
+    assert plain.startswith("## Strand Memory\nEntities:") and "[Working Memory]" not in plain
 
 
 def test_persona_prompt_anchor_injected_once_per_session(tmp_path):
@@ -209,7 +209,7 @@ def test_persona_prompt_anchor_injected_once_per_session(tmp_path):
             return first, second
 
     first, second = run(scenario())
-    assert first == "## Cortext Memory\n[Persona Stance]\nCalm, unhurried peer."
+    assert first == "## Strand Memory\n[Persona Stance]\nCalm, unhurried peer."
     assert second == ""
 
 

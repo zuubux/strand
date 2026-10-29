@@ -1,0 +1,33 @@
+# Strand user service.
+#
+# Setup (per user, no root needed):
+#   pip install --user .                      # installs `strand`, `strand-gui` and strand.daemon
+#   mkdir -p ~/.config/strand ~/.local/share/strand
+#   mkdir -p ~/.config/systemd/user && cp packaging/systemd/strand.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now strand
+#
+# Check:  systemctl --user status strand   |   strand logs -n 50
+# Debug:  systemctl --user stop strand && python3 -m strand.daemon --diag
+#
+# The daemon is quiet by default: structured logs go to ~/.local/share/strand/strand.log
+# (not the journal). It serves on $XDG_RUNTIME_DIR/strand/strand.sock (0600).
+[Unit]
+Description=Strand cognitive working-memory daemon
+After=network.target
+
+[Service]
+Type=simple
+# Uses the python3 on the user's PATH, where `pip install --user` put the strand package.
+ExecStart=/home/nic/Projects/strand/.venv/bin/python3 -m strand.daemon
+Restart=on-failure
+RestartSec=3
+ProtectSystem=strict
+ProtectHome=read-only
+RuntimeDirectory=strand
+ReadWritePaths=%h/.config/strand %h/.local/share/strand %t/strand
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

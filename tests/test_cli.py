@@ -4,8 +4,8 @@ import sqlite3
 import pytest
 import sqlite_vec
 
-from cortext.cli import main
-from cortext.db import EMBEDDING_DIM, DatabaseManager
+from strand.cli import main
+from strand.db import EMBEDDING_DIM, DatabaseManager
 
 
 @pytest.fixture
@@ -151,6 +151,6 @@ def test_prune_keeps_user_explicit_and_connected(seeded, capsys):
 
 
 def test_db_path_from_env(seeded, capsys, monkeypatch):
-    monkeypatch.setenv("CORTEXT_DB_PATH", str(seeded))
+    monkeypatch.setenv("STRAND_DB_PATH", str(seeded))
     assert main(["stats"]) == 0
     assert "entities: 3" in capsys.readouterr().out

@@ -1,8 +1,8 @@
 import asyncio
 
-from cortext.db import DatabaseManager
-from cortext.resolver import ContextResolver
-from cortext.session import SessionLedger
+from strand.db import DatabaseManager
+from strand.resolver import ContextResolver
+from strand.session import SessionLedger
 from tests.test_proxy import body_of, ok_json, proxy_client
 
 
@@ -74,10 +74,10 @@ def test_proxy_withholds_private_context_by_default(tmp_path):
 
 
 def test_proxy_header_enables_private_context_case_insensitively(tmp_path):
-    payload = run(proxy_post(tmp_path, {"x-cortext-allow-private": "True"}))
+    payload = run(proxy_post(tmp_path, {"x-strand-allow-private": "True"}))
     assert "Secret vault code" in payload
 
 
 def test_proxy_other_header_values_do_not_enable_private(tmp_path):
-    payload = run(proxy_post(tmp_path, {"X-Cortext-Allow-Private": "false"}))
+    payload = run(proxy_post(tmp_path, {"X-Strand-Allow-Private": "false"}))
     assert "Secret vault code" not in payload

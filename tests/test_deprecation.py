@@ -4,11 +4,11 @@ import logging
 
 import pytest
 
-from cortext.db import DatabaseManager
-from cortext.distill import DistillationEngine, heuristic_extract
-from cortext.extractors import SYSTEM_PROMPT, parse_extraction
-from cortext.resolver import ContextResolver
-from cortext.session import SessionLedger
+from strand.db import DatabaseManager
+from strand.distill import DistillationEngine, heuristic_extract
+from strand.extractors import SYSTEM_PROMPT, parse_extraction
+from strand.resolver import ContextResolver
+from strand.session import SessionLedger
 
 
 def run(coro):
@@ -191,7 +191,7 @@ def test_extractor_prompt_emphasizes_state_transitions():
 
 
 def test_cli_prune_decayed_removes_deprecated_edges_and_honors_dry_run(tmp_path, capsys):
-    from cortext.cli import main
+    from strand.cli import main
 
     path = tmp_path / "m.db"
 

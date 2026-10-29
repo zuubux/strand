@@ -1,4 +1,4 @@
-"""Dependency-free inspection of the local workstation (imports nothing from `cortext`)."""
+"""Dependency-free inspection of the local workstation (imports nothing from `strand`)."""
 
 import getpass
 import os

@@ -4,11 +4,11 @@ from contextlib import asynccontextmanager
 
 import httpx
 
-from cortext.config import Config
-from cortext.db import DatabaseManager
-from cortext.proxy import create_app
-from cortext.resolver import ContextResolver
-from cortext.session import SessionLedger
+from strand.config import Config
+from strand.db import DatabaseManager
+from strand.proxy import create_app
+from strand.resolver import ContextResolver
+from strand.session import SessionLedger
 
 SSE_BODY = b'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\ndata: [DONE]\n\n'
 
@@ -33,7 +33,7 @@ async def proxy_client(db_path, upstream_handler):
         config = Config(upstream_url="http://upstream.test/v1", upstream_api_key="sk-test")
         app = create_app(config, resolver, upstream)
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://cortext") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://strand") as client:
             try:
                 yield client, seen
             finally:
@@ -98,7 +98,7 @@ def test_prepends_to_existing_system_message_and_strips_session_id(tmp_path):
     payload = body_of(request)
     assert "session_id" not in payload
     system = payload["messages"][0]["content"]
-    assert system.startswith("## Cortext Memory")
+    assert system.startswith("## Strand Memory")
     assert system.endswith("Be terse.")
     assert len(payload["messages"]) == 2
 
@@ -196,29 +196,29 @@ def test_config_from_env_defaults_and_overrides():
     defaults = Config.from_env({})
     assert (defaults.host, defaults.port) == ("127.0.0.1", 8088)
     assert defaults.upstream_url == "https://api.openai.com/v1"
-    assert defaults.db_path == "~/.config/cortext/memory.db"
+    assert defaults.db_path == "~/.config/strand/memory.db"
 
     custom = Config.from_env(
         {
-            "CORTEXT_UPSTREAM_URL": "http://x/v1",
-            "CORTEXT_UPSTREAM_API_KEY": "k",
-            "CORTEXT_PORT": "9000",
-            "CORTEXT_HOST": "0.0.0.0",
-            "CORTEXT_DB_PATH": "/tmp/db",
+            "STRAND_UPSTREAM_URL": "http://x/v1",
+            "STRAND_UPSTREAM_API_KEY": "k",
+            "STRAND_PORT": "9000",
+            "STRAND_HOST": "0.0.0.0",
+            "STRAND_DB_PATH": "/tmp/db",
         }
     )
     assert custom == Config("http://x/v1", "k", "0.0.0.0", 9000, "/tmp/db")
 
 
 def test_delta_log_fields_count_personality_and_working_memory():
-    from cortext.proxy import _delta_log_fields
+    from strand.proxy import _delta_log_fields
 
     delta = (
-        "## Cortext Memory\n[Persona Stance]\nAnchor prompt\n- Dry Wit: calm\n"
+        "## Strand Memory\n[Persona Stance]\nAnchor prompt\n- Dry Wit: calm\n"
         "[Operational Directives]\n- a: x\n- b: y\n[Interaction Preferences]\n- Nm: z\n"
         "[Working Memory]\nEntities:\n- BMW (vehicle): E34\nRelations:\n- User -drives-> BMW\n- A -b-> C"
     )
     assert _delta_log_fields(delta) == "entities=1 edges=2 traits=2 directives=2 preferences=1"
-    plain = "## Cortext Memory\nEntities:\n- A (person): x\n- B (person): y\nRelations:\n- A -knows-> B"
+    plain = "## Strand Memory\nEntities:\n- A (person): x\n- B (person): y\nRelations:\n- A -knows-> B"
     assert _delta_log_fields(plain) == "entities=2 edges=1"
     assert _delta_log_fields("") == "entities=0 edges=0"

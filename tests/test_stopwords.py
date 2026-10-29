@@ -2,10 +2,10 @@ import asyncio
 
 import pytest
 
-from cortext.db import DatabaseManager
-from cortext.distill import DistillationEngine, heuristic_extract
-from cortext.resolver import ContextResolver
-from cortext.stopwords import is_valid_entity_name
+from strand.db import DatabaseManager
+from strand.distill import DistillationEngine, heuristic_extract
+from strand.resolver import ContextResolver
+from strand.stopwords import is_valid_entity_name
 
 
 @pytest.mark.parametrize(

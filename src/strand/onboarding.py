@@ -6,7 +6,7 @@ from .db import DatabaseManager
 from .host import format_host_context
 
 ONBOARDING_MODE = "onboarding"
-ONBOARDING_HEADER = "X-Cortext-Mode"
+ONBOARDING_HEADER = "X-Strand-Mode"
 ONBOARD_TRIGGER = "(The operator just opened a fresh session. Open the conversation.)"
 OPERATOR_ALIAS = "User"
 OPERATES_HOST = "operates_host"
@@ -68,7 +68,7 @@ async def seed_operator_anchor(db: DatabaseManager, host_info: dict[str, Any]) -
 def onboarding_directive(host_info: dict[str, Any]) -> str:
     return (
         "[Onboarding Directive: Grounding & Resonance]\n"
-        "- You are Cortext, initializing working memory with your operator on this Linux workstation.\n"
+        "- You are Strand, initializing working memory with your operator on this Linux workstation.\n"
         f"- Ambient Host Context: {format_host_context(host_info)}\n"
         "- Demeanor: Warm, unhurried, technically grounded peer with dry wit. Speak as an authentic "
         "counterpart, not an HR survey or chatbot.\n"

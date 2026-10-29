@@ -7,15 +7,15 @@ import logging
 import httpx
 import pytest
 
-from cortext import daemon, proxy
-from cortext.common import is_private, strip_think
-from cortext.compactor import SessionCompactor
-from cortext.config import Config
-from cortext.db import PRIVATE_ENTITY_SQL, DatabaseManager
-from cortext.distill import DistillationEngine
-from cortext.proxy import _stream_text, create_app
-from cortext.resolver import ContextResolver
-from cortext.session import SessionLedger
+from strand import daemon, proxy
+from strand.common import is_private, strip_think
+from strand.compactor import SessionCompactor
+from strand.config import Config
+from strand.db import PRIVATE_ENTITY_SQL, DatabaseManager
+from strand.distill import DistillationEngine
+from strand.proxy import _stream_text, create_app
+from strand.resolver import ContextResolver
+from strand.session import SessionLedger
 
 from .test_embed import unit
 from .test_proxy import ok_json, proxy_client, run
@@ -37,8 +37,8 @@ class _Collector(logging.Handler):
 
 @pytest.fixture
 def logs():
-    """Capture the `cortext` logger tree directly (independent of propagation settings)."""
-    logger = logging.getLogger("cortext")
+    """Capture the `strand` logger tree directly (independent of propagation settings)."""
+    logger = logging.getLogger("strand")
     handler = _Collector()
     old_level = logger.level
     logger.addHandler(handler)
@@ -100,7 +100,7 @@ def test_is_private_false(archetype, metadata):
 
 
 def test_resolver_reuses_the_canonical_predicate():
-    from cortext import resolver
+    from strand import resolver
 
     assert resolver.is_private is is_private
 
@@ -266,7 +266,7 @@ async def _exchange(tmp_path, headers, stream=False):
         await db.upsert_entity("Vault", "private", "Secret vault code")
         app = create_app(Config(upstream_url="http://upstream.test/v1"), ContextResolver(db, SessionLedger()), upstream, engine)
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://cortext") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://strand") as client:
             response = await client.post(
                 "/v1/chat/completions",
                 json={"stream": stream, "messages": [{"role": "user", "content": QUERY}]},
@@ -280,14 +280,14 @@ async def _exchange(tmp_path, headers, stream=False):
 
 @pytest.mark.parametrize("stream", [False, True])
 def test_allow_private_exchange_is_never_distilled(tmp_path, stream, logs):
-    request, engine = run(_exchange(tmp_path, {"X-Cortext-Allow-Private": "true"}, stream))
+    request, engine = run(_exchange(tmp_path, {"X-Strand-Allow-Private": "true"}, stream))
     assert "Secret vault code" in request.content.decode()  # private context really was injected
     assert engine.calls == []
     assert "Skipping distillation" in logs.text
 
 
 @pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("headers", [{}, {"X-Cortext-Allow-Private": "false"}])
+@pytest.mark.parametrize("headers", [{}, {"X-Strand-Allow-Private": "false"}])
 def test_default_exchange_is_still_distilled(tmp_path, stream, headers):
     request, engine = run(_exchange(tmp_path, headers, stream))
     assert "Secret vault code" not in request.content.decode()
@@ -379,17 +379,17 @@ def test_safe_bind_does_not_warn(config, logs):
 
 def test_main_warns_before_serving_tcp_exposed(monkeypatch, tmp_path, logs):
     monkeypatch.setenv("HOME", str(tmp_path))
-    for key in ("XDG_RUNTIME_DIR", "CORTEXT_API_KEY", "CORTEXT_SOCKET_PATH", "CORTEXT_PORT"):
+    for key in ("XDG_RUNTIME_DIR", "STRAND_API_KEY", "STRAND_SOCKET_PATH", "STRAND_PORT"):
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("CORTEXT_HOST", "0.0.0.0")
-    monkeypatch.setenv("CORTEXT_LOG_PATH", str(tmp_path / "cortext.log"))
+    monkeypatch.setenv("STRAND_HOST", "0.0.0.0")
+    monkeypatch.setenv("STRAND_LOG_PATH", str(tmp_path / "strand.log"))
     served = []
     monkeypatch.setattr(daemon, "build_app", lambda config: object())
     monkeypatch.setattr(daemon.uvicorn, "run", lambda app, **kw: served.append(kw))
     try:
         daemon.main()
     finally:
-        from cortext.logging import shutdown_logging
+        from strand.logging import shutdown_logging
 
         shutdown_logging()
     assert served == [{"host": "0.0.0.0", "port": 8088}]

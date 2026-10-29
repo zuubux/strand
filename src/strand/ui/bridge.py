@@ -1,4 +1,4 @@
-"""QObject bridge between the QML chat window and the local Cortext daemon.
+"""QObject bridge between the QML chat window and the local Strand daemon.
 
 Transport is the daemon's UNIX socket (loopback TCP fallback) via httpx. Each turn
 streams on a worker thread with its own asyncio loop; Qt signals emitted there are
@@ -22,19 +22,19 @@ from typing import Any
 import httpx
 from PySide6.QtCore import Property, QObject, Signal, Slot
 
-from cortext.config import Config, load_config
-from cortext.onboarding import ONBOARD_TRIGGER, ONBOARDING_HEADER, ONBOARDING_MODE
+from strand.config import Config, load_config
+from strand.onboarding import ONBOARD_TRIGGER, ONBOARDING_HEADER, ONBOARDING_MODE
 
 DEFAULT_MODEL = "gpt-4o-mini"
-UDS_BASE_URL = "http://cortext"
+UDS_BASE_URL = "http://strand"
 CHAT_PATH = "/v1/chat/completions"
-PRIVATE_HEADER = "X-Cortext-Allow-Private"
+PRIVATE_HEADER = "X-Strand-Allow-Private"
 HISTORY_LIMIT = 100
 COMMAND_RE = re.compile(r"^/([A-Za-z]+)(?:[ \t]+(.*))?$", re.DOTALL)
 FENCE_RE = re.compile(r"^[ \t]{0,3}```[ \t]*([\w+.#-]*)[ \t]*$")
 HELP_TEXT = (
-    "Commands: /new (fresh session), /private on|off (send X-Cortext-Allow-Private), "
-    "/model <name> (switch model), /onboard (fresh session, Cortext opens the grounding conversation), /help. Ctrl+L new session, Ctrl+D diagnostics, Esc stop/clear."
+    "Commands: /new (fresh session), /private on|off (send X-Strand-Allow-Private), "
+    "/model <name> (switch model), /onboard (fresh session, Strand opens the grounding conversation), /help. Ctrl+L new session, Ctrl+D diagnostics, Esc stop/clear."
 )
 
 
@@ -82,9 +82,9 @@ def split_markdown(text: str) -> list[dict[str, Any]]:
 def resolve_model(
     config: Config, env: Mapping[str, str] | None = None, explicit: str | None = None
 ) -> str:
-    """Pick the chat model: explicit > $CORTEXT_UI_MODEL > config `model_default` > fallback."""
+    """Pick the chat model: explicit > $STRAND_UI_MODEL > config `model_default` > fallback."""
     env = os.environ if env is None else env
-    for candidate in (explicit, env.get("CORTEXT_UI_MODEL"), config.model_default):
+    for candidate in (explicit, env.get("STRAND_UI_MODEL"), config.model_default):
         if candidate and candidate.strip():
             return candidate.strip()
     return DEFAULT_MODEL
@@ -293,7 +293,7 @@ class Bridge(QObject):
             aborted = True
         except httpx.ConnectError as exc:
             self._set_status("Disconnected")
-            error = f"Cannot reach Cortext daemon: {exc}"
+            error = f"Cannot reach Strand daemon: {exc}"
         except httpx.HTTPError as exc:
             error = f"Request failed: {exc}"
         except Exception as exc:  # noqa: BLE001 - nothing may escape the worker thread
@@ -392,7 +392,7 @@ class Bridge(QObject):
                     except Exception:  # noqa: BLE001
                         pass
 
-        thread = threading.Thread(target=target, name="cortext-ui-io", daemon=True)
+        thread = threading.Thread(target=target, name="strand-ui-io", daemon=True)
         thread.start()
         return thread
 

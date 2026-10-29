@@ -2,11 +2,11 @@ import asyncio
 import json
 import logging
 
-from cortext.db import EMBEDDING_DIM, DatabaseManager
-from cortext.distill import DistillationEngine, heuristic_extract
-from cortext.extractors import SYSTEM_PROMPT, parse_extraction
-from cortext.resolver import ContextResolver
-from cortext.session import SessionLedger
+from strand.db import EMBEDDING_DIM, DatabaseManager
+from strand.distill import DistillationEngine, heuristic_extract
+from strand.extractors import SYSTEM_PROMPT, parse_extraction
+from strand.resolver import ContextResolver
+from strand.session import SessionLedger
 
 
 def run(coro):

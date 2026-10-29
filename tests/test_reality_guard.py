@@ -2,9 +2,9 @@
 
 import asyncio
 
-from cortext.db import DatabaseManager
-from cortext.proxy import _delta_log_fields
-from cortext.resolver import ContextResolver
+from strand.db import DatabaseManager
+from strand.proxy import _delta_log_fields
+from strand.resolver import ContextResolver
 
 CHECK = "[Reality Check - Attribute Discrepancy]"
 
@@ -103,7 +103,7 @@ def test_format_keeps_personality_sections_and_places_check_first(tmp_path):
     order = [
         delta.index(m)
         for m in (
-            "## Cortext Memory",
+            "## Strand Memory",
             CHECK,
             "[Persona Stance]",
             "[Operational Directives]",

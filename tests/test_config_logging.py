@@ -3,22 +3,22 @@ import logging
 
 import pytest
 
-from cortext.cli import main, mask_secret
-from cortext.config import Config, load_config, save_config_value
-from cortext.logging import get_logger, setup_logging, shutdown_logging
+from strand.cli import main, mask_secret
+from strand.config import Config, load_config, save_config_value
+from strand.logging import get_logger, setup_logging, shutdown_logging
 
 
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     for name in (
-        "CORTEXT_UPSTREAM_URL",
-        "CORTEXT_UPSTREAM_API_KEY",
-        "CORTEXT_HOST",
-        "CORTEXT_PORT",
-        "CORTEXT_DB_PATH",
-        "CORTEXT_LOG_LEVEL",
-        "CORTEXT_LOG_PATH",
+        "STRAND_UPSTREAM_URL",
+        "STRAND_UPSTREAM_API_KEY",
+        "STRAND_HOST",
+        "STRAND_PORT",
+        "STRAND_DB_PATH",
+        "STRAND_LOG_LEVEL",
+        "STRAND_LOG_PATH",
     ):
         monkeypatch.delenv(name, raising=False)
     return tmp_path
@@ -30,21 +30,21 @@ def test_defaults_when_no_file(home):
 
 
 def test_file_overrides_defaults_and_env_overrides_file(home, monkeypatch):
-    path = home / ".config" / "cortext" / "config.json"
+    path = home / ".config" / "strand" / "config.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"upstream_url": "http://file/v1", "port": 9001, "log_level": "debug"}))
     config = load_config()
     assert (config.upstream_url, config.port, config.log_level) == ("http://file/v1", 9001, "DEBUG")
     assert config.host == "127.0.0.1"
 
-    monkeypatch.setenv("CORTEXT_UPSTREAM_URL", "http://env/v1")
-    monkeypatch.setenv("CORTEXT_PORT", "7000")
+    monkeypatch.setenv("STRAND_UPSTREAM_URL", "http://env/v1")
+    monkeypatch.setenv("STRAND_PORT", "7000")
     config = load_config()
     assert (config.upstream_url, config.port, config.log_level) == ("http://env/v1", 7000, "DEBUG")
 
 
 def test_corrupt_file_is_ignored(home):
-    path = home / ".config" / "cortext" / "config.json"
+    path = home / ".config" / "strand" / "config.json"
     path.parent.mkdir(parents=True)
     path.write_text("{not json")
     assert load_config() == Config()
@@ -53,7 +53,7 @@ def test_corrupt_file_is_ignored(home):
 def test_save_config_value_creates_dirs_and_merges(home):
     save_config_value("upstream_api_key", "sk-abc")
     save_config_value("port", "9100")
-    path = home / ".config" / "cortext" / "config.json"
+    path = home / ".config" / "strand" / "config.json"
     assert json.loads(path.read_text()) == {"port": 9100, "upstream_api_key": "sk-abc"}
     assert path.stat().st_mode & 0o777 == 0o600
     with pytest.raises(KeyError):
@@ -93,8 +93,8 @@ def test_logs_missing_file(home, capsys):
 
 
 def test_rotating_logger_writes_and_cli_tails(home, capsys, monkeypatch):
-    log_path = home / "logs" / "cortext.log"
-    monkeypatch.setenv("CORTEXT_LOG_PATH", str(log_path))
+    log_path = home / "logs" / "strand.log"
+    monkeypatch.setenv("STRAND_LOG_PATH", str(log_path))
     try:
         logger = setup_logging("INFO", debug=False)
         get_logger("proxy").info("hello %d", 1)
@@ -111,7 +111,7 @@ def test_rotating_logger_writes_and_cli_tails(home, capsys, monkeypatch):
     assert "[WARNING] [db] line 4" in text
     assert "hidden" not in text
     assert text.split(" [")[0].count("-") == 2  # YYYY-MM-DD HH:MM:SS prefix
-    assert not any(getattr(h, "_cortext_managed", False) for h in logging.getLogger("cortext").handlers)
+    assert not any(getattr(h, "_strand_managed", False) for h in logging.getLogger("strand").handlers)
 
     assert main(["logs", "--tail", "2"]) == 0
     lines = capsys.readouterr().out.splitlines()
@@ -122,12 +122,12 @@ def test_rotating_logger_writes_and_cli_tails(home, capsys, monkeypatch):
 
 
 def test_dedup_distance_threshold_config(tmp_path):
-    from cortext.config import ENV_VARS, Config, load_config
+    from strand.config import ENV_VARS, Config, load_config
 
     assert Config().dedup_distance_threshold == 0.45
-    assert ENV_VARS["dedup_distance_threshold"] == "CORTEXT_DEDUP_DISTANCE_THRESHOLD"
+    assert ENV_VARS["dedup_distance_threshold"] == "STRAND_DEDUP_DISTANCE_THRESHOLD"
     assert Config.from_env({}, {"dedup_distance_threshold": 0.3}).dedup_distance_threshold == 0.3
-    env = {"CORTEXT_DEDUP_DISTANCE_THRESHOLD": "0.2"}
+    env = {"STRAND_DEDUP_DISTANCE_THRESHOLD": "0.2"}
     assert load_config(env, tmp_path / "none.json").dedup_distance_threshold == 0.2
 
 
@@ -139,15 +139,15 @@ def test_model_default_precedence_and_cli_persistence(home, monkeypatch, capsys)
     assert load_config().model_default == "gemini-3.6-flash"
     assert main(["config", "get", "model_default"]) == 0
     assert capsys.readouterr().out.strip() == "gemini-3.6-flash"
-    monkeypatch.setenv("CORTEXT_MODEL_DEFAULT", "env-model")
+    monkeypatch.setenv("STRAND_MODEL_DEFAULT", "env-model")
     assert load_config().model_default == "env-model"
     assert load_config({}).model_default == "gemini-3.6-flash"
 
 
 def test_uvicorn_records_use_server_component(tmp_path):
-    from cortext.logging import uvicorn_log_handler
+    from strand.logging import uvicorn_log_handler
 
-    log_path = tmp_path / "cortext.log"
+    log_path = tmp_path / "strand.log"
     setup_logging("INFO", log_path, debug=False)
     handler = uvicorn_log_handler()
     uv = logging.getLogger("uvicorn.error")

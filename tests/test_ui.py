@@ -8,9 +8,9 @@ from PySide6.QtCore import QCoreApplication
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from cortext.config import Config  # noqa: E402
-from cortext.ui import bridge as bridge_mod  # noqa: E402
-from cortext.ui.bridge import Bridge, parse_sse_line, resolve_endpoint, status_label  # noqa: E402
+from strand.config import Config  # noqa: E402
+from strand.ui import bridge as bridge_mod  # noqa: E402
+from strand.ui.bridge import Bridge, parse_sse_line, resolve_endpoint, status_label  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -29,7 +29,7 @@ def sse(*tokens, done=True):
 
 def make_bridge(handler, config=None):
     factory = lambda: httpx.AsyncClient(  # noqa: E731
-        transport=httpx.MockTransport(handler), base_url="http://cortext"
+        transport=httpx.MockTransport(handler), base_url="http://strand"
     )
     return Bridge(config=config or Config(), model="test-model", client_factory=factory)
 
@@ -61,12 +61,12 @@ def test_resolve_endpoint_uses_existing_socket(tmp_path):
         uds, base = resolve_endpoint(Config(socket_path=path))
     finally:
         srv.close()
-    assert (uds, base) == (path, "http://cortext")
+    assert (uds, base) == (path, "http://strand")
     assert status_label(uds, base) == "Connected: c.sock"
 
 
 def test_resolve_endpoint_xdg_default_and_tcp_fallback(tmp_path):
-    sock = tmp_path / "cortext" / "cortext.sock"
+    sock = tmp_path / "strand" / "strand.sock"
     config = Config()
     assert config.effective_socket_path({"XDG_RUNTIME_DIR": str(tmp_path)}) == str(sock)
     # Missing socket file -> loopback TCP fallback.
@@ -77,7 +77,7 @@ def test_resolve_endpoint_xdg_default_and_tcp_fallback(tmp_path):
 
 def test_make_client_selects_uds_transport(tmp_path, monkeypatch):
     b = Bridge(config=Config(), model="m")
-    b._uds_path, b._base_url = str(tmp_path / "x.sock"), "http://cortext"
+    b._uds_path, b._base_url = str(tmp_path / "x.sock"), "http://strand"
     seen = {}
     real = httpx.AsyncHTTPTransport
 
@@ -189,7 +189,7 @@ def test_qml_loads_offscreen(qapp):
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
 
-    from cortext.ui.app import MAIN_QML
+    from strand.ui.app import MAIN_QML
 
     QQuickStyle.setStyle("Basic")
     b = make_bridge(lambda r: httpx.Response(200, json={}))
@@ -197,29 +197,29 @@ def test_qml_loads_offscreen(qapp):
     engine.rootContext().setContextProperty("bridge", b)
     engine.load(QUrl.fromLocalFile(str(MAIN_QML)))
     assert engine.rootObjects()
-    assert engine.rootObjects()[0].property("title") == "Cortext"
+    assert engine.rootObjects()[0].property("title") == "Strand"
     engine.deleteLater()
 
 
-# ---- model resolution: explicit > CORTEXT_UI_MODEL > config model_default > fallback ----
+# ---- model resolution: explicit > STRAND_UI_MODEL > config model_default > fallback ----
 
 
 def test_resolve_model_precedence():
-    from cortext.ui.bridge import DEFAULT_MODEL, resolve_model
+    from strand.ui.bridge import DEFAULT_MODEL, resolve_model
 
     cfg = Config(model_default="gemini-3.6-flash")
-    assert resolve_model(cfg, {"CORTEXT_UI_MODEL": "env-m"}, explicit="arg-m") == "arg-m"
-    assert resolve_model(cfg, {"CORTEXT_UI_MODEL": "env-m"}) == "env-m"
-    assert resolve_model(cfg, {"CORTEXT_UI_MODEL": "  "}) == "gemini-3.6-flash"
+    assert resolve_model(cfg, {"STRAND_UI_MODEL": "env-m"}, explicit="arg-m") == "arg-m"
+    assert resolve_model(cfg, {"STRAND_UI_MODEL": "env-m"}) == "env-m"
+    assert resolve_model(cfg, {"STRAND_UI_MODEL": "  "}) == "gemini-3.6-flash"
     assert resolve_model(cfg, {}) == "gemini-3.6-flash"
     assert resolve_model(Config(), {}) == DEFAULT_MODEL
 
 
 def test_bridge_uses_persisted_model_default(qapp, monkeypatch):
-    monkeypatch.delenv("CORTEXT_UI_MODEL", raising=False)
+    monkeypatch.delenv("STRAND_UI_MODEL", raising=False)
     cfg = Config(model_default="gemini-3.6-flash")
     assert Bridge(config=cfg).modelName == "gemini-3.6-flash"
-    monkeypatch.setenv("CORTEXT_UI_MODEL", "override")
+    monkeypatch.setenv("STRAND_UI_MODEL", "override")
     assert Bridge(config=cfg).modelName == "override"
 
 
@@ -227,7 +227,7 @@ def test_bridge_uses_persisted_model_default(qapp, monkeypatch):
 
 
 def test_parse_command():
-    from cortext.ui.bridge import parse_command
+    from strand.ui.bridge import parse_command
 
     assert parse_command("/new") == ("new", "")
     assert parse_command("  /Private   ON ") == ("private", "ON")
@@ -268,13 +268,13 @@ def test_run_command_new_private_model(qapp):
     assert not b.privateMode
 
     asyncio.run(b._stream([{"role": "user", "content": "a"}]))
-    assert "x-cortext-allow-private" not in requests[-1].headers
+    assert "x-strand-allow-private" not in requests[-1].headers
     assert b.runCommand("/private on") and b.privateMode
     asyncio.run(b._stream([{"role": "user", "content": "a"}]))
-    assert requests[-1].headers["x-cortext-allow-private"] == "true"
+    assert requests[-1].headers["x-strand-allow-private"] == "true"
     assert b.runCommand("/private OFF") and not b.privateMode
     asyncio.run(b._stream([{"role": "user", "content": "a"}]))
-    assert "x-cortext-allow-private" not in requests[-1].headers
+    assert "x-strand-allow-private" not in requests[-1].headers
 
     assert "test-model" in b.runCommand("/model")
     assert "gemini-x" in b.runCommand("/model  gemini-x ")
@@ -382,7 +382,7 @@ def test_new_conversation_during_stream_aborts_and_keeps_new_session_clean(qapp)
 
 
 def test_split_markdown_code_fences():
-    from cortext.ui.bridge import split_markdown
+    from strand.ui.bridge import split_markdown
 
     segs = split_markdown("Intro\n```python\nprint(1)\n```\nOutro")
     assert [(s["code"], s["lang"], s["text"]) for s in segs] == [
@@ -399,7 +399,7 @@ def test_split_markdown_code_fences():
 def test_geometry_roundtrip_with_qsettings(qapp, tmp_path):
     from PySide6.QtCore import QSettings
 
-    from cortext.ui import app as app_mod
+    from strand.ui import app as app_mod
 
     class Rect:
         def intersects(self, other):
@@ -440,7 +440,7 @@ def test_geometry_roundtrip_with_qsettings(qapp, tmp_path):
 def test_size_persistence_roundtrip_and_clamp(qapp, tmp_path):
     from PySide6.QtCore import QSettings
 
-    from cortext.ui import app as app_mod
+    from strand.ui import app as app_mod
 
     class Win:
         def __init__(self, w=800, h=700):
@@ -474,7 +474,7 @@ def test_size_persistence_roundtrip_and_clamp(qapp, tmp_path):
 def test_restore_window_wayland_skips_position_and_survives_errors(qapp, tmp_path):
     from PySide6.QtCore import QSettings
 
-    from cortext.ui import app as app_mod
+    from strand.ui import app as app_mod
 
     class Win:
         w, h = 1, 1
@@ -536,7 +536,7 @@ def _load_window(b):
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
 
-    from cortext.ui.app import MAIN_QML
+    from strand.ui.app import MAIN_QML
 
     QQuickStyle.setStyle("Basic")
     engine = QQmlApplicationEngine()
@@ -587,7 +587,7 @@ def test_qml_slash_command_is_handled_locally(qapp):
 def test_qml_note_bubbles_do_not_collapse(qapp):
     """Local /help and /private feedback must wrap at a sane width, not one word per line."""
     from PySide6.QtCore import QMetaObject, Qt, Q_ARG
-    from cortext.ui.bridge import HELP_TEXT
+    from strand.ui.bridge import HELP_TEXT
 
     b = make_bridge(lambda r: httpx.Response(200, json={}))
     engine, win = _load_window(b)

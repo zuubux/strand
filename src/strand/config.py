@@ -1,4 +1,4 @@
-"""Daemon configuration: environment variables > ~/.config/cortext/config.json > defaults."""
+"""Daemon configuration: environment variables > ~/.config/strand/config.json > defaults."""
 
 import json
 import math
@@ -12,7 +12,7 @@ from typing import Any
 DEFAULT_UPSTREAM_URL = "https://api.openai.com/v1"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8088
-DEFAULT_DB_PATH = "~/.config/cortext/memory.db"
+DEFAULT_DB_PATH = "~/.config/strand/memory.db"
 DEFAULT_LOG_LEVEL = "INFO"
 # sqlite-vec returns L2 distance: unit vectors at cosine distance ~0.35 sit at L2 ~0.83,
 # orthogonal (unrelated) ones at >= 1.414.
@@ -26,25 +26,25 @@ DEFAULT_CONTINUITY_MAX_EPISODES = 2
 
 # config.json key -> environment variable
 ENV_VARS = {
-    "upstream_url": "CORTEXT_UPSTREAM_URL",
-    "upstream_api_key": "CORTEXT_UPSTREAM_API_KEY",
-    "api_key": "CORTEXT_API_KEY",
-    "host": "CORTEXT_HOST",
-    "port": "CORTEXT_PORT",
-    "db_path": "CORTEXT_DB_PATH",
-    "log_level": "CORTEXT_LOG_LEVEL",
-    "socket_path": "CORTEXT_SOCKET_PATH",
-    "extractor_model": "CORTEXT_EXTRACTOR_MODEL",
-    "extractor_url": "CORTEXT_EXTRACTOR_URL",
-    "distance_threshold": "CORTEXT_DISTANCE_THRESHOLD",
-    "dedup_distance_threshold": "CORTEXT_DEDUP_DISTANCE_THRESHOLD",
-    "decay_enabled": "CORTEXT_DECAY_ENABLED",
-    "decay_half_life_days": "CORTEXT_DECAY_HALF_LIFE_DAYS",
-    "compaction_threshold_hours": "CORTEXT_COMPACTION_THRESHOLD_HOURS",
-    "continuity_horizon_days": "CORTEXT_CONTINUITY_HORIZON_DAYS",
-    "continuity_max_episodes": "CORTEXT_CONTINUITY_MAX_EPISODES",
-    "model_default": "CORTEXT_MODEL_DEFAULT",
-    "persona_prompt": "CORTEXT_PERSONA_PROMPT",
+    "upstream_url": "STRAND_UPSTREAM_URL",
+    "upstream_api_key": "STRAND_UPSTREAM_API_KEY",
+    "api_key": "STRAND_API_KEY",
+    "host": "STRAND_HOST",
+    "port": "STRAND_PORT",
+    "db_path": "STRAND_DB_PATH",
+    "log_level": "STRAND_LOG_LEVEL",
+    "socket_path": "STRAND_SOCKET_PATH",
+    "extractor_model": "STRAND_EXTRACTOR_MODEL",
+    "extractor_url": "STRAND_EXTRACTOR_URL",
+    "distance_threshold": "STRAND_DISTANCE_THRESHOLD",
+    "dedup_distance_threshold": "STRAND_DEDUP_DISTANCE_THRESHOLD",
+    "decay_enabled": "STRAND_DECAY_ENABLED",
+    "decay_half_life_days": "STRAND_DECAY_HALF_LIFE_DAYS",
+    "compaction_threshold_hours": "STRAND_COMPACTION_THRESHOLD_HOURS",
+    "continuity_horizon_days": "STRAND_CONTINUITY_HORIZON_DAYS",
+    "continuity_max_episodes": "STRAND_CONTINUITY_MAX_EPISODES",
+    "model_default": "STRAND_MODEL_DEFAULT",
+    "persona_prompt": "STRAND_PERSONA_PROMPT",
 }
 
 
@@ -72,7 +72,7 @@ def _validate_half_life(value: Any) -> float:
 
 
 def default_config_path() -> Path:
-    return Path.home() / ".config" / "cortext" / "config.json"
+    return Path.home() / ".config" / "strand" / "config.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +83,7 @@ class Config:
     port: int = DEFAULT_PORT
     db_path: str = DEFAULT_DB_PATH
     log_level: str = DEFAULT_LOG_LEVEL
-    # Inbound key clients must present to Cortext (distinct from upstream_api_key).
+    # Inbound key clients must present to Strand (distinct from upstream_api_key).
     api_key: str = ""
     # UNIX domain socket path; empty means "not explicitly configured".
     socket_path: str = ""
@@ -113,14 +113,14 @@ class Config:
         """Socket path to bind, or "" for TCP.
 
         Explicit `socket_path` wins. Otherwise, with no explicit host/port and
-        $XDG_RUNTIME_DIR set, default to $XDG_RUNTIME_DIR/cortext/cortext.sock.
+        $XDG_RUNTIME_DIR set, default to $XDG_RUNTIME_DIR/strand/strand.sock.
         """
         if self.socket_path:
             return self.socket_path
         env = os.environ if env is None else env
         runtime_dir = env.get("XDG_RUNTIME_DIR")
         if runtime_dir and not self.tcp_explicit:
-            return f"{runtime_dir}/cortext/cortext.sock"
+            return f"{runtime_dir}/strand/strand.sock"
         return ""
 
     def is_socket_mode(self, env: Mapping[str, str] | None = None) -> bool:

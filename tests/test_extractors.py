@@ -3,9 +3,9 @@ import json
 
 import httpx
 
-from cortext.db import DatabaseManager
-from cortext.distill import DistillationEngine
-from cortext.extractors import LLMExtractor, parse_extraction
+from strand.db import DatabaseManager
+from strand.distill import DistillationEngine
+from strand.extractors import LLMExtractor, parse_extraction
 
 QUERY = "I am building the Atlas project with Alice every week."
 RESPONSE = "Great, Atlas sounds like a solid project and Alice seems like a strong lead."

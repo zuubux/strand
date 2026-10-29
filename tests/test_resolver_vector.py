@@ -1,7 +1,7 @@
 import asyncio
 
-from cortext.db import DatabaseManager
-from cortext.resolver import ContextResolver
+from strand.db import DatabaseManager
+from strand.resolver import ContextResolver
 from tests.test_embed import MockEmbeddingManager, unit
 
 
@@ -88,11 +88,11 @@ def test_no_embedder_keeps_lexical_behaviour(tmp_path):
 
 
 def test_config_distance_threshold_controls_cutoff(tmp_path, monkeypatch):
-    from cortext.config import Config, load_config
+    from strand.config import Config, load_config
     assert Config().distance_threshold == 1.0
-    monkeypatch.setenv("CORTEXT_DISTANCE_THRESHOLD", "0.5")
+    monkeypatch.setenv("STRAND_DISTANCE_THRESHOLD", "0.5")
     assert load_config(config_path=tmp_path / "none.json").distance_threshold == 0.5
-    monkeypatch.delenv("CORTEXT_DISTANCE_THRESHOLD")
+    monkeypatch.delenv("STRAND_DISTANCE_THRESHOLD")
     assert Config.from_env({}, {"distance_threshold": 0.9}).distance_threshold == 0.9
 
     mid = unit(0)
@@ -112,11 +112,11 @@ def test_config_distance_threshold_controls_cutoff(tmp_path, monkeypatch):
 
 
 def test_build_app_passes_distance_threshold(tmp_path):
-    from cortext.config import Config
-    from cortext.daemon import build_app
+    from strand.config import Config
+    from strand.daemon import build_app
 
     captured = {}
-    import cortext.daemon as daemon
+    import strand.daemon as daemon
 
     original = daemon.ContextResolver
 

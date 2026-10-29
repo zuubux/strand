@@ -1,7 +1,7 @@
-"""Structured rotating file logging for the `cortext` logger tree.
+"""Structured rotating file logging for the `strand` logger tree.
 
 Format: `YYYY-MM-DD HH:MM:SS [LEVEL] [component] message`, where the component is the
-last part of the logger name (e.g. `cortext.proxy` -> `proxy`).
+last part of the logger name (e.g. `strand.proxy` -> `proxy`).
 """
 
 import logging
@@ -10,7 +10,7 @@ import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-LOGGER_NAME = "cortext"
+LOGGER_NAME = "strand"
 MAX_BYTES = 5 * 1024 * 1024
 BACKUP_COUNT = 2
 FORMAT = "%(asctime)s [%(levelname)s] [%(component)s] %(message)s"
@@ -21,10 +21,10 @@ logging.getLogger(LOGGER_NAME).addHandler(logging.NullHandler())
 
 
 def default_log_path() -> Path:
-    override = os.environ.get("CORTEXT_LOG_PATH")
+    override = os.environ.get("STRAND_LOG_PATH")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".local" / "share" / "cortext" / "cortext.log"
+    return Path.home() / ".local" / "share" / "strand" / "strand.log"
 
 
 def _chmod_quiet(path: Path, mode: int) -> None:
@@ -74,7 +74,7 @@ class _ComponentFilter(logging.Filter):
 
 def _remove_managed_handlers(logger: logging.Logger) -> None:
     for handler in list(logger.handlers):
-        if getattr(handler, "_cortext_managed", False):
+        if getattr(handler, "_strand_managed", False):
             logger.removeHandler(handler)
             handler.close()
 
@@ -82,7 +82,7 @@ def _remove_managed_handlers(logger: logging.Logger) -> None:
 def setup_logging(
     level: str | int = "INFO", path: Path | str | None = None, debug: bool | None = None
 ) -> logging.Logger:
-    """Attach a rotating file handler to the `cortext` logger (idempotent).
+    """Attach a rotating file handler to the `strand` logger (idempotent).
 
     Also streams to stderr when `debug` is true; by default that means DEBUG level on a TTY.
     """
@@ -112,7 +112,7 @@ def setup_logging(
         else:
             handler.setFormatter(_ColorFormatter(FORMAT, DATE_FORMAT))
         handler.addFilter(_ComponentFilter())
-        handler._cortext_managed = True  # type: ignore[attr-defined]
+        handler._strand_managed = True  # type: ignore[attr-defined]
         logger.addHandler(handler)
     return logger
 
@@ -127,7 +127,7 @@ def get_logger(component: str) -> logging.Logger:
 
 
 def uvicorn_log_handler() -> logging.Handler:
-    """Handler factory for uvicorn's dictConfig: the managed cortext file handler (or a no-op)."""
+    """Handler factory for uvicorn's dictConfig: the managed strand file handler (or a no-op)."""
     for handler in logging.getLogger(LOGGER_NAME).handlers:
         if isinstance(handler, _SecureRotatingFileHandler):
             return handler

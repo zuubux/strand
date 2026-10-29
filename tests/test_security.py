@@ -5,12 +5,12 @@ from contextlib import asynccontextmanager
 
 import httpx
 
-from cortext.config import Config, load_config
-from cortext.db import DatabaseManager
-from cortext.logging import setup_logging, shutdown_logging
-from cortext.proxy import create_app
-from cortext.resolver import ContextResolver
-from cortext.session import SessionLedger
+from strand.config import Config, load_config
+from strand.db import DatabaseManager
+from strand.logging import setup_logging, shutdown_logging
+from strand.proxy import create_app
+from strand.resolver import ContextResolver
+from strand.session import SessionLedger
 
 
 def run(coro):
@@ -58,7 +58,7 @@ def test_db_tightens_existing_directory_and_file(tmp_path):
 
 
 def test_log_directory_and_file_are_private(tmp_path):
-    log_path = tmp_path / "logs" / "cortext.log"
+    log_path = tmp_path / "logs" / "strand.log"
     try:
         setup_logging("INFO", log_path, debug=False)
         assert mode_of(log_path.parent) == 0o700
@@ -73,11 +73,11 @@ def test_log_directory_and_file_are_private(tmp_path):
 def test_api_key_config_precedence():
     assert Config().api_key == ""
     assert Config.from_env({}, {"api_key": "file"}).api_key == "file"
-    assert Config.from_env({"CORTEXT_API_KEY": "env"}, {"api_key": "file"}).api_key == "env"
+    assert Config.from_env({"STRAND_API_KEY": "env"}, {"api_key": "file"}).api_key == "env"
 
 
-def test_load_config_reads_cortext_api_key_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("CORTEXT_API_KEY", "from-env")
+def test_load_config_reads_strand_api_key_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("STRAND_API_KEY", "from-env")
     assert load_config(config_path=tmp_path / "missing.json").api_key == "from-env"
 
 
@@ -102,7 +102,7 @@ async def auth_client(db_path, api_key, upstream_api_key="sk-up"):
         )
         app = create_app(config, ContextResolver(db, SessionLedger()), upstream)
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://cortext") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://strand") as client:
             try:
                 yield client, seen
             finally:

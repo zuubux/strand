@@ -245,7 +245,7 @@ def create_app(
             await resolver.db.close()
 
     # No auto-generated docs/schema routes on the daemon.
-    app = FastAPI(title="Cortext", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="Strand", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
     if config.api_key:
         expected = f"Bearer {config.api_key}".encode()
@@ -295,7 +295,7 @@ def create_app(
         if len(session_id) > MAX_SESSION_ID_LEN:
             return _error(400, f"session_id must be at most {MAX_SESSION_ID_LEN} characters", "invalid_request_error")
         query = _last_user_query(messages)
-        allow_private = request.headers.get("x-cortext-allow-private", "").strip().lower() == "true"
+        allow_private = request.headers.get("x-strand-allow-private", "").strip().lower() == "true"
         # Sanitize the whole query before cutting the preview: truncating first could leave a
         # partial secret too short for the redaction patterns to match.
         preview = sanitize_text(query)[:_QUERY_LOG_CHARS]
@@ -313,7 +313,7 @@ def create_app(
             logger.info("Resolved delta session=%r %s", session_id, _delta_log_fields(delta))
         else:
             logger.info("Resolved delta session=%r entities=0 edges=0", session_id)
-        mode = request.headers.get("x-cortext-mode", "").strip().lower()
+        mode = request.headers.get("x-strand-mode", "").strip().lower()
         try:
             explicit = mode == ONBOARDING_MODE
             if resolution_failed:

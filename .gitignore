@@ -1,4 +1,4 @@
-# Cortext / SQLite & Local Databases
+# Strand / SQLite & Local Databases
 *.db
 *.db-shm
 *.db-wal

@@ -9,7 +9,7 @@ ApplicationWindow {
     height: 640
     minimumWidth: 420
     minimumHeight: 360
-    title: "Cortext"
+    title: "Strand"
     color: "#16191D"
 
     readonly property color panel: "#1E2228"
@@ -76,7 +76,7 @@ ApplicationWindow {
             if (feedback.length > 0) {
                 input.text = ""
                 note(feedback)
-                if (bridge.busy)  // /onboard: Cortext opens, so show its streaming reply
+                if (bridge.busy)  // /onboard: Strand opens, so show its streaming reply
                     transcript.append({ role: "assistant", body: "", pending: true })
                 return
             }
@@ -193,7 +193,7 @@ ApplicationWindow {
                 anchors.leftMargin: 12
                 anchors.rightMargin: 6
                 Label {
-                    text: bridge.privateMode ? "Cortext  ·  private" : "Cortext"
+                    text: bridge.privateMode ? "Strand  ·  private" : "Strand"
                     color: root.dim
                     font.pixelSize: 11
                 }
@@ -241,7 +241,7 @@ ApplicationWindow {
             Label {
                 anchors.centerIn: parent
                 visible: transcript.count === 0
-                text: "Ask Cortext anything"
+                text: "Ask Strand anything"
                 color: root.dim
                 font.pixelSize: 15
             }
@@ -353,7 +353,7 @@ ApplicationWindow {
                     TextArea.flickable: TextArea {
                         id: input
                         objectName: "messageInput"
-                        placeholderText: "Message Cortext…  (Enter to send, Shift+Enter for newline)"
+                        placeholderText: "Message Strand…  (Enter to send, Shift+Enter for newline)"
                         placeholderTextColor: root.dim
                         color: root.textColor
                         wrapMode: TextArea.Wrap
