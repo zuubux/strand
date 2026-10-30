@@ -129,7 +129,10 @@ def main(argv: list[str] | None = None) -> int:
     window.heightChanged.connect(timer.start)
     app.aboutToQuit.connect(persist)
     app.aboutToQuit.connect(bridge.shutdown)  # cancel and join every strand-ui-io worker
-    window.closing.connect(lambda _event: app.quit())
+    # Qt Quick's `closing` carries a QQuickCloseEvent* PySide cannot convert; a lambda that
+    # accepts arguments (even `*_`) still receives it and raises TypeError, so take none.
+    window.closing.connect(lambda: bridge.shutdown())
+    window.closing.connect(lambda: app.quit())
     bridge.checkConnection()
     code = app.exec()
     bridge.shutdown()  # idempotent; guarantees no worker thread outlives exec()

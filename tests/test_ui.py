@@ -322,6 +322,31 @@ def test_diagnostics_record_latest_turn(qapp):
     assert b2.diagnostics["outcome"] == "error"
 
 
+def test_diagnostics_fiber_telemetry_metrics(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("Hel", "lo", "!")))
+    d = b.diagnostics
+    assert d["throughput"] == "0.0 t/s" and d["ttft_ms"] == 0 and d["total_ms"] == 0
+    asyncio.run(b._stream([{"role": "user", "content": "hello!"}]))
+    d = b.diagnostics
+    assert d["token_count"] == 3
+    assert d["total_ms"] >= d["ttft_ms"] >= 0
+    assert d["throughput"].endswith(" t/s") and float(d["throughput"].split()[0]) > 0
+
+
+def test_diagnostics_transport_reports_mode(tmp_path):
+    import socket as socketlib
+
+    path = str(tmp_path / "m.sock")
+    srv = socketlib.socket(socketlib.AF_UNIX)
+    srv.bind(path)
+    try:
+        os.chmod(path, 0o600)
+        b = Bridge(config=Config(socket_path=path), model="m")
+        assert b.diagnostics["transport"] == f"unix:{path} (0600)"
+    finally:
+        srv.close()
+
+
 def test_transport_property_reports_socket_path(tmp_path):
     import socket as socketlib
 
@@ -648,3 +673,233 @@ def test_shutdown_cancels_hanging_stream_and_joins_worker(qapp):
 def test_shutdown_without_workers_is_noop(qapp):
     b = make_bridge(lambda r: httpx.Response(200, content=sse("ok")))
     b.shutdown()
+
+
+def _walk(item):
+    for child in item.childItems():
+        yield child
+        yield from _walk(child)
+
+
+def test_qml_typography_cascade_and_turn_geometry(qapp):
+    from PySide6.QtCore import QMetaObject, Qt, Q_ARG
+
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    win.setWidth(760)
+    win.setHeight(640)
+    win.show()
+    assert win.property("monoFamilies").toVariant() == ["JetBrains Mono", "Fira Code", "monospace"]
+    assert win.property("uiFamilies").toVariant()[1:] == ["Inter", "-apple-system", "Segoe UI", "Noto Sans", "sans-serif"]
+    assert win.property("narrativeLineHeight") == 1.65
+    assert win.property("uiFamily") and win.property("monoFamily")
+    QMetaObject.invokeMethod(win, "note", Qt.ConnectionType.DirectConnection, Q_ARG("QVariant", "ok"))
+    for _ in range(5):
+        QCoreApplication.processEvents()
+    notes = [i for i in _walk(win.contentItem()) if i.objectName() == "bubble"]
+    assert len(notes) == 1 and notes[0].x() < 40  # left-aligned, unboxed
+    win.hide()
+    engine.deleteLater()
+
+
+def test_qml_diff_helpers(qapp):
+    from PySide6.QtCore import QMetaObject, Qt, Q_ARG, Q_RETURN_ARG
+
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    diff = "--- a/src/x.py\n+++ b/src/x.py\n@@ -1 +1 @@\n-old <1>\n+new"
+
+    def call(name, *args):
+        return QMetaObject.invokeMethod(
+            win, name, Qt.ConnectionType.DirectConnection, Q_RETURN_ARG("QVariant"),
+            *[Q_ARG("QVariant", a) for a in args],
+        )
+
+    assert call("diffTitle", diff) == "src/x.py"
+    assert call("isDiff", "diff", "") is True and call("isDiff", "python", "x") is False
+    html = call("diffHtml", diff)
+    assert "#f87171\">-old &lt;1&gt;" in html and "#34d399\">+new" in html
+    engine.deleteLater()
+
+
+# ---- Settings modal: config bridge and extractor probe ----
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for var in bridge_mod.load_config.__globals__["ENV_VARS"].values():
+        monkeypatch.delenv(var, raising=False)
+    return tmp_path
+
+
+def test_get_config_defaults_and_file(qapp, home):
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    cfg = b.getConfig()
+    assert cfg["persona_prompt"] == ""
+    assert cfg["upstream_url"] == "https://api.openai.com/v1"
+    assert cfg["decay_enabled"] is False
+    assert cfg["fail_closed_private"] is True
+    assert cfg["upstream_api_key_set"] is False
+    assert "upstream_api_key" not in cfg  # the secret is never handed to QML
+    path = home / ".config" / "strand" / "config.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"model_default": "m1", "upstream_api_key": "sk-x"}))
+    cfg = b.getConfig()
+    assert cfg["model_default"] == "m1"
+    assert cfg["upstream_api_key_set"] is True
+
+
+def test_save_config_atomic_modes_and_merge(qapp, home):
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    path = home / ".config" / "strand" / "config.json"
+    assert b.saveConfig({"persona_prompt": "  Dry wit.  ", "decay_enabled": True, "bogus": 1}) is True
+    data = json.loads(path.read_text())
+    assert data == {"persona_prompt": "Dry wit.", "decay_enabled": True}
+    assert (path.stat().st_mode & 0o777) == 0o600
+    assert (path.parent.stat().st_mode & 0o777) == 0o700
+    assert b.saveConfig({"upstream_api_key": "sk-1", "fail_closed_private": False}) is True
+    assert b.saveConfig({"upstream_api_key": "", "model_default": "m2"}) is True  # blank keeps key
+    data = json.loads(path.read_text())
+    assert data["upstream_api_key"] == "sk-1"
+    assert data["persona_prompt"] == "Dry wit."
+    assert data["fail_closed_private"] is False and data["model_default"] == "m2"
+    assert (path.stat().st_mode & 0o777) == 0o600
+    assert [p.name for p in path.parent.iterdir()] == ["config.json"]  # no temp leftovers
+    assert b.getConfig()["fail_closed_private"] is False
+
+
+def test_save_config_rejects_bad_input_and_corrupt_file(qapp, home):
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    assert b.saveConfig({"decay_enabled": "maybe"}) is False
+    path = home / ".config" / "strand" / "config.json"
+    assert not path.exists()
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json")
+    assert b.saveConfig({"persona_prompt": "x"}) is False
+    assert path.read_text() == "{not json"  # never clobbers an unreadable file
+
+
+def _probe(handler, url):
+    factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))  # noqa: E731
+    b = Bridge(config=Config(), model="m", probe_factory=factory)
+    results = []
+    b.extractorStatusChanged.connect(lambda ok, msg: results.append((ok, msg)))
+    asyncio.run(b._probe_extractor(url))
+    return results
+
+
+def test_extractor_probe_success_fallback_and_failures(qapp):
+    seen = []
+
+    def ok(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"data": []})
+
+    assert _probe(ok, "http://127.0.0.1:1234/v1/") == [(True, "Connected")]
+    assert seen == ["http://127.0.0.1:1234/v1/models"]
+
+    def only_v1(request):
+        return httpx.Response(200 if request.url.path == "/v1/models" else 404)
+
+    assert _probe(only_v1, "http://127.0.0.1:1234") == [(True, "Connected")]
+    assert _probe(lambda r: httpx.Response(500), "http://h/v1") == [(False, "HTTP 500")]
+
+    def timeout(request):
+        raise httpx.ConnectTimeout("slow")
+
+    assert _probe(timeout, "http://h") == [(False, "Timed out")]
+
+    def refuse(request):
+        raise httpx.ConnectError("no")
+
+    assert _probe(refuse, "http://h") == [(False, "Unreachable: ConnectError")]
+    assert _probe(ok, "  ") == [(False, "Enter an http(s) URL")]
+
+
+def test_test_extractor_slot_emits_signal_from_worker(qapp):
+    import time
+
+    from PySide6.QtCore import QCoreApplication
+
+    factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200)))  # noqa: E731
+    b = Bridge(config=Config(), model="m", probe_factory=factory)
+    results = []
+    b.extractorStatusChanged.connect(lambda ok, msg: results.append((ok, msg)))
+    b.testExtractor("http://h/v1")
+    deadline = time.time() + 5
+    while not results and time.time() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
+    b.shutdown()
+    assert results == [(True, "Connected")]
+
+
+def test_qml_settings_modal_open_close(qapp, home):
+    from PySide6.QtCore import QMetaObject
+
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    modal = win.findChild(object, "settingsModal")
+    assert modal is not None and modal.property("visible") is False
+    assert win.property("settingsOpen") is False
+    QMetaObject.invokeMethod(win, "openSettings")
+    assert win.property("settingsOpen") is True and modal.property("visible") is True
+    QMetaObject.invokeMethod(win, "handleEscape")  # what Esc triggers
+    assert win.property("settingsOpen") is False
+    QMetaObject.invokeMethod(win, "openSettings")
+    QMetaObject.invokeMethod(win, "closeSettings")  # backdrop / ✕ handler
+    assert win.property("settingsOpen") is False
+    engine.deleteLater()
+
+
+def test_extractor_model_read_and_save(qapp, home):
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    assert b.getConfig()["extractor_model"] == ""
+    assert b.saveConfig({"extractor_model": "  qwen2.5:3b "}) is True
+    path = home / ".config" / "strand" / "config.json"
+    assert json.loads(path.read_text())["extractor_model"] == "qwen2.5:3b"
+    assert b.getConfig()["extractor_model"] == "qwen2.5:3b"
+    assert b.saveConfig({"extractor_url": "http://127.0.0.1:11434/v1"}) is True
+    assert b.getConfig()["extractor_model"] == "qwen2.5:3b"  # merge keeps it
+
+
+@pytest.mark.parametrize(
+    ("segment", "enabled", "days", "whisper"),
+    [
+        ("horizonSprint", True, 7.0, "Aggressive pruning: unreferenced strands fade after 7 days."),
+        ("horizonBalanced", True, 30.0, "Standard working memory: unreferenced strands fade over 30 days."),
+        ("horizonPermanent", False, None, "Time is frozen: all strands retain permanent baseline weight."),
+    ],
+)
+def test_qml_decay_horizon_segments_persist(qapp, home, segment, enabled, days, whisper):
+    from PySide6.QtCore import QMetaObject
+
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    assert win.findChild(object, "decayBox") is None  # checkbox replaced
+    QMetaObject.invokeMethod(win, "openSettings")
+    if segment == "horizonSprint":  # start from a different state so the click must change it
+        assert b.saveConfig({"decay_enabled": False}) is True
+    win.findChild(object, segment).click()
+    path = home / ".config" / "strand" / "config.json"
+    data = json.loads(path.read_text())
+    assert data["decay_enabled"] is enabled
+    if days is not None:
+        assert data["decay_half_life_days"] == days
+    assert win.findChild(object, "horizonWhisper").property("text") == whisper
+    assert (path.stat().st_mode & 0o777) == 0o600
+    cfg = b.getConfig()
+    assert cfg["decay_enabled"] is enabled
+    assert cfg["decay_half_life_days"] == (days if days is not None else 30.0)
+    engine.deleteLater()
+
+
+def test_save_config_decay_half_life_validation(qapp, home):
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    assert b.saveConfig({"decay_enabled": True, "decay_half_life_days": 7}) is True
+    path = home / ".config" / "strand" / "config.json"
+    assert json.loads(path.read_text()) == {"decay_enabled": True, "decay_half_life_days": 7.0}
+    for bad in (0, -1, "nan", "abc"):
+        assert b.saveConfig({"decay_half_life_days": bad}) is False
+    assert json.loads(path.read_text())["decay_half_life_days"] == 7.0

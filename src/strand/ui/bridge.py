@@ -13,16 +13,25 @@ import json
 import os
 import re
 import stat
+import tempfile
 import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 import httpx
 from PySide6.QtCore import Property, QObject, Signal, Slot
 
-from strand.config import Config, load_config
+from strand.config import (
+    Config,
+    _as_bool,
+    _read_file,
+    _validate_half_life,
+    default_config_path,
+    load_config,
+)
 from strand.onboarding import ONBOARD_TRIGGER, ONBOARDING_HEADER, ONBOARDING_MODE
 
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -30,6 +39,20 @@ UDS_BASE_URL = "http://strand"
 CHAT_PATH = "/v1/chat/completions"
 PRIVATE_HEADER = "X-Strand-Allow-Private"
 HISTORY_LIMIT = 100
+EXTRACTOR_TIMEOUT = 1.5
+# Keys the Settings modal may persist to config.json, with their value kind.
+SETTINGS_KEYS: dict[str, str] = {
+    "persona_prompt": "str",
+    "upstream_url": "str",
+    "upstream_api_key": "secret",
+    "model_default": "str",
+    "extractor_url": "str",
+    "extractor_model": "str",
+    "decay_enabled": "bool",
+    "decay_half_life_days": "float",
+    "fail_closed_private": "bool",
+    "redact_secrets": "bool",
+}
 COMMAND_RE = re.compile(r"^/([A-Za-z]+)(?:[ \t]+(.*))?$", re.DOTALL)
 FENCE_RE = re.compile(r"^[ \t]{0,3}```[ \t]*([\w+.#-]*)[ \t]*$")
 HELP_TEXT = (
@@ -148,6 +171,7 @@ class Bridge(QObject):
     diagnosticsChanged = Signal()
     streamAborted = Signal()
     conversationReset = Signal()
+    extractorStatusChanged = Signal(bool, str)
 
     def __init__(
         self,
@@ -155,8 +179,10 @@ class Bridge(QObject):
         model: str | None = None,
         client_factory: Callable[[], httpx.AsyncClient] | None = None,
         parent: QObject | None = None,
+        probe_factory: Callable[[], httpx.AsyncClient] | None = None,
     ) -> None:
         super().__init__(parent)
+        self._probe_factory = probe_factory
         self._config = config if config is not None else load_config()
         self._model = resolve_model(self._config, explicit=model)
         self._session_id = f"ui-{uuid.uuid4().hex[:12]}"
@@ -173,6 +199,7 @@ class Bridge(QObject):
         self._task: asyncio.Task[None] | None = None
         self._abort_requested = False
         self._first_token_ms = 0
+        self._token_count = 0
         self._prompts: list[str] = []
         self._prompt_index: int | None = None
         self._turn: dict[str, Any] = {}
@@ -199,19 +226,34 @@ class Bridge(QObject):
     def transport(self) -> str:
         return f"unix:{self._uds_path}" if self._uds_path else f"tcp:{self._base_url[7:]}"
 
+    def _transport_detail(self) -> str:
+        """Active runtime path plus mode, e.g. `unix:/run/strand/strand.sock (0600)`."""
+        if not self._uds_path:
+            return f"{self.transport} (loopback)"
+        try:
+            mode = f"{stat.S_IMODE(os.stat(self._uds_path).st_mode):04o}"
+        except OSError:
+            mode = "unavailable"
+        return f"{self.transport} ({mode})"
+
     @Property("QVariantMap", notify=diagnosticsChanged)
     def diagnostics(self) -> dict[str, Any]:
         """Session/model/transport plus metrics of the latest turn (empty values before one)."""
         info: dict[str, Any] = {
             "sessionId": self._session_id,
             "model": self._model,
-            "transport": self.transport,
+            "transport": self._transport_detail(),
             "status": self._status,
             "private": self._private,
             "promptChars": 0,
             "replyChars": 0,
             "latencyMs": 0,
             "firstTokenMs": 0,
+            "ttft_ms": 0,
+            "total_ms": 0,
+            "token_count": 0,
+            "throughput": "0.0 t/s",
+            "ledger": "Active" if self._history else "Cached",
             "outcome": "",
         }
         info.update(self._turn)
@@ -281,6 +323,7 @@ class Bridge(QObject):
         aborted = False
         started = time.perf_counter()
         self._first_token_ms = 0
+        self._token_count = 0
         try:
             async with self.make_client() as client:
                 async with client.stream("POST", CHAT_PATH, json=body, headers=self._headers()) as resp:
@@ -304,7 +347,14 @@ class Bridge(QObject):
                 error = f"Stream failed: {exc}"
         current = generation is None or generation == self._generation
         if current:
+            total = time.perf_counter() - started
+            ttft = self._first_token_ms / 1000
+            tps = self._token_count / max(0.001, total - ttft)
             self._turn = {
+                "throughput": f"{tps:.1f} t/s",
+                "ttft_ms": self._first_token_ms,
+                "total_ms": int(total * 1000),
+                "token_count": self._token_count,
                 "promptChars": len(messages[-1]["content"]) if messages else 0,
                 "replyChars": sum(len(p) for p in parts),
                 "latencyMs": int((time.perf_counter() - started) * 1000),
@@ -360,6 +410,7 @@ class Bridge(QObject):
         return None
 
     def _note_first_token(self, parts: list[str], started: float | None) -> None:
+        self._token_count += 1
         if not parts and started is not None:
             self._first_token_ms = int((time.perf_counter() - started) * 1000)
 
@@ -437,6 +488,102 @@ class Bridge(QObject):
     @Slot()
     def checkConnection(self) -> None:
         self._run_async(self._check)
+
+    # -- settings (Settings modal) ---------------------------------------------------
+    @Slot(result="QVariantMap")
+    def getConfig(self) -> dict[str, Any]:
+        """Active settings for the Settings modal. The upstream API key is never returned."""
+        cfg = load_config()
+        file_values = _read_file(default_config_path())
+        return {
+            "persona_prompt": cfg.persona_prompt,
+            "upstream_url": cfg.upstream_url,
+            "model_default": cfg.model_default,
+            "extractor_url": cfg.extractor_url,
+            "extractor_model": cfg.extractor_model,
+            "decay_enabled": cfg.decay_enabled,
+            "decay_half_life_days": cfg.decay_half_life_days,
+            "upstream_api_key_set": bool(cfg.upstream_api_key),
+            "fail_closed_private": _as_bool(file_values.get("fail_closed_private", True)),
+            "redact_secrets": _as_bool(file_values.get("redact_secrets", True)),
+        }
+
+    @Slot("QVariantMap", result=bool)
+    def saveConfig(self, data: dict[str, Any]) -> bool:
+        """Merge recognised keys into config.json atomically (dir 0700, file 0600).
+
+        Unknown keys are ignored; an empty `upstream_api_key` keeps the stored key.
+        Returns False (file untouched) on invalid input or an I/O error.
+        """
+        try:
+            path = default_config_path()
+            current = _read_file(path, strict=True)
+            updates: dict[str, Any] = {}
+            for key, kind in SETTINGS_KEYS.items():
+                if key not in data:
+                    continue
+                value = data[key]
+                if kind == "bool":
+                    updates[key] = _as_bool(value)
+                elif kind == "float":
+                    updates[key] = _validate_half_life(value)
+                else:
+                    text = "" if value is None else str(value).strip()
+                    if kind == "secret" and not text:
+                        continue
+                    updates[key] = text
+            current.update(updates)
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            try:
+                os.chmod(path.parent, 0o700)
+            except PermissionError:
+                pass
+            fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config-", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(current, fh, indent=2, sort_keys=True)
+                    fh.write("\n")
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, path)
+            except BaseException:
+                Path(tmp).unlink(missing_ok=True)
+                raise
+        except (OSError, ValueError, TypeError):
+            return False
+        return True
+
+    @Slot(str)
+    def testExtractor(self, url: str) -> None:
+        """Probe the local SLM endpoint off-thread; result arrives as `extractorStatusChanged`."""
+        self._run_async(lambda: self._probe_extractor(url))
+
+    async def _probe_extractor(self, url: str) -> None:
+        base = url.strip().rstrip("/")
+        if not base.startswith(("http://", "https://")):
+            self.extractorStatusChanged.emit(False, "Enter an http(s) URL")
+            return
+        candidates = [f"{base}/models"]
+        if not base.endswith("/v1"):
+            candidates.append(f"{base}/v1/models")
+        message = "Unreachable"
+        try:
+            async with self._make_probe_client() as client:
+                for target in candidates:
+                    resp = await client.get(target)
+                    if resp.status_code < 400:
+                        self.extractorStatusChanged.emit(True, "Connected")
+                        return
+                    message = f"HTTP {resp.status_code}"
+        except httpx.TimeoutException:
+            message = "Timed out"
+        except httpx.HTTPError as exc:
+            message = f"Unreachable: {type(exc).__name__}"
+        self.extractorStatusChanged.emit(False, message)
+
+    def _make_probe_client(self) -> httpx.AsyncClient:
+        if self._probe_factory is not None:
+            return self._probe_factory()
+        return httpx.AsyncClient(timeout=EXTRACTOR_TIMEOUT)
 
     @Slot(result=bool)
     def abort(self) -> bool:
