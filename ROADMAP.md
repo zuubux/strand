@@ -33,22 +33,35 @@ Check items off as they land. Every phase must keep `pytest -W error` green, ful
 ## Phase 4: Interface & Interaction Layer (GUI)
 - [x] **UI-1 Desktop Workbench (`strand-gui`)**: Native PySide6 / QML chat window communicating over UDS (`strand.sock`) or TCP. Includes diagnostics drawer (`Ctrl+D`), session rotation (`Ctrl+L`), abort (`Esc`), command history (`Up`/`Down`), markdown/code styling, and window geometry persistence.
 - [x] **UI-2 Local Slash Commands**: `/new`, `/private <on|off>`, `/model <name>`, and `/help` intercepted client-side without polluting upstream context.
+- [x] **UI-H1 Hardening (BUG-UI-001)**: input dock no longer jitters between 1 and 2 rows while typing (phantom watermark padding removed, width animation gated); Model B extraction emits direct subject-predicate-object edges with no `User's Preference`-style containers.
+- [x] **UI-P1 Transcript & Telemetry Polish (OBS-UI-002, OBS-UI-006)**: assistant turns are slate cards (`#13171f`, radius 12, max 85%/820px) with a compact thinking pill; telemetry drawer retitled `TELEMETRY`, 0.96-opaque `#0d1117` with a hairline border and 12px floating margins.
 - [ ] **UI-3 System Tray & Global Hotkey**: Ambient background daemon presence with global hotkey launcher.
 
 ## Phase 5: The Personality Matrix & Interaction Tuning
 - [x] **PER-1 Matrix Archetypes (`trait`, `directive`, `preference`)**: End-to-end substrate for behavioral memory. Permitted in schema, extracted by Model B (with automatic edge deprecation for conflicting rules), tracked by `SessionLedger` (injected once per session), and categorized hierarchically in `resolver.py`.
 - [x] **PER-2 Bedrock Persona Anchor**: `persona_prompt` configured via `config.json` (`STRAND_PERSONA_PROMPT`), injected as synthetic entity `-1` on Turn 1 under `[Persona Stance]`.
 - [x] **PER-3 Structured Proxy Metric Logs**: Log line accurately reports `entities=X edges=Y traits=Z directives=A preferences=B` or `(empty)`.
+- [x] **OBS-POL-005 Phase 1 Critique-Driven Edge Deprecation**: Model B `SYSTEM_PROMPT` separates PERMANENT DIRECTIVES (explicit markers: "from now on", "always", "never", "stop doing X", "switch to Y", "going forward") from TRANSIENT STEERING ("right now", "just for this", "give me"), which never deprecates standing edges; permanent corrections emit `deprecated_edges` plus an active `directive`/`preference` replacement. Tests: `tests/test_extractors.py`, `tests/test_distill.py`.
+- [x] **OBS-POL-005 Phase 1 Invariant Bedrock Anchor**: `BEDROCK_INVARIANT` (`common.py`) is emitted in every prompt envelope, tracked by ledger sentinel `BEDROCK_ID = -2`. Tests: `tests/test_resolver.py`, `tests/test_personality.py`.
+- [x] **OBS-POL-005 Phase 1 Dynamic Persona Precedence**: bedrock always first; active operator traits/directives/preferences form the dynamic stance and suppress `config.persona_prompt`; with none active (cold boot or all superseded) `persona_prompt` is the fallback; `SessionLedger` suppresses them on Turn 2+ (0-token ongoing tax).
+- [x] **OBS-POL-005 Phase 1 Critique Deprecation with Permanence Guardrails**: permanent corrections deprecate the superseded edge and emit an active replacement; transient steering never deprecates standing edges (see Critique-Driven Edge Deprecation above).
 
-## Phase 6: Cognitive Partnership & Proactive Reasoning
+## Phase 6: Cognitive Partnership & Proactive Reasoning (Cognitive Grounding)
 - [x] **COG-1 Proactive Contradiction & Reality Guard**:
   - In `resolver.py`: Detect direct attribute conflicts between incoming prompt claims and grounded active edges (e.g. user specifies "5-speed clutch" for a car recorded with a 6-speed transmission).
   - Inject a specialized `[Reality Check]` warning into the session context delta to prompt the model to clarify discrepancies rather than blindly agree.
 - [x] **COG-2 Conversational Grounding & Onboarding**:
   - Ambient first-run detection or `/onboard` / `/bootstrap` command.
   - Guided, organic conversational interview (subtle steering rather than rigid questionnaires) to seed the `User` (`Operator`) anchor node, hardware orbit (WORKSTATION, Cluster-Node-01), active projects, key collaborators, and core interaction stances.
+  - [x] **OBS-POL-004 Conversational Onboarding & Intent Triage**: true Day Zero (0 `user_explicit` persons), "What should I call you?" opening that never uses `$USER`, `/onboard` intent triage for existing operators, and `user_explicit` operator anchoring (`operates_host`, `User` re-anchoring).
+  - [x] **OBS-POL-006 Model B Operator Extraction**: procedural name heuristics (`parse_name_answer`, `?`/word-count rules, `EXPECTING_NAME`, proxy interceptor) removed; Model B emits the declared operator (`person`, `user_explicit`, 1.0, `operates_host`) from natural replies ("Nic", "Just Nic", "Nic works", "Nicholas is fine"), `count_operators()` > 0 ends Day Zero and `reanchor_generic_user` folds the generic `User`.
 - [x] **COG-3 Episodic Stitching & Project Continuity**:
   - Cross-reference recent uncompacted episodes (last 7 days) matching queried entities to inject recent working context into new sessions.
 - [ ] **COG-4 Shared Lore & Episodic Vernacular**:
   - Defer until > 200 operational episodes accumulate.
   - Background compaction (`compactor.py`) distills shared debugging milestones and inside shorthand into entity lore metadata.
+## Phase 7: Scoped Workspace Awareness (JIT Tools)
+Governed by `CONSTRAINTS.md` (Ring 0 ambient read, JIT pull, nothing raw in `memory.db`).
+- [x] **WS-1 Bounded Local Tool Runner**: `src/strand/tools/workspace.py` exposing `read_file` and `list_directory`, constrained to configured `workspace_roots` with windowed pagination and hard size caps (e.g. 8 KB per call).
+- [x] **WS-2 Proxy Tool Declaration & Execution Loop**: `proxy.py` attaches the tool schemas to the upstream model request and executes returned local tool calls, feeding results back until a final answer.
+- [x] **WS-3 Ephemeral Ledger Eviction**: `SessionLedger` marks raw tool payloads and media buffers as transient and drops them from multi-turn token history; none of it reaches `memory.db`.

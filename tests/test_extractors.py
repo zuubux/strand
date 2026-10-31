@@ -100,3 +100,236 @@ def test_engine_survives_bad_extractor_output(tmp_path):
 
     episode, names, edges = _distill(tmp_path, extractor_for(boom))
     assert episode is not None and names == [] and edges == 0
+
+
+def _two_hop(container, generic, kind="preference"):
+    return {
+        "entities": [
+            {"name": "User", "archetype": "person", "summary": "Operator"},
+            {"name": container, "archetype": kind, "summary": "grouping"},
+            {"name": "AWD", "archetype": "concept", "summary": "All-wheel drive"},
+        ],
+        "edges": [
+            {"source": "User", "target": container, "relation": "has"},
+            {"source": container, "target": "AWD", "relation": generic},
+        ],
+    }
+
+
+def test_preference_container_collapses_to_direct_triple():
+    result = parse_extraction(json.dumps(_two_hop("User's Preference", "includes")))
+    assert [e["name"] for e in result["entities"]] == ["User", "AWD"]
+    assert result["edges"] == [{"source": "User", "target": "AWD", "relation": "prefers"}]
+
+
+def test_concern_container_collapses_with_concern_relation():
+    result = parse_extraction(json.dumps(_two_hop("User's Concern", "contains", "trait")))
+    assert result["edges"] == [{"source": "User", "target": "AWD", "relation": "concerned_about"}]
+    assert "User's Concern" not in [e["name"] for e in result["entities"]]
+
+
+def test_container_with_specific_relation_keeps_it_and_orphan_uses_owner():
+    data = {
+        "entities": [{"name": "User Settings", "archetype": "preference"}, {"name": "Dark Mode"}],
+        "edges": [{"source": "User Settings", "target": "Dark Mode", "relation": "enables"}],
+    }
+    result = parse_extraction(json.dumps(data))
+    assert [e["name"] for e in result["entities"]] == ["Dark Mode"]
+    assert result["edges"] == [{"source": "User", "target": "Dark Mode", "relation": "enables"}]
+
+
+def test_container_with_no_children_is_dropped_and_real_entities_untouched():
+    data = {
+        "entities": [{"name": "User's Preference"}, {"name": "Preference Engine"}],
+        "edges": [{"source": "User", "target": "User's Preference", "relation": "has"}],
+    }
+    result = parse_extraction(json.dumps(data))
+    assert [e["name"] for e in result["entities"]] == ["Preference Engine"]
+    assert result["edges"] == []
+    assert parse_extraction(json.dumps(GOOD))["edges"] == GOOD["edges"]
+
+
+def test_system_prompt_forbids_intermediate_containers():
+    from strand.extractors import SYSTEM_PROMPT
+
+    assert "(User) --[prefers]--> (AWD)" in SYSTEM_PROMPT
+    assert "Never create generic intermediate container" in SYSTEM_PROMPT
+
+
+def _operator_payload(name="Nic", host="workstation-01"):
+    return {
+        "entities": [{"name": name, "archetype": "person", "summary": "Operator", "origin": "user_explicit", "confidence": 1.0}],
+        "edges": [{"source": name, "target": host, "relation": "operates_host"}],
+    }
+
+
+def test_extractor_keeps_model_b_operator_as_user_explicit(monkeypatch):
+    import strand.extractors as ex
+
+    monkeypatch.setattr(ex, "get_host_context", lambda: {"hostname": "workstation-01"})
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return reply(json.dumps(_operator_payload()))
+
+    result = run(extractor_for(handler)("Nic works", RESPONSE))
+    assert "Host: workstation-01" in seen["body"]["messages"][1]["content"]
+    (person,) = [e for e in result["entities"] if e["archetype"] == "person"]
+    assert person["name"] == "Nic"
+    assert person["origin"] == "user_explicit" and person["confidence"] == 1.0
+    (edge,) = result["edges"]
+    assert (edge["source"], edge["target"], edge["relation"]) == ("Nic", "workstation-01", "operates_host")
+    assert edge["origin"] == "user_explicit"
+
+
+def test_non_person_or_unflagged_entities_stay_model_inferred():
+    payload = {
+        "entities": [
+            {"name": "Atlas", "archetype": "project", "origin": "user_explicit", "confidence": 1.0},
+            {"name": "Alice", "archetype": "person"},
+        ],
+        "edges": [{"source": "Alice", "target": "Atlas", "relation": "operates_host"}],
+    }
+    result = parse_extraction(json.dumps(payload))
+    assert all("origin" not in e and "confidence" not in e for e in result["entities"])
+    assert all("origin" not in e for e in result["edges"])
+
+
+def test_name_heuristics_are_gone():
+    import strand.extractors as ex
+
+    for attr in ("parse_name_answer", "declared_name", "anchor_declared_operator", "EXPECTING_NAME"):
+        assert not hasattr(ex, attr), attr
+
+
+def test_system_prompt_delegates_name_semantics_to_model_b():
+    from strand.extractors import SYSTEM_PROMPT
+
+    assert "What should I call you?" in SYSTEM_PROMPT
+    for variant in ("'Nic'", "'Just Nic'", "'Nic works'", "'Nicholas is fine'"):
+        assert variant in SYSTEM_PROMPT, variant
+    assert 'archetype "person", origin "user_explicit" and confidence 1.0' in SYSTEM_PROMPT
+    assert "(<Declared Name>) --[operates_host]--> (<Hostname>)" in SYSTEM_PROMPT
+
+
+def test_model_b_operator_persists_and_reanchors_generic_user(tmp_path, monkeypatch):
+    import strand.extractors as ex
+    from strand.onboarding import count_operators, reanchor_generic_user
+
+    monkeypatch.setattr(ex, "get_host_context", lambda: {"hostname": "workstation-01"})
+
+    async def go(answer, n):
+        async with DatabaseManager(tmp_path / f"m{n}.db") as db:
+            generic = await db.upsert_entity("User", "person", "generic", origin="model_inferred", confidence=0.6)
+            rule = await db.upsert_entity("No apologies", "directive", "never apologize")
+            await db.upsert_edge(generic, rule, "demands")
+            assert await count_operators(db) == 0
+            extractor = extractor_for(lambda r: reply(json.dumps(_operator_payload())))
+            await DistillationEngine(db, extractor=extractor).process_exchange("s", answer, RESPONSE)
+            assert await count_operators(db) > 0
+            assert await reanchor_generic_user(db)
+            async with db.conn.execute("SELECT name, origin, confidence FROM entities WHERE archetype = 'person'") as cur:
+                people = [tuple(r) for r in await cur.fetchall()]
+            async with db.conn.execute(
+                "SELECT s.name, t.name, e.relation FROM edges e JOIN entities s ON s.id = e.source_id "
+                "JOIN entities t ON t.id = e.target_id"
+            ) as cur:
+                return people, {tuple(r) for r in await cur.fetchall()}
+
+    for n, answer in enumerate(("Nic", "Just Nic", "Nic works", "Nicholas is fine")):
+        people, edges = run(go(answer, n))
+        assert people == [("Nic", "user_explicit", 1.0)], answer
+        assert ("Nic", "workstation-01", "operates_host") in edges, answer
+        assert ("Nic", "No apologies", "demands") in edges, answer
+
+
+def test_question_answer_with_no_operator_payload_leaves_day_zero_open(tmp_path):
+    from strand.onboarding import count_operators
+
+    async def go():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            extractor = extractor_for(lambda r: reply(json.dumps({"entities": [], "edges": []})))
+            await DistillationEngine(db, extractor=extractor).process_exchange("s", "Why do you ask?", RESPONSE)
+            return await count_operators(db)
+
+    assert run(go()) == 0
+
+
+def test_reanchor_is_noop_without_declared_operator(tmp_path):
+    from strand.onboarding import reanchor_generic_user
+
+    async def go():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            generic = await db.upsert_entity("User", "person", "generic", origin="model_inferred", confidence=0.6)
+            rule = await db.upsert_entity("No apologies", "directive", "never apologize")
+            await db.upsert_edge(generic, rule, "demands")
+            folded = await reanchor_generic_user(db)
+            async with db.conn.execute("SELECT COUNT(*) FROM edges") as cur:
+                return folded, (await cur.fetchone())[0]
+
+    assert run(go()) == (False, 1)
+
+
+def test_model_b_operator_without_host_edge_still_counts_as_operator(tmp_path):
+    from strand.onboarding import count_operators
+
+    payload = {"entities": [{"name": "Nic", "archetype": "person", "origin": "user_explicit"}], "edges": []}
+
+    async def go():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            extractor = extractor_for(lambda r: reply(json.dumps(payload)))
+            await DistillationEngine(db, extractor=extractor).process_exchange("s", "Nic works for me", RESPONSE)
+            return await count_operators(db)
+
+    assert run(go()) == 1
+
+
+# --- OBS-POL-005 Phase 1: critique-driven deprecation with permanence guardrails ----------------
+
+
+def _critique_extractor(seen):
+    """Offline Model B stand-in obeying the prompt contract: only permanence markers deprecate."""
+    permanent = {
+        "entities": [{"name": "no-diff-summaries", "archetype": "directive", "summary": "Never summarize diffs"}],
+        "edges": [{"source": "Nic", "target": "no-diff-summaries", "relation": "demands"}],
+        "deprecated_edges": [
+            {"source": "Nic", "target": "diff-summaries", "relation": "prefers", "reason": "stopped"}
+        ],
+    }
+
+    def handler(request):
+        body = json.loads(request.content)
+        user_msg = body["messages"][1]["content"]
+        seen.append(body["messages"][0]["content"])
+        payload = permanent if "from now on" in user_msg else {"entities": [], "edges": [], "deprecated_edges": []}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+
+    return extractor_for(handler)
+
+
+def test_prompt_documents_permanence_guardrail():
+    from strand.extractors import SYSTEM_PROMPT
+
+    for token in (
+        "PERMANENT DIRECTIVES",
+        "TRANSIENT STEERING",
+        "from now on",
+        "going forward",
+        "right now",
+        "just for this",
+        "must NOT deprecate any standing edge",
+        "model_inferred",
+    ):
+        assert token in SYSTEM_PROMPT, token
+
+
+def test_transient_phrase_does_not_deprecate_but_permanent_phrase_does():
+    seen = []
+    extractor = _critique_extractor(seen)
+    transient = run(extractor("Give me the diff right now.", "Here it is."))
+    permanent = run(extractor("Stop summarizing diffs from now on.", "Understood."))
+    assert transient["deprecated_edges"] == [] and transient["entities"] == []
+    assert [(e["target"], e["relation"]) for e in permanent["deprecated_edges"]] == [("diff-summaries", "prefers")]
+    assert permanent["entities"][0]["archetype"] == "directive"
+    assert len(seen) == 2 and "TRANSIENT STEERING" in seen[0]

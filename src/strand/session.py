@@ -1,8 +1,10 @@
 """In-memory session ledger: remembers which graph facts the LLM has already been shown."""
 
+import json
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from typing import Any
 
 DEFAULT_TTL_SECONDS = 3600.0
 DEFAULT_MAX_SESSIONS = 1000
@@ -27,6 +29,34 @@ class SessionDelta:
     @property
     def is_empty(self) -> bool:
         return not (self.entity_ids or self.edge_ids)
+
+
+TOOL_EVICT_MIN_CHARS = 512  # earlier-turn tool outputs longer than this are compacted
+_EVICTED_MEDIA_TYPES = ("image_url", "input_audio", "input_image")
+
+
+def _tool_placeholder(size: int) -> str:
+    return f"[tool output evicted: {size} chars]"
+
+
+def _evict_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Compact one earlier-turn message: bulky tool output and inline media become placeholders."""
+    content = message.get("content")
+    if message.get("role") == "tool":
+        text = content if isinstance(content, str) else json.dumps(content, default=str)
+        if len(text) > TOOL_EVICT_MIN_CHARS:
+            return {**message, "content": _tool_placeholder(len(text))}
+        return message
+    if isinstance(content, list):
+        parts = [
+            {"type": "text", "text": "[media evicted]"}
+            if isinstance(part, dict) and part.get("type") in _EVICTED_MEDIA_TYPES
+            else part
+            for part in content
+        ]
+        if parts != content:
+            return {**message, "content": parts}
+    return message
 
 
 def _novel(candidates: Iterable[int], seen: set[int]) -> tuple[int, ...]:
@@ -98,6 +128,23 @@ class SessionLedger:
         state.seen_entity_ids.update(new_entities)
         state.seen_edge_ids.update(new_edges)
         return SessionDelta(new_entities, new_edges)
+
+    @staticmethod
+    def compact_history(messages: list[Any]) -> list[Any]:
+        """Evict transient payloads from turns before the latest user message.
+
+        Raw tool outputs and inline media are runtime streams: the current turn keeps them
+        intact, earlier turns keep only the assistant's syntheses plus a short placeholder.
+        Returns a new list; the input is not mutated.
+        """
+        last_user = max(
+            (i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"),
+            default=-1,
+        )
+        return [
+            _evict_message(m) if i < last_user and isinstance(m, dict) else m
+            for i, m in enumerate(messages)
+        ]
 
     def reset(self, session_id: str) -> bool:
         """Forget a session entirely. Returns True if it existed."""

@@ -5,12 +5,14 @@ and never raises: any transport, status or JSON problem yields an empty extracti
 so distillation falls back to storing just the episode.
 """
 
+import re
 from typing import Any
 
 import httpx
 
 from .common import extract_json, strip_think
-from .distill import Extraction
+from .distill import USER_CONFIDENCE, USER_ORIGIN, Extraction
+from .host import get_host_context
 from .logging import get_logger
 
 logger = get_logger("extractors")
@@ -47,20 +49,116 @@ SYSTEM_PROMPT = (
     "stop using diffs, send full files'), emit a deprecated_edges entry naming the same source, "
     "target and relation of the old rule so it is cleanly deprecated, and add the new rule as "
     "a new entity and edge. "
+    "Permanence guardrail: distinguish PERMANENT DIRECTIVES from TRANSIENT STEERING. A permanent "
+    "directive needs an explicit permanence marker such as 'from now on', 'always', 'never', "
+    "'stop doing X', 'switch to Y' or 'going forward'. Transient steering is immediate or one-off "
+    "context such as 'right now', 'just for this' or 'give me the diff' with no marker; it must NOT "
+    "create a permanent directive or preference and must NOT deprecate any standing edge, so return "
+    "nothing for it. When a permanent behavioral correction is detected (e.g. 'Stop summarizing "
+    "diffs from now on'): 1) identify the obsolete directive, preference or trait and emit it in "
+    "deprecated_edges with the operator as source and the old rule's target and relation; 2) emit the "
+    "replacement behavior as an active entity with archetype \"directive\" or \"preference\" and "
+    "connect it to the operator with an edge (the model_inferred origin is applied to it automatically). "
+    "Deprecation only severs edges; never list entities for deletion because of a critique. "
+    "Attach traits, concerns and preferences directly between the subject and the concrete "
+    "noun or entity through the edge relation, e.g. (User) --[prefers]--> (AWD) or "
+    "(User) --[concerned_about]--> (Battery Life). Never create generic intermediate container "
+    "entities such as \"User's Preference\", \"User's Concern\" or \"User Settings\"; no two-hop "
+    "chains like (User) --[has]--> (User's Preference) --[includes]--> (AWD). "
+    "Operator identity: when the exchange identifies or confirms the operator's preferred conversational "
+    "name (for example an answer to 'What should I call you?' such as 'Nic', 'Just Nic', 'Nic works', "
+    "'Nicholas is fine', or a statement like 'Call me Nic' or 'I'm Nic'), emit an entity with name set to "
+    'the declared name, archetype "person", origin "user_explicit" and confidence 1.0, and emit the edge '
+    '(<Declared Name>) --[operates_host]--> (<Hostname>) using the hostname given in the Host line. '
+    "Use the declared name instead of User as the source of the operator's other edges. "
+    "Questions, refusals and non-names (e.g. 'why?', 'nothing', 'stop') declare no name. "
     'If nothing is worth keeping return {"entities": [], "edges": [], "deprecated_edges": [], '
     '"forgotten_entities": []}.'
 )
+
+
+OPERATES_HOST = "operates_host"
 
 
 def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+_CONTAINER_RE = re.compile(
+    r"^(?P<owner>the user|user|operator|me|my|i)(?:['’]s|s)?\s+"
+    r"(?P<kind>preferences?|concerns?|traits?|settings?)$",
+    re.IGNORECASE,
+)
+_KIND_RELATION = {
+    "preference": "prefers",
+    "setting": "prefers",
+    "concern": "concerned_about",
+    "trait": "enforces",
+}
+_GENERIC_RELATIONS = frozenset(
+    {"has", "have", "includes", "include", "contains", "contain", "is", "are", "has_a", "has_preference"}
+)
+
+
+def _container(name: str) -> tuple[str, str] | None:
+    """(owner, singular kind) when `name` is a synthetic grouping node like "User's Preference"."""
+    match = _CONTAINER_RE.match(name.strip())
+    if match is None:
+        return None
+    owner = "User" if match["owner"].lower() in ("the user", "user", "me", "my", "i") else "Operator"
+    return owner, match["kind"].lower().rstrip("s")
+
+
+def collapse_containers(
+    entities: list[dict[str, str]], edges: list[dict[str, str]], deprecated: list[dict[str, str]]
+) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
+    """Collapse `(S) -> (User's Preference) -> (T)` chains into direct `(S) -> (T)` edges.
+
+    Synthetic grouping entities are dropped along with every edge touching them; each
+    outgoing container edge is re-attached to the container's subject (the incoming edge
+    source, else the owner named in the pattern). Generic relations (has/includes/...)
+    are replaced by one derived from the container kind (prefers, concerned_about, enforces).
+    """
+    containers = {e["name"].lower(): _container(e["name"]) for e in entities}
+    for edge in edges + deprecated:
+        for key in ("source", "target"):
+            containers.setdefault(edge[key].lower(), _container(edge[key]))
+    containers = {name: info for name, info in containers.items() if info is not None}
+    if not containers:
+        return entities, edges, deprecated
+
+    subjects: dict[str, str] = {}
+    for edge in edges:
+        target = edge["target"].lower()
+        if target in containers and edge["source"].lower() not in containers:
+            subjects.setdefault(target, edge["source"])
+
+    def rewrite(items: list[dict[str, str]]) -> list[dict[str, str]]:
+        out: list[dict[str, str]] = []
+        for item in items:
+            source, target = item["source"].lower(), item["target"].lower()
+            if target in containers:
+                continue  # edge into a container: replaced by the direct edge below
+            if source in containers:
+                owner, kind = containers[source]
+                relation = item["relation"]
+                if relation.lower() in _GENERIC_RELATIONS:
+                    relation = _KIND_RELATION[kind]
+                item = {**item, "source": subjects.get(source, owner), "relation": relation}
+            if item not in out:
+                out.append(item)
+        return out
+
+    kept = [e for e in entities if e["name"].lower() not in containers]
+    return kept, rewrite(edges), rewrite(deprecated)
+
+
 def parse_extraction(content: str) -> Extraction:
     """Parse model output into an extraction dict; malformed input yields empty lists.
 
-    Only whitelisted fields are copied, so any model-emitted `origin`/`confidence` is dropped
-    and the engine applies the model defaults (model_inferred at MODEL_CONFIDENCE).
+    Only whitelisted fields are copied. Model-emitted `origin`/`confidence` are dropped (the engine
+    applies model_inferred at MODEL_CONFIDENCE) except for the declared operator: a `person` with
+    `origin: user_explicit` keeps user_explicit at 1.0, as does its `operates_host` edge.
     """
     empty: Extraction = {
         "entities": [], "edges": [], "deprecated_edges": [], "forgotten_entities": [], "summary": ""
@@ -69,19 +167,25 @@ def parse_extraction(content: str) -> Extraction:
     if data is None:
         return empty
     entities = []
+    operators: set[str] = set()
     for item in data.get("entities") or []:
         if isinstance(item, dict) and _text(item.get("name")):
-            entities.append(
-                {
-                    "name": _text(item["name"]),
-                    "archetype": _text(item.get("archetype")),
-                    "summary": _text(item.get("summary")),
-                }
-            )
+            entity = {
+                "name": _text(item["name"]),
+                "archetype": _text(item.get("archetype")),
+                "summary": _text(item.get("summary")),
+            }
+            if entity["archetype"] == "person" and _text(item.get("origin")) == USER_ORIGIN:
+                entity.update(origin=USER_ORIGIN, confidence=USER_CONFIDENCE)  # declared operator (Model B)
+                operators.add(entity["name"])
+            entities.append(entity)
     edges = []
     for item in data.get("edges") or []:
         if isinstance(item, dict) and all(_text(item.get(k)) for k in ("source", "target", "relation")):
-            edges.append({k: _text(item[k]) for k in ("source", "target", "relation")})
+            edge = {k: _text(item[k]) for k in ("source", "target", "relation")}
+            if edge["relation"] == OPERATES_HOST and edge["source"] in operators:
+                edge.update(origin=USER_ORIGIN, confidence=USER_CONFIDENCE)
+            edges.append(edge)
     deprecated = []
     for item in data.get("deprecated_edges") or []:
         if isinstance(item, dict) and all(_text(item.get(k)) for k in ("source", "target", "relation")):
@@ -90,6 +194,7 @@ def parse_extraction(content: str) -> Extraction:
     forgotten = list(
         dict.fromkeys(_text(n) for n in raw_forgotten if _text(n)) if isinstance(raw_forgotten, list) else ()
     )
+    entities, edges, deprecated = collapse_containers(entities, edges, deprecated)
     return {
         "entities": entities,
         "edges": edges,
@@ -116,6 +221,7 @@ class LLMExtractor:
 
     async def __call__(self, query: str, response: str) -> Extraction:
         response = strip_think(response)
+        hostname = str(get_host_context().get("hostname") or "localhost")
         payload = {
             "model": self.model_name,
             "temperature": 0,
@@ -124,7 +230,10 @@ class LLMExtractor:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": f"User: {query[:_MAX_INPUT_CHARS]}\n\nAssistant: {response[:_MAX_INPUT_CHARS]}",
+                    "content": (
+                        f"Host: {hostname}\n\nUser: {query[:_MAX_INPUT_CHARS]}"
+                        f"\n\nAssistant: {response[:_MAX_INPUT_CHARS]}"
+                    ),
                 },
             ],
         }

@@ -1,10 +1,12 @@
 """OpenAI-compatible streaming proxy that injects novel graph context into the system prompt."""
 
 import asyncio
+import copy
 import hmac
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -19,14 +21,17 @@ from .host import get_host_context
 from .logging import get_logger
 from .onboarding import (
     ONBOARD_TRIGGER,
+    MODE_DAY_ZERO,
+    MODE_TRIAGE,
     ONBOARDING_MODE,
-    count_persons,
+    count_operators,
     onboarding_directive,
-    seed_operator_anchor,
+    reanchor_generic_user,
 )
 from .resolver import ContextResolver
 from .sanitize import sanitize_text
 from .session import MAX_SESSION_ID_LEN
+from .tools.workspace import WORKSPACE_TOOLS, dispatch_tool_call
 
 logger = get_logger("proxy")
 DEFAULT_SESSION_ID = "default"
@@ -34,6 +39,8 @@ _UPSTREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 MAX_CONCURRENT_DISTILLATIONS = 4
 MAX_ONBOARDING_SESSIONS = 1000
 MAX_REQUEST_BYTES = 10 * 1024 * 1024  # POST /v1/chat/completions body cap (HTTP 413 beyond this)
+MAX_TOOL_ITERATIONS = 5  # local tool rounds per request before a final answer is forced
+_LOCAL_TOOL_NAMES = frozenset(t["function"]["name"] for t in WORKSPACE_TOOLS)
 _QUERY_LOG_CHARS = 80
 _CONTEXT_ROLES = ("system", "developer")
 
@@ -192,6 +199,145 @@ def _delta_log_fields(delta: str) -> str:
     return " ".join(fields)
 
 
+def _merge_tools(existing: Any) -> list[Any]:
+    """Client-declared tools plus WORKSPACE_TOOLS (client definitions win on name clashes)."""
+    merged = list(existing) if isinstance(existing, list) else []
+    declared = {t["function"].get("name") for t in merged if isinstance(t, dict) and isinstance(t.get("function"), dict)}
+    return merged + [t for t in WORKSPACE_TOOLS if t["function"]["name"] not in declared]
+
+
+_MESSAGE_CORE_KEYS = ("role", "content", "tool_calls", "index")
+
+
+def _merge_extra(dst: dict[str, Any], src: dict[str, Any], skip: tuple[str, ...], concat: bool = False) -> None:
+    """Copy provider-specific fields (thought_signature, reasoning_content, extra_content...) verbatim.
+
+    Nested dicts merge recursively; with `concat` string deltas append (streamed reasoning text),
+    otherwise later values replace earlier ones (signatures arrive whole).
+    """
+    for key, value in src.items():
+        if key in skip:
+            continue
+        current = dst.get(key)
+        if isinstance(value, dict) and isinstance(current, dict):
+            _merge_extra(current, value, (), concat)
+        elif concat and isinstance(value, str) and isinstance(current, str):
+            dst[key] = current + value
+        else:
+            dst[key] = copy.deepcopy(value)
+
+
+def _parse_tool_calls(body: bytes, streaming: bool) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    """(assistant text, normalized tool calls, extra assistant message fields) from a completion or SSE body.
+
+    Provider-specific fields on the message and on each tool call are preserved so the assistant turn can
+    be echoed upstream losslessly (Gemini rejects tool results whose call lost its thought_signature).
+    """
+    calls: dict[int, dict[str, Any]] = {}
+    text: list[str] = []
+    extras: dict[str, Any] = {}
+
+    def absorb(items: Any, merge: bool) -> None:
+        for pos, item in enumerate(items if isinstance(items, list) else []):
+            if not isinstance(item, dict):
+                continue
+            index = item.get("index", pos) if merge and isinstance(item.get("index", pos), int) else pos
+            call = calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+            call["id"] = item.get("id") or call["id"]
+            _merge_extra(call, item, ("id", "type", "function", "index"))
+            function = item.get("function")
+            if isinstance(function, dict):
+                _merge_extra(call["function"], function, ("name", "arguments"))
+                call["function"]["name"] += function.get("name") or ""
+                arguments = function.get("arguments")
+                call["function"]["arguments"] += arguments if isinstance(arguments, str) else json.dumps(arguments or {})
+
+    try:
+        if streaming:
+            for line in body.decode("utf-8", errors="replace").split("\n"):
+                line = line.strip()
+                data = line[5:].strip() if line.startswith("data:") else ""
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    choices = json.loads(data)["choices"]
+                except (ValueError, KeyError, TypeError):
+                    continue
+                for choice in choices if isinstance(choices, list) else []:
+                    delta = choice.get("delta") if isinstance(choice, dict) and choice.get("index", 0) == 0 else None
+                    if isinstance(delta, dict):
+                        text.append(_delta_text(delta.get("content")))
+                        _merge_extra(extras, delta, _MESSAGE_CORE_KEYS, concat=True)
+                        absorb(delta.get("tool_calls"), True)
+        else:
+            message = json.loads(body)["choices"][0]["message"]
+            text.append(_text_of(message.get("content")))
+            _merge_extra(extras, message, _MESSAGE_CORE_KEYS)
+            absorb(message.get("tool_calls"), False)
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return "", [], {}
+    ordered = [calls[i] for i in sorted(calls)]
+    for n, call in enumerate(ordered):
+        call["id"] = call["id"] or f"call_{n}"
+    return "".join(text), [c for c in ordered if c["function"]["name"]], extras
+
+
+class _ReplayStream(httpx.AsyncByteStream):
+    """Already-buffered chunks followed by the rest of a still-open upstream stream."""
+
+    def __init__(self, head: list[bytes], rest: AsyncIterator[bytes], upstream: httpx.Response) -> None:
+        self._head, self._rest, self._upstream = head, rest, upstream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self._head:
+            yield chunk
+        async for chunk in self._rest:
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self._upstream.aclose()
+
+
+async def _buffer_until_decided(upstream: httpx.Response) -> tuple[bytes, httpx.Response | None]:
+    """Buffer an SSE turn until it is either a tool-call turn or a plain answer.
+
+    Returns (body, None) with the stream fully consumed when tool-call deltas appear (they are
+    never relayed). As soon as assistant text or a finish marker is seen without tool-call
+    deltas, returns (b"", live): a response replaying the buffered head, then the remainder.
+    """
+    head: list[bytes] = []
+    seen = b""
+    iterator = upstream.aiter_bytes()
+    try:
+        async for chunk in iterator:
+            head.append(chunk)
+            seen += chunk
+            if b'"tool_calls"' in seen:
+                async for rest in iterator:
+                    head.append(rest)
+                return b"".join(head), None
+            if _stream_text(seen) or any(_stream_outcome(seen)):
+                headers = {"content-type": upstream.headers["content-type"]} if "content-type" in upstream.headers else None
+                stream = _ReplayStream(head, iterator, upstream)
+                return b"", httpx.Response(upstream.status_code, headers=headers, stream=stream)
+    except BaseException:
+        await asyncio.shield(upstream.aclose())
+        raise
+    await upstream.aclose()
+    return b"".join(head), None
+
+
+async def _run_tool_call(call: dict[str, Any], roots: list[Path]) -> dict[str, Any]:
+    """Execute one tool call locally; the result is an ephemeral `role: tool` message."""
+    function = call["function"]
+    try:
+        arguments = json.loads(function["arguments"] or "{}")
+    except ValueError:
+        arguments = None  # dispatch_tool_call reports invalid_arguments
+    result = await asyncio.to_thread(dispatch_tool_call, function["name"], arguments, roots)
+    return {"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result)}
+
+
 def _error(status: int, message: str, kind: str) -> JSONResponse:
     return JSONResponse({"error": {"message": message, "type": kind}}, status_code=status)
 
@@ -211,12 +357,16 @@ def create_app(
         else DistillationEngine(resolver.db, ledger=resolver.ledger)
     )
     background_tasks: set[asyncio.Task[Any]] = set()
-    onboarding_sessions: dict[str, None] = {}  # insertion-ordered, bounded
+    onboarding_sessions: dict[str, str] = {}  # session -> onboarding mode; insertion-ordered, bounded
     distill_slots = asyncio.Semaphore(MAX_CONCURRENT_DISTILLATIONS)
 
     async def _distill(session_id: str, query: str, response: str) -> None:
         async with distill_slots:
             await engine.process_exchange(session_id, query, response)
+            try:  # Model B may have declared the operator: fold any generic `User` node into it
+                await reanchor_generic_user(resolver.db)
+            except Exception:
+                logger.warning("Operator re-anchor failed session=%r", session_id, exc_info=True)
 
     def schedule_distillation(session_id: str, query: str, response: str, allow_private: bool = False) -> None:
         """Fire-and-forget; process_exchange swallows its own errors.
@@ -259,6 +409,50 @@ def create_app(
             return await call_next(request)
 
     app.state.background_tasks = background_tasks
+
+    async def post_upstream(payload: dict[str, Any], headers: dict[str, str]) -> httpx.Response:
+        request = http.build_request("POST", chat_url, content=json.dumps(payload), headers=headers)
+        return await http.send(request, stream=True)
+
+    async def run_tool_loop(payload: dict[str, Any], headers: dict[str, str], streaming: bool) -> httpx.Response:
+        """JIT tool loop: run workspace tool calls locally and re-post until a final answer.
+
+        Each upstream turn is fully buffered, so tool-call deltas never reach the client; the
+        returned response is pre-read and carries only the final turn. Tool calls naming tools
+        Strand does not own are passed through to the client untouched. After
+        MAX_TOOL_ITERATIONS tool rounds a last request is made with `tool_choice: none`.
+        """
+        roots = config.resolved_workspace_roots()
+        convo = list(payload["messages"])
+        for round_no in range(MAX_TOOL_ITERATIONS + 1):
+            guard = round_no == MAX_TOOL_ITERATIONS
+            body_payload = {**payload, "messages": convo}
+            if guard:
+                logger.warning("Tool loop hit %d iterations; forcing a final answer", MAX_TOOL_ITERATIONS)
+                body_payload["tool_choice"] = "none"
+            upstream = await post_upstream(body_payload, headers)
+            if streaming and upstream.status_code < 400 and not guard:
+                body, live = await _buffer_until_decided(upstream)
+                if live is not None:  # plain answer: relay it live, tool deltas never appeared
+                    return live
+            else:
+                try:
+                    body = await upstream.aread()
+                finally:
+                    await upstream.aclose()
+            text, calls, extras = "", [], {}
+            if upstream.status_code < 400 and not guard:
+                text, calls, extras = _parse_tool_calls(body, streaming)
+            if not calls or any(c["function"]["name"] not in _LOCAL_TOOL_NAMES for c in calls):
+                break
+            logger.info("Executing %d local tool call(s) round=%d", len(calls), round_no + 1)
+            convo.append({**extras, "role": "assistant", "content": text or None, "tool_calls": calls})
+            for call in calls:
+                convo.append(await _run_tool_call(call, roots))
+        content_type = upstream.headers.get("content-type")
+        return httpx.Response(
+            upstream.status_code, headers={"content-type": content_type} if content_type else None, content=body
+        )
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -318,18 +512,18 @@ def create_app(
             explicit = mode == ONBOARDING_MODE
             if resolution_failed:
                 pass  # fail open: forward the request untouched
-            elif explicit and session_id not in onboarding_sessions:
-                onboarding_sessions[session_id] = None
-            elif session_id not in onboarding_sessions and await count_persons(resolver.db) == 0:
-                logger.info("Day-zero: no person entities; flagging session=%r for onboarding", session_id)
-                onboarding_sessions[session_id] = None
+            elif session_id not in onboarding_sessions and (explicit or await count_operators(resolver.db) == 0):
+                # No explicit operator yet: Day Zero. /onboard with one on record: intent triage.
+                has_operator = await count_operators(resolver.db) > 0
+                onboarding_sessions[session_id] = MODE_TRIAGE if has_operator else MODE_DAY_ZERO
+                logger.info("Onboarding session=%r mode=%s", session_id, onboarding_sessions[session_id])
             while len(onboarding_sessions) > MAX_ONBOARDING_SESSIONS:
                 del onboarding_sessions[next(iter(onboarding_sessions))]
             if session_id in onboarding_sessions and not resolution_failed:
                 host_info = get_host_context()
-                if explicit:  # day-zero only flags the session; Model B seeds people organically
-                    await seed_operator_anchor(resolver.db, host_info)
-                delta = f"{onboarding_directive(host_info)}\n\n{delta}" if delta else onboarding_directive(host_info)
+                user_turns = sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "user")
+                directive = onboarding_directive(host_info, onboarding_sessions[session_id], user_turns <= 1)
+                delta = f"{directive}\n\n{delta}" if delta else directive
         except Exception:
             logger.error("Onboarding setup failed session=%r; continuing without it", session_id, exc_info=True)
         if delta:
@@ -346,9 +540,14 @@ def create_app(
         if streaming:
             # Compressed SSE cannot be line-parsed for distillation; ask for plaintext.
             headers["Accept-Encoding"] = "identity"
-        upstream_request = http.build_request("POST", chat_url, content=json.dumps(payload), headers=headers)
+        # Earlier-turn raw tool output and media are transient: keep only the syntheses.
+        payload["messages"] = resolver.ledger.compact_history(payload["messages"])
         try:
-            upstream = await http.send(upstream_request, stream=True)
+            if config.tools_enabled:
+                payload["tools"] = _merge_tools(payload.get("tools"))
+                upstream = await run_tool_loop(payload, headers, streaming)
+            else:
+                upstream = await post_upstream(payload, headers)
         except httpx.HTTPError as exc:
             logger.error("Upstream request failed session=%r: %r; session reset", session_id, exc)
             resolver.ledger.reset(session_id)

@@ -12,6 +12,10 @@ EMBEDDING_DIM = 384
 
 # Personality Matrix archetypes: interaction rules stored as ordinary entity rows.
 PERSONALITY_ARCHETYPES = frozenset({"trait", "directive", "preference"})
+BEDROCK_INVARIANT = (
+    "You are Strand, a sovereign, local-first cognitive companion running directly on the operator's machine. "
+    "Be authentic, technically rigorous, and direct. Never apologize. Never use conversational filler."
+)
 FACTUAL_ARCHETYPES = frozenset({"person", "project", "system", "vehicle", "concept"})
 VALID_ARCHETYPES = FACTUAL_ARCHETYPES | PERSONALITY_ARCHETYPES
 MIN_EDGE_CONFIDENCE = 0.2  # edges below this are treated as deprecated and never recalled

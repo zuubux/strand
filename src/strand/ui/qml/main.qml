@@ -570,7 +570,7 @@ ApplicationWindow {
             }
 
             // Asymmetric turn geometry: the user is a compact, recessed, right-aligned card;
-            // Strand is an unboxed, left-aligned editorial flow; notes are dim local asides.
+            // Strand is a left-aligned slate card (max 85% / 820px); notes are dim local asides.
             delegate: Item {
                 id: row
                 required property string role
@@ -588,11 +588,13 @@ ApplicationWindow {
                     // One-way geometry: bubble.width derives only from row.width and text metrics,
                     // never from `content` (which wraps to bubble.width), so there are no layout loops.
                     readonly property bool isThinking: row.pending && row.body.length === 0
-                    readonly property bool boxed: row.isUser
+                    readonly property bool isAssistant: row.role === "assistant"
+                    readonly property bool boxed: row.isUser || isAssistant
                     readonly property real hPad: boxed ? root.bodyPixelSize : 0
                     readonly property real vPad: boxed ? Math.round(root.bodyPixelSize * 0.7) : 2
                     readonly property real edge: Math.round(root.bodyPixelSize * 8 / 7)
-                    readonly property real maxWidth: row.isUser ? row.width * 0.72 : row.width - 2 * edge
+                    readonly property real maxWidth: row.isUser ? row.width * 0.72
+                        : (isAssistant ? Math.min(row.width * 0.85, 820, row.width - 2 * edge) : row.width - 2 * edge)
                     TextMetrics {
                         id: textMetrics
                         font.pixelSize: root.bodyPixelSize
@@ -600,16 +602,17 @@ ApplicationWindow {
                     }
                     readonly property real naturalWidth: Math.ceil(textMetrics.advanceWidth) + 2 * hPad + 2
                     x: row.isUser ? row.width - width - edge : edge
-                    // Strand turns and notes use the full column; only user cards shrink to fit.
-                    width: row.isUser ? Math.min(maxWidth, naturalWidth) : Math.max(0, maxWidth)
+                    // Notes use the full column; user cards and the assistant thinking pill shrink to fit;
+                    // assistant answers fill their bounded card width.
+                    width: (row.isUser || (isAssistant && isThinking)) ? Math.min(maxWidth, naturalWidth) : Math.max(0, maxWidth)
                     height: content.implicitHeight + 2 * vPad
 
                     Rectangle {
                         anchors.fill: parent
                         visible: bubble.boxed
-                        radius: 10
-                        color: root.userRecess
-                        border.color: root.userBorder
+                        radius: 12
+                        color: row.isUser ? root.userRecess : "#13171f"
+                        border.color: row.isUser ? root.userBorder : Qt.rgba(1, 1, 1, 0.06)
                         border.width: 1
                     }
 
@@ -719,7 +722,12 @@ ApplicationWindow {
                 color: "#13171f"
                 border.width: 1
                 border.color: input.activeFocus ? "#38bdf8" : Qt.rgba(1, 1, 1, 0.08)
-                Behavior on width { NumberAnimation { duration: 150; easing.type: Easing.OutQuad } }
+                // Animate only when the input is empty (resting/reset). While typing the width
+                // snaps, so the wrap engine and an in-flight animation never race (BUG-UI-001).
+                Behavior on width {
+                    enabled: input.text.length === 0
+                    NumberAnimation { duration: 150; easing.type: Easing.OutQuad }
+                }
 
                 Flickable {
                     id: inputFlick
@@ -745,8 +753,10 @@ ApplicationWindow {
                         topPadding: 12
                         bottomPadding: 12
                         leftPadding: 14
-                        // Reserve room for the model watermark so typed text never runs under it.
-                        rightPadding: modelWatermark.width + 20
+                        // Reserve room for the model watermark only while it is shown (empty input);
+                        // once typing starts the full dock width is available, so no phantom wall
+                        // forces a premature wrap (BUG-UI-001).
+                        rightPadding: text.length > 0 ? 14 : modelWatermark.width + 20
                         enabled: bridge ? !bridge.busy : false
                         onTextChanged: if (text.length === 0) root.browsingHistory = false
                         background: null
@@ -871,9 +881,9 @@ ApplicationWindow {
         visible: x < parent.width
         clip: true
         radius: 16
-        // Glass: translucent panel tint with a faint light rim.
-        color: Qt.rgba(root.panel.r, root.panel.g, root.panel.b, 0.82)
-        border.color: Qt.rgba(1, 1, 1, 0.10)
+        // Near-opaque #0d1117 surface (0.96) so transcript text never ghosts through.
+        color: Qt.rgba(0.051, 0.067, 0.090, 0.96)
+        border.color: Qt.rgba(1, 1, 1, 0.08)
         border.width: 1
         Behavior on x { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
 
@@ -898,7 +908,7 @@ ApplicationWindow {
                     height: 24
                     Label {
                         anchors.verticalCenter: parent.verticalCenter
-                        text: "FIBER TELEMETRY"
+                        text: "TELEMETRY"
                         color: root.textColor
                         font.family: root.uiFamily
                         font.pixelSize: 12

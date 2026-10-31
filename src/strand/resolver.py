@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from strand.common import (
+    BEDROCK_INVARIANT,
     DEFAULT_CONTINUITY_HORIZON_DAYS,
     DEFAULT_CONTINUITY_MAX_EPISODES,
     MIN_EDGE_CONFIDENCE,
@@ -32,6 +33,7 @@ MIN_EFFECTIVE_PRIORITY = 0.15  # with decay enabled, candidates below this are p
 MAX_FREQUENCY_FACTOR = 1.5  # cap on the access-frequency boost
 FREQUENCY_STEP = 0.05  # boost per recorded access
 MAX_PERSONALITY_ENTITIES = 20  # cap on always-on personality nodes recalled per turn
+BEDROCK_ID = -2  # sentinel ledger id: the permanent identity invariant is injected once per session
 PERSONA_ANCHOR_ID = -1  # sentinel ledger id: the configured persona prompt is injected once per session
 # Personality sections in presentation order, hierarchically above working memory.
 _PERSONALITY_SECTIONS = (
@@ -311,6 +313,8 @@ def format_context_delta(
             sections += [title, *body]
 
     lines = [_HEADER]
+    if BEDROCK_ID in new_entities:
+        lines.append(BEDROCK_INVARIANT)
     alerts = list(discrepancies)
     if alerts:
         lines.append(_REALITY_CHECK)
@@ -629,9 +633,13 @@ class ContextResolver:
                 await self.db.touch_access([e.id for e in entities], [e.id for e in edges])
             except Exception:
                 logger.warning("touch_access failed; recall continues", exc_info=True)
-        anchor = [PERSONA_ANCHOR_ID] if self.persona_prompt else []
+        # The factory persona is the cold-boot fallback: once the graph holds operator stance
+        # nodes it is superseded and suppressed.
+        stance = any(e.archetype in PERSONALITY_ARCHETYPES for e in entities)
+        anchor = [PERSONA_ANCHOR_ID] if self.persona_prompt and not stance else []
+        bedrock = [BEDROCK_ID] if stance or anchor else []
         delta = self.ledger.filter_new(
-            session_id, [*anchor, *(e.id for e in entities)], (e.id for e in edges)
+            session_id, [*bedrock, *anchor, *(e.id for e in entities)], (e.id for e in edges)
         )
         episode_ids, continuity = await self.recent_continuity(roots, session_id, allow_private)
         if episode_ids:

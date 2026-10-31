@@ -174,12 +174,13 @@ def _system_text(request):
     return messages[0]["content"] if messages[0]["role"] == "system" else ""
 
 
-def test_header_triggers_onboarding_directive_and_seeds(tmp_path, pinned_host):
+def test_header_triggers_onboarding_directive_without_seeding_from_user(tmp_path, pinned_host):
     seen, names = _post(tmp_path, {"X-Strand-Mode": "onboarding"}, with_person=True)
     system = _system_text(seen[0])
     assert "[Onboarding Directive: Grounding & Resonance]" in system
     assert "host workstation-01, Fedora Linux 44" in system
-    assert {"Operator", "workstation-01"} <= set(names)
+    assert "Intent Triage" in system
+    assert set(names) == {"Marcus"}  # the $USER account never becomes a person node
 
 
 def test_day_zero_flags_first_session_without_seeding(tmp_path, pinned_host):
@@ -228,3 +229,12 @@ def test_new_command_clears_onboarding_mode(qapp):
     b._onboarding = True
     assert b.runCommand("/new")
     assert "X-Strand-Mode" not in b._headers()
+
+
+def test_onboarding_has_no_procedural_name_anchor():
+    import strand.onboarding as onboarding
+
+    assert not hasattr(onboarding, "anchor_operator_name")
+    assert onboarding.OPENING_LINE == "Hi, I'm Strand. What should I call you?"
+    text = onboarding.onboarding_directive({"hostname": "workstation-01"})
+    assert onboarding.OPENING_LINE in text and "do not use the Linux account name as a fallback" in text

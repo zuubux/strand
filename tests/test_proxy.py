@@ -222,3 +222,157 @@ def test_delta_log_fields_count_personality_and_working_memory():
     plain = "## Strand Memory\nEntities:\n- A (person): x\n- B (person): y\nRelations:\n- A -knows-> B"
     assert _delta_log_fields(plain) == "entities=2 edges=1"
     assert _delta_log_fields("") == "entities=0 edges=0"
+
+
+HOST = {"user": "nic", "hostname": "workstation-01", "os": "Fedora Linux 44"}
+
+
+def _systems(seen):
+    return [body_of(r)["messages"][0]["content"] for r in seen]
+
+
+async def _post_chat(client, text, headers=None, history=()):
+    messages = [*history, {"role": "user", "content": text}]
+    return await client.post("/v1/chat/completions", json={"messages": messages, "session_id": "s"}, headers=headers or {})
+
+
+def _onboard_scenario(tmp_path, monkeypatch, persons, headers=None, text="hello there"):
+    import strand.proxy as proxy_mod
+
+    monkeypatch.setattr(proxy_mod, "get_host_context", lambda: dict(HOST))
+
+    async def scenario():
+        seen: list[httpx.Request] = []
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: (seen.append(r), ok_json(r))[1]))
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            for name, origin in persons:
+                await db.upsert_entity(name, "person", "x", origin=origin, confidence=1.0 if origin == "user_explicit" else 0.6)
+            app = create_app(Config(upstream_url="http://upstream.test/v1"), ContextResolver(db, SessionLedger()), upstream)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://strand") as client:
+                await _post_chat(client, text, headers)
+                await asyncio.gather(*app.state.background_tasks)
+            await upstream.aclose()
+        return _systems(seen)
+
+    return run(scenario())
+
+
+def test_day_zero_triggers_without_user_explicit_person(tmp_path, monkeypatch):
+    (system,) = _onboard_scenario(tmp_path, monkeypatch, [("Inferred Ian", "model_inferred")])
+    assert "[Onboarding Directive" in system
+    assert "Intent Triage" not in system
+
+
+def test_day_zero_does_not_trigger_with_user_explicit_person(tmp_path, monkeypatch):
+    (system,) = _onboard_scenario(tmp_path, monkeypatch, [("Nic", "user_explicit")], text="Tell me about Nic")
+    assert "[Onboarding Directive" not in system
+
+
+def test_turn_one_directive_forces_name_question_and_forbids_user_fallback(tmp_path, monkeypatch):
+    (system,) = _onboard_scenario(tmp_path, monkeypatch, [])
+    assert "Hi, I'm Strand. What should I call you?" in system
+    assert "NEVER address the operator by their Linux account ($USER) name" in system
+    assert "do not use the Linux account name as a fallback" in system
+    assert "host workstation-01" in system  # specs stay ambient
+
+
+def test_later_turn_directive_covers_greeting_hostname_and_mission(tmp_path, monkeypatch):
+    from strand.onboarding import onboarding_directive
+
+    text = onboarding_directive(HOST, first_turn=False)
+    assert "running locally on workstation-01" in text
+    assert "sovereign working memory and privacy" in text
+    assert "What should I call you?" not in text
+
+
+def test_onboard_on_existing_database_triggers_intent_triage(tmp_path, monkeypatch):
+    (system,) = _onboard_scenario(
+        tmp_path, monkeypatch, [("Nic", "user_explicit")], headers={"X-Strand-Mode": "onboarding"}
+    )
+    assert "Intent Triage" in system
+    assert "1. Update their name/identity." in system
+    assert "2. Recalibrate communication directives, tone, and formatting." in system
+    assert "3. Re-run the full onboarding dialogue." in system
+    assert "handled in Settings" in system
+    assert "What should I call you?" not in system
+
+
+def _model_b_operator(request):
+    return httpx.Response(
+        200,
+        json={
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "entities": [
+                                    {"name": "Nic", "archetype": "person", "origin": "user_explicit", "confidence": 1.0}
+                                ],
+                                "edges": [{"source": "Nic", "target": "workstation-01", "relation": "operates_host"}],
+                            }
+                        )
+                    }
+                }
+            ]
+        },
+    )
+
+
+def test_model_b_operator_completes_day_zero_and_folds_generic_user(tmp_path, monkeypatch):
+    import strand.extractors as ex
+    import strand.proxy as proxy_mod
+    from strand.distill import DistillationEngine
+    from strand.extractors import LLMExtractor
+    from strand.onboarding import count_operators
+
+    monkeypatch.setattr(proxy_mod, "get_host_context", lambda: dict(HOST))
+    monkeypatch.setattr(ex, "get_host_context", lambda: dict(HOST))
+
+    async def scenario():
+        def greeting(_: httpx.Request) -> httpx.Response:
+            text = "Nice to meet you, Nic. I run locally on workstation-01 as your sovereign working memory."
+            return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": text}}]})
+
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(greeting))
+        slm = httpx.AsyncClient(transport=httpx.MockTransport(_model_b_operator))
+        async with DatabaseManager(tmp_path / "b.db") as db:
+            generic = await db.upsert_entity("User", "person", "generic", origin="model_inferred", confidence=0.6)
+            rule = await db.upsert_entity("No apologies", "directive", "never apologize")
+            await db.upsert_edge(generic, rule, "demands")
+            engine = DistillationEngine(db, extractor=LLMExtractor("http://slm.test/v1", "tiny", client=slm))
+            app = create_app(
+                Config(upstream_url="http://upstream.test/v1"), ContextResolver(db, SessionLedger()), upstream, engine
+            )
+            history = [
+                {"role": "user", "content": "hello there"},
+                {"role": "assistant", "content": "Hi, I'm Strand. What should I call you?"},
+                {"role": "user", "content": "Nicholas is fine"},
+            ]
+            before = await count_operators(db)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://strand") as client:
+                await client.post("/v1/chat/completions", json={"messages": history, "session_id": "s"})
+                await asyncio.gather(*app.state.background_tasks)
+            await upstream.aclose()
+            await slm.aclose()
+            async with db.conn.execute("SELECT name FROM entities WHERE archetype = 'person'") as cur:
+                people = [r[0] for r in await cur.fetchall()]
+            async with db.conn.execute(
+                "SELECT s.name, t.name, e.relation FROM edges e JOIN entities s ON s.id = e.source_id "
+                "JOIN entities t ON t.id = e.target_id"
+            ) as cur:
+                edges = {tuple(r) for r in await cur.fetchall()}
+            return before, await count_operators(db), people, edges
+
+    before, after, people, edges = run(scenario())
+    assert before == 0 and after > 0
+    assert people == ["Nic"]
+    assert ("Nic", "workstation-01", "operates_host") in edges
+    assert ("Nic", "No apologies", "demands") in edges
+
+
+def test_proxy_has_no_procedural_name_interceptors():
+    import strand.proxy as proxy_mod
+
+    for attr in ("declared_name", "EXPECTING_NAME", "anchor_operator_name"):
+        assert not hasattr(proxy_mod, attr), attr

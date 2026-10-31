@@ -25,6 +25,7 @@ DEFAULT_LOG_LEVEL = "INFO"
 # orthogonal (unrelated) ones at >= 1.414.
 DEFAULT_DISTANCE_THRESHOLD = 1.0
 DEFAULT_DECAY_HALF_LIFE_DAYS = 30.0
+DEFAULT_WORKSPACE_ROOTS = ("~/Projects",)
 
 # config.json key -> environment variable
 ENV_VARS = {
@@ -47,6 +48,8 @@ ENV_VARS = {
     "continuity_max_episodes": "STRAND_CONTINUITY_MAX_EPISODES",
     "model_default": "STRAND_MODEL_DEFAULT",
     "persona_prompt": "STRAND_PERSONA_PROMPT",
+    "workspace_roots": "STRAND_WORKSPACE_ROOTS",
+    "tools_enabled": "STRAND_TOOLS_ENABLED",
 }
 
 
@@ -60,6 +63,25 @@ def _as_bool(value: Any) -> bool:
     if text in ("0", "false", "no", "off", ""):
         return False
     raise ValueError(f"invalid boolean {value!r}; use true or false")
+
+
+def _as_roots(value: Any) -> list[str]:
+    """Parse workspace roots: a JSON list, or a string separated by `os.pathsep` or commas."""
+    if isinstance(value, (list, tuple)):
+        items = [str(v) for v in value]
+    else:
+        text = str(value).strip()
+        if text.startswith("["):
+            try:
+                loaded = json.loads(text)
+            except ValueError:
+                raise ValueError(f"invalid workspace_roots {value!r}") from None
+            if not isinstance(loaded, list):
+                raise ValueError(f"invalid workspace_roots {value!r}")
+            items = [str(v) for v in loaded]
+        else:
+            items = text.replace(",", os.pathsep).split(os.pathsep)
+    return [i.strip() for i in items if i.strip()]
 
 
 def _validate_half_life(value: Any) -> float:
@@ -108,6 +130,9 @@ class Config:
     model_default: str = ""
     # Optional bedrock persona anchor, injected ahead of the personality matrix.
     persona_prompt: str = ""
+    # Ring-0 ambient read: approved workspace roots and the tool-runner master switch.
+    workspace_roots: list[str] = field(default_factory=lambda: list(DEFAULT_WORKSPACE_ROOTS))
+    tools_enabled: bool = True
     # True when host or port came from the environment or config.json (forces TCP).
     tcp_explicit: bool = field(default=False, compare=False)
 
@@ -134,6 +159,10 @@ class Config:
         """("uds", path) in socket mode, else ("tcp", host); port is `self.port`."""
         path = self.effective_socket_path(env)
         return ("uds", path) if path else ("tcp", self.host)
+
+    def resolved_workspace_roots(self) -> list[Path]:
+        """Canonical roots (`~` expanded, symlinks resolved) so they cannot be escaped."""
+        return [Path(r).expanduser().resolve() for r in self.workspace_roots]
 
     def validate(self) -> "Config":
         """Raise ValueError for settings that would only fail later at runtime; return self."""
@@ -187,6 +216,8 @@ class Config:
             ),
             model_default=str(pick("model_default", "")).strip(),
             persona_prompt=str(pick("persona_prompt", "")).strip(),
+            workspace_roots=_as_roots(pick("workspace_roots", list(DEFAULT_WORKSPACE_ROOTS))),
+            tools_enabled=_as_bool(pick("tools_enabled", True)),
             tcp_explicit=bool(pick("host", "") or pick("port", "")),
         )
 
@@ -242,8 +273,10 @@ def save_config_value(key: str, value: Any, config_path: Path | None = None) -> 
         "continuity_horizon_days",
     ):
         value = float(value)
-    elif key == "decay_enabled":
+    elif key in ("decay_enabled", "tools_enabled"):
         value = _as_bool(value)
+    elif key == "workspace_roots":
+        value = _as_roots(value)
     elif key == "log_level":
         value = str(value).upper()
     elif key == "model_default":

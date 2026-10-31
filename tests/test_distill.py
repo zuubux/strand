@@ -513,3 +513,49 @@ def test_distill_without_vectors_uses_alias_matching_and_resolver_sees_alias(tmp
     names, resolved = run(scenario())
     assert names == [("dev-server",), ("Zeta Tool",)]
     assert resolved[0] == "dev-server"
+
+
+# --- OBS-POL-005 Phase 1: critique-driven edge deprecation ------------------------------------
+
+
+def test_critique_deprecates_edge_keeps_nodes_and_is_idempotent(tmp_path):
+    import json as _json
+
+    extraction = {
+        "entities": [{"name": "no-diff-summaries", "archetype": "directive", "summary": "Never summarize diffs"}],
+        "edges": [{"source": "Nic", "target": "no-diff-summaries", "relation": "demands"}],
+        "deprecated_edges": [
+            {"source": "Nic", "target": "diff-summaries", "relation": "prefers", "reason": "stopped"}
+        ],
+    }
+
+    async def extractor(query, response):
+        return extraction
+
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            nic = await db.upsert_entity("Nic", "person", "", origin="user_explicit")
+            old = await db.upsert_entity("diff-summaries", "preference", "Summarize diffs", origin="user_explicit")
+            await db.upsert_edge(nic, old, "prefers")
+            engine = DistillationEngine(db, extractor=extractor)
+            await engine.process_exchange("s", "Stop summarizing diffs from now on", "Understood, I will stop summarizing diffs and show them in full.")
+            await engine.process_exchange("s", "Stop summarizing diffs from now on", "Understood, I will stop summarizing diffs and show them in full.")
+            async with db.conn.execute(
+                "SELECT weight, metadata FROM edges WHERE source_id = ? AND target_id = ?", (nic, old)
+            ) as cur:
+                edge = await cur.fetchone()
+            async with db.conn.execute(
+                "SELECT archetype, origin FROM entities WHERE name IN ('diff-summaries', 'no-diff-summaries') ORDER BY name"
+            ) as cur:
+                nodes = [tuple(r) for r in await cur.fetchall()]
+            async with db.conn.execute(
+                "SELECT e.weight FROM edges e JOIN entities t ON t.id = e.target_id WHERE t.name = 'no-diff-summaries'"
+            ) as cur:
+                fresh = [r[0] for r in await cur.fetchall()]
+            return edge, nodes, fresh
+
+    edge, nodes, fresh = asyncio.run(scenario())
+    assert edge["weight"] == 0.0
+    assert _json.loads(edge["metadata"])["deprecated"] is True
+    assert nodes == [("preference", "user_explicit"), ("directive", "model_inferred")]  # old node survives
+    assert fresh == [1.0]
