@@ -161,6 +161,17 @@ def _entity_from_row(row, prefix: str = "") -> Entity:
     )
 
 
+_ARCHETYPE_WORDS = frozenset({"car", "cars", "vehicle", "vehicles"})
+_SELF_HISTORY_WORDS = frozenset({"my", "mine", "history", "past", "owned", "own", "previous", "previously"})
+_OWNERSHIP_RELATIONS = ("owns", "owned", "previously_owned")
+
+
+def _is_collection_query(haystack: str) -> bool:
+    """True when a casefolded query asks for the operator's vehicles as a collection."""
+    words = set(re.findall(r"[\w']+", haystack))
+    return bool(words & _ARCHETYPE_WORDS) and bool(words & _SELF_HISTORY_WORDS)
+
+
 def _is_word_char(char: str) -> bool:
     return char.isalnum() or char == "_"
 
@@ -397,7 +408,9 @@ class ContextResolver:
     async def match_entities(self, query: str, allow_private: bool = False) -> list[Entity]:
         """Entities whose name or metadata alias appears in `query` (case-insensitive, whole word).
 
-        Results are ordered by first mention in the query and capped at `max_entities`.
+        Results are ordered by first mention in the query and capped at `max_entities`. An
+        archetype-level collection query ("car"/"vehicles" plus "my"/"history"/"past"/"owned")
+        also leads with the operator's active owned and previously owned `vehicle` entities.
         """
         haystack = query.casefold()
         if not haystack.strip():
@@ -410,6 +423,7 @@ class ContextResolver:
         if not allow_private:
             rows = [r for r in rows if not is_private(r["archetype"], r["metadata"])]
 
+        collection = await self._operator_vehicles(haystack, rows) if _is_collection_query(haystack) else []
         hits: list[tuple[int, int, Entity]] = []
         for row in rows:
             terms = (
@@ -433,10 +447,36 @@ class ContextResolver:
             ranked.sort(key=lambda r: (-prio[r[3].id], r[0], r[1], r[2]))
         else:
             ranked.sort(key=lambda r: (-r[3].confidence, r[0], r[1], r[2]))
-        matched = [entity for *_, entity in ranked[: self.max_entities]]
+        matched = [entity for *_, entity in ranked]
+        collected = {e.id for e in collection}
+        matched = (collection + [e for e in matched if e.id not in collected])[: self.max_entities]
         if self.embedder is not None and self.db.vec_enabled and len(matched) < self.max_entities:
             matched += await self._semantic_hits(query, rows, {e.id for e in matched})
         return matched[: self.max_entities]
+
+    async def _operator_vehicles(self, haystack: str, rows: Iterable) -> list[Entity]:
+        """Tier 0: active `vehicle` entities the operator owns or previously owned (archetype query).
+
+        `rows` is already privacy-filtered. The operator is the generic `User` or any `person` with an
+        `operates_host` edge; severed edges (see `_is_active_edge`) are skipped.
+        """
+        marks = ",".join("?" for _ in _OWNERSHIP_RELATIONS)
+        async with self.db.conn.execute(
+            "SELECT ed.weight, ed.confidence, ed.metadata, ed.target_id FROM edges AS ed "
+            "JOIN entities AS s ON s.id = ed.source_id JOIN entities AS t ON t.id = ed.target_id "
+            f"WHERE t.archetype = 'vehicle' AND s.archetype = 'person' AND ed.relation IN ({marks}) "
+            "AND (lower(s.name) = 'user' OR EXISTS (SELECT 1 FROM edges AS h WHERE h.source_id = s.id "
+            "AND h.relation = 'operates_host')) ORDER BY ed.id",
+            _OWNERSHIP_RELATIONS,
+        ) as cur:
+            edge_rows = await cur.fetchall()
+        by_id = {r["id"]: r for r in rows}
+        found: dict[int, Entity] = {}
+        for weight, confidence, raw, target_id in edge_rows:
+            active = {"weight": weight, "confidence": confidence, "metadata": load_metadata(raw)}
+            if target_id in by_id and target_id not in found and _is_active_edge(active):
+                found[target_id] = _entity_from_row(by_id[target_id])
+        return list(found.values())
 
     async def _semantic_hits(self, query: str, rows: Iterable, taken: set[int]) -> list[Entity]:
         """Tier 3: vector KNN over entity embeddings, nearest first, excluding `taken`.

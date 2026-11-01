@@ -376,3 +376,145 @@ def test_proxy_has_no_procedural_name_interceptors():
 
     for attr in ("declared_name", "EXPECTING_NAME", "anchor_operator_name"):
         assert not hasattr(proxy_mod, attr), attr
+
+
+FULL_HOST = {
+    "user": "nic",
+    "hostname": "workstation-01",
+    "os": "Fedora Linux 44",
+    "desktop": "KDE",
+    "session": "wayland",
+    "cpu": "Test CPU 9000X",
+    "ram_gb": 32.0,
+}
+SPEC_TOKENS = ("Fedora", "Test CPU 9000X", "32 GB", "KDE", "wayland")
+
+
+def _telemetry_system(tmp_path, monkeypatch, config=None, headers=None):
+    import strand.proxy as proxy_mod
+
+    monkeypatch.setattr(proxy_mod, "get_host_context", lambda: dict(FULL_HOST))
+    config = config or Config(upstream_url="http://upstream.test/v1")
+
+    async def scenario():
+        seen: list[httpx.Request] = []
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: (seen.append(r), ok_json(r))[1]))
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            app = create_app(config, ContextResolver(db, SessionLedger()), upstream)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://strand") as client:
+                for hdrs in headers or [{}]:
+                    await _post_chat(client, "hello there", hdrs)
+                await asyncio.gather(*app.state.background_tasks)
+            await upstream.aclose()
+        return _systems(seen)
+
+    return run(scenario())
+
+
+def test_host_telemetry_off_omits_specs_but_keeps_hostname(tmp_path, monkeypatch):
+    (system,) = _telemetry_system(tmp_path, monkeypatch)
+    assert "[Onboarding Directive" in system
+    assert "host workstation-01" in system
+    for token in SPEC_TOKENS:
+        assert token not in system
+    assert "CPU" not in system and "RAM" not in system
+
+
+def test_host_telemetry_config_true_injects_full_specs(tmp_path, monkeypatch):
+    config = Config(upstream_url="http://upstream.test/v1", enable_host_telemetry=True)
+    (system,) = _telemetry_system(tmp_path, monkeypatch, config=config)
+    for token in SPEC_TOKENS:
+        assert token in system
+    assert "host workstation-01" in system
+
+
+def test_host_telemetry_session_override_activates_mid_session(tmp_path, monkeypatch):
+    first, second, third = _telemetry_system(
+        tmp_path,
+        monkeypatch,
+        headers=[{}, {"X-Strand-Host-Telemetry": "true"}, {}],
+    )
+    assert "Test CPU 9000X" not in first
+    assert "Test CPU 9000X" in second and "Fedora Linux 44" in second
+    assert "Test CPU 9000X" in third  # the override persists for the session
+
+
+def test_session_ledger_host_telemetry_override_is_per_session_and_reset():
+    ledger = SessionLedger()
+    assert ledger.allow_host_telemetry("a") is False
+    ledger.set_allow_host_telemetry("a", True)
+    assert ledger.allow_host_telemetry("a") is True
+    assert ledger.allow_host_telemetry("b") is False
+    ledger.set_allow_host_telemetry("a", False)
+    assert ledger.allow_host_telemetry("a") is False
+    ledger.set_allow_host_telemetry("a", True)
+    ledger.reset("a")
+    assert ledger.allow_host_telemetry("a") is False
+
+
+def _telemetry_choice_scenario(tmp_path, monkeypatch, target):
+    """Onboarding session where Model B distills a hardware choice; then one more turn."""
+    import strand.proxy as proxy_mod
+    from strand.distill import DistillationEngine
+    from strand.extractors import LLMExtractor
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(proxy_mod, "get_host_context", lambda: dict(FULL_HOST))
+    payload = {
+        "entities": [
+            {"name": "Nic", "archetype": "person", "summary": "Operator", "origin": "user_explicit"},
+            {"name": target, "archetype": "preference", "summary": "Hardware telemetry stance"},
+        ],
+        "edges": [{"source": "Nic", "target": target, "relation": "prefers"}],
+    }
+
+    async def scenario():
+        seen: list[httpx.Request] = []
+        answer = httpx.Response(
+            200, json={"choices": [{"message": {"role": "assistant", "content": "Understood, tuning the rig settings now."}}]}
+        )
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: (seen.append(r), answer)[1]))
+        slm = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+            )
+        )
+        ledger = SessionLedger()
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            engine = DistillationEngine(db, extractor=LLMExtractor("http://slm.test/v1", "tiny", client=slm))
+            app = create_app(Config(upstream_url="http://upstream.test/v1"), ContextResolver(db, ledger), upstream, engine)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://strand") as client:
+                history = [{"role": "user", "content": "Nic"}]
+                for text in ("Yeah, check it out", "anything else?"):
+                    history.append({"role": "user", "content": text})
+                    await client.post("/v1/chat/completions", json={"messages": list(history), "session_id": "s"})
+                    await asyncio.gather(*app.state.background_tasks)
+            await upstream.aclose()
+            await slm.aclose()
+        return seen, ledger
+
+    seen, ledger = run(scenario())
+    config_path = tmp_path / ".config" / "strand" / "config.json"
+    return _systems(seen), ledger, config_path
+
+
+def test_conversational_hardware_opt_in_activates_session_and_persists(tmp_path, monkeypatch):
+    systems, ledger, config_path = _telemetry_choice_scenario(tmp_path, monkeypatch, "Host Telemetry Enabled")
+    assert "Test CPU 9000X" not in systems[0]  # Turn 1/2: no eager hardware dump
+    assert ledger.allow_host_telemetry("s") is True
+    assert "Test CPU 9000X" in systems[1] and "32 GB" in systems[1]  # very next turn carries specs
+    assert json.loads(config_path.read_text()) == {"enable_host_telemetry": True}
+    assert config_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_conversational_hardware_decline_keeps_specs_redacted_and_persists_false(tmp_path, monkeypatch):
+    systems, ledger, config_path = _telemetry_choice_scenario(tmp_path, monkeypatch, "Host Telemetry On-Demand")
+    assert ledger.allow_host_telemetry("s") is False
+    assert all("Test CPU 9000X" not in s for s in systems)
+    assert json.loads(config_path.read_text()) == {"enable_host_telemetry": False}
+
+
+def test_no_telemetry_edge_writes_no_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _telemetry_system(tmp_path, monkeypatch)
+    assert not (tmp_path / ".config" / "strand" / "config.json").exists()

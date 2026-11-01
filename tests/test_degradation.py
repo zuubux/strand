@@ -266,3 +266,19 @@ def test_ping_uses_half_second_timeout():
     assert cli.PING_TIMEOUT == 0.5
     assert run(cli._ping("http://127.0.0.1:9/")) is False  # closed local port, offline
 
+
+
+def test_doctor_reports_isolated_cache_dir(doctor_env, monkeypatch, capsys):
+    tmp_path, _ = doctor_env
+    monkeypatch.delenv("FASTEMBED_CACHE_PATH", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(cli, "fastembed_available", lambda: True)
+    isolated = tmp_path / "xdg" / "strand" / "fastembed"
+    assert cli.main(["--db", str(tmp_path / "doc.db"), "doctor"]) == 0
+    out = capsys.readouterr().out
+    assert f"not cached in {isolated}" in out
+    assert "/tmp/fastembed_cache" not in out
+    (isolated / "models--qdrant--bge-small-en-v1.5-onnx-q").mkdir(parents=True)
+    assert cli.main(["--db", str(tmp_path / "doc.db"), "doctor"]) == 0
+    out = capsys.readouterr().out
+    assert f"cached at {isolated}/models--qdrant--bge-small-en-v1.5-onnx-q" in out

@@ -15,9 +15,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from .common import strip_think
-from .config import Config
+from .config import Config, save_config_value
 from .distill import DistillationEngine
-from .host import get_host_context
+from .host import get_host_context, redact_host_context
 from .logging import get_logger
 from .onboarding import (
     ONBOARD_TRIGGER,
@@ -27,6 +27,7 @@ from .onboarding import (
     count_operators,
     onboarding_directive,
     reanchor_generic_user,
+    telemetry_preference,
 )
 from .resolver import ContextResolver
 from .sanitize import sanitize_text
@@ -160,6 +161,9 @@ def _stream_outcome(raw: bytes) -> tuple[bool, bool]:
                 finished = True
     return finished, errored
 
+
+# Response header telling the UI what the resolved context delta held (drives the grounding pulse).
+GROUNDING_HEADER = "X-Strand-Grounding"
 
 _DELTA_SECTIONS = {
     "Entities:": "entities",
@@ -358,6 +362,7 @@ def create_app(
     )
     background_tasks: set[asyncio.Task[Any]] = set()
     onboarding_sessions: dict[str, str] = {}  # session -> onboarding mode; insertion-ordered, bounded
+    telemetry_choices: dict[str, bool] = {}  # session -> applied onboarding hardware choice; bounded
     distill_slots = asyncio.Semaphore(MAX_CONCURRENT_DISTILLATIONS)
 
     async def _distill(session_id: str, query: str, response: str) -> None:
@@ -367,6 +372,28 @@ def create_app(
                 await reanchor_generic_user(resolver.db)
             except Exception:
                 logger.warning("Operator re-anchor failed session=%r", session_id, exc_info=True)
+            if session_id in onboarding_sessions:
+                await _apply_telemetry_choice(session_id)
+
+    async def _apply_telemetry_choice(session_id: str) -> None:
+        """SEC-PRIV-002: honour the operator's conversational hardware opt-in / opt-out.
+
+        Model B distills `(<Operator>) --[prefers]--> (Host Telemetry Enabled | On-Demand)`. The
+        choice is applied to the live session (so the very next turn carries, or withholds, the
+        specs) and persisted as `enable_host_telemetry` in config.json (atomic, 0600).
+        """
+        try:
+            choice = await telemetry_preference(resolver.db)
+            if choice is None or telemetry_choices.get(session_id) is choice:
+                return
+            telemetry_choices[session_id] = choice
+            while len(telemetry_choices) > MAX_ONBOARDING_SESSIONS:
+                del telemetry_choices[next(iter(telemetry_choices))]
+            resolver.ledger.set_allow_host_telemetry(session_id, choice)
+            await asyncio.to_thread(save_config_value, "enable_host_telemetry", choice)
+            logger.info("Host telemetry choice session=%r enabled=%s", session_id, choice)
+        except Exception:
+            logger.warning("Host telemetry choice failed session=%r", session_id, exc_info=True)
 
     def schedule_distillation(session_id: str, query: str, response: str, allow_private: bool = False) -> None:
         """Fire-and-forget; process_exchange swallows its own errors.
@@ -503,13 +530,14 @@ def create_app(
             logger.error("Context resolution failed session=%r; forwarding without context", session_id, exc_info=True)
             resolver.ledger.reset(session_id)
             delta = ""
-        if delta:
-            logger.info("Resolved delta session=%r %s", session_id, _delta_log_fields(delta))
-        else:
-            logger.info("Resolved delta session=%r entities=0 edges=0", session_id)
+        grounding = _delta_log_fields(delta) if delta else "entities=0 edges=0"
+        logger.info("Resolved delta session=%r %s", session_id, grounding)
         mode = request.headers.get("x-strand-mode", "").strip().lower()
         try:
             explicit = mode == ONBOARDING_MODE
+            telemetry = request.headers.get("x-strand-host-telemetry", "").strip().lower()
+            if telemetry in ("1", "true", "yes", "on", "0", "false", "no", "off"):
+                resolver.ledger.set_allow_host_telemetry(session_id, telemetry in ("1", "true", "yes", "on"))
             if resolution_failed:
                 pass  # fail open: forward the request untouched
             elif session_id not in onboarding_sessions and (explicit or await count_operators(resolver.db) == 0):
@@ -521,8 +549,18 @@ def create_app(
                 del onboarding_sessions[next(iter(onboarding_sessions))]
             if session_id in onboarding_sessions and not resolution_failed:
                 host_info = get_host_context()
+                if not (config.enable_host_telemetry is True or resolver.ledger.allow_host_telemetry(session_id)):
+                    host_info = redact_host_context(host_info)  # SEC-PRIV-002: fail closed
                 user_turns = sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "user")
-                directive = onboarding_directive(host_info, onboarding_sessions[session_id], user_turns <= 1)
+                decision: bool | None = None
+                if user_turns >= 4 and onboarding_sessions[session_id] == MODE_DAY_ZERO:
+                    if config.enable_host_telemetry is True or resolver.ledger.allow_host_telemetry(session_id):
+                        decision = True
+                    else:
+                        decision = await telemetry_preference(resolver.db)
+                directive = onboarding_directive(
+                    host_info, onboarding_sessions[session_id], user_turns <= 1, user_turns, decision
+                )
                 delta = f"{directive}\n\n{delta}" if delta else directive
         except Exception:
             logger.error("Onboarding setup failed session=%r; continuing without it", session_id, exc_info=True)
@@ -571,7 +609,12 @@ def create_app(
                 resolver.ledger.reset(session_id)
             else:
                 schedule_distillation(session_id, query, _completion_text(body), allow_private)
-            return Response(body, status_code=upstream.status_code, media_type=content_type)
+            return Response(
+                body,
+                status_code=upstream.status_code,
+                media_type=content_type,
+                headers={GROUNDING_HEADER: grounding},
+            )
 
         async def relay() -> AsyncIterator[bytes]:
             collected: list[bytes] = []
@@ -611,7 +654,7 @@ def create_app(
             relay(),
             status_code=upstream.status_code,
             media_type=content_type or "text/event-stream",
-            headers={"Cache-Control": "no-cache"},
+            headers={"Cache-Control": "no-cache", GROUNDING_HEADER: grounding},
             background=BackgroundTask(upstream.aclose),
         )
 

@@ -90,3 +90,61 @@ def test_ledger_marks_stance_seen_and_drops_everything_on_turn_two(tmp_path):
     assert BEDROCK_INVARIANT in t1
     assert t2 == ""  # zero token tax on Turn 2+
     assert BEDROCK_INVARIANT in other  # a new session is a new Turn 1
+
+
+# --- Collection / archetype traversal -----------------------------------------------------------
+
+
+async def _seed_garage(db):
+    nic = await db.upsert_entity("Nic", "person", "Operator", origin="user_explicit")
+    e34 = await db.upsert_entity("E34", "vehicle", "BMW 5 Series")
+    forester = await db.upsert_entity("Forester", "vehicle", "Subaru")
+    sold = await db.upsert_entity("Miata", "vehicle", "Mazda")
+    other = await db.upsert_entity("Alice", "person", "Colleague")
+    stranger = await db.upsert_entity("Corvette", "vehicle", "Alice's car")
+    host = await db.upsert_entity("onyx", "system", "Workstation")
+    await db.upsert_edge(nic, host, "operates_host")
+    await db.upsert_edge(nic, e34, "previously_owned")
+    await db.upsert_edge(nic, forester, "owns")
+    await db.upsert_edge(nic, sold, "owns")
+    await db.upsert_edge(other, stranger, "owns")
+    await db.deprecate_edge("Nic", "Miata", "owns", reason="wrong")
+
+
+def test_car_history_query_matches_operator_vehicles(tmp_path):
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            await _seed_garage(db)
+            resolver = ContextResolver(db)
+            return [e.name for e in await resolver.match_entities("Do you recall my car history?")]
+
+    names = run(scenario())
+    assert set(names) == {"E34", "Forester"}
+
+
+def test_collection_query_requires_self_reference_and_archetype_word(tmp_path):
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            await _seed_garage(db)
+            resolver = ContextResolver(db)
+            return [
+                [e.name for e in await resolver.match_entities(q)]
+                for q in ("What is a car?", "Tell me about my past", "vehicles owned")
+            ]
+
+    plain, no_archetype, plural = run(scenario())
+    assert plain == [] and no_archetype == []
+    assert set(plural) == {"E34", "Forester"}
+
+
+def test_collection_traversal_reaches_vehicles_in_gather(tmp_path):
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            await _seed_garage(db)
+            entities, edges = await ContextResolver(db).gather("list my cars")
+            return {e.name for e in entities}, {e.relation for e in edges}
+
+    names, relations = run(scenario())
+    assert {"E34", "Forester", "Nic"} <= names
+    assert {"owns", "previously_owned"} <= relations
+

@@ -167,3 +167,28 @@ def test_uvicorn_records_use_server_component(tmp_path):
     assert "[ERROR] [server] boom" in text
     assert "[INFO] [proxy] hello" in text
     assert "[error]" not in text
+
+
+def test_enable_host_telemetry_default_env_and_file(home):
+    from strand.config import ENV_VARS
+
+    assert ENV_VARS["enable_host_telemetry"] == "STRAND_ENABLE_HOST_TELEMETRY"
+    assert Config().enable_host_telemetry is False
+    assert Config.from_env({}, {}).enable_host_telemetry is False
+    for raw in ("1", "true", "TRUE", "Yes"):
+        assert Config.from_env({"STRAND_ENABLE_HOST_TELEMETRY": raw}, {}).enable_host_telemetry is True
+    assert Config.from_env({"STRAND_ENABLE_HOST_TELEMETRY": "0"}, {"enable_host_telemetry": True}).enable_host_telemetry is False
+    assert Config.from_env({}, {"enable_host_telemetry": True}).enable_host_telemetry is True
+    assert Config.from_env({"STRAND_ENABLE_HOST_TELEMETRY": ""}, {"enable_host_telemetry": True}).enable_host_telemetry is True
+
+
+def test_cli_config_get_set_enable_host_telemetry(home, capsys):
+    assert main(["config", "get", "enable_host_telemetry"]) == 0
+    assert capsys.readouterr().out.strip() == "False"
+    assert main(["config", "set", "enable_host_telemetry", "yes"]) == 0
+    capsys.readouterr()
+    path = home / ".config" / "strand" / "config.json"
+    assert json.loads(path.read_text()) == {"enable_host_telemetry": True}
+    assert load_config().enable_host_telemetry is True
+    assert main(["config", "get", "enable_host_telemetry"]) == 0
+    assert capsys.readouterr().out.strip() == "True"

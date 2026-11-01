@@ -70,6 +70,15 @@ def get_host_context() -> dict[str, Any]:
     }
 
 
+def redact_host_context(info: dict[str, Any]) -> dict[str, Any]:
+    """Fail-closed view of `get_host_context()`: only `user` and `hostname` survive.
+
+    OS release, desktop/session, CPU model and RAM are hardware fingerprints and are dropped
+    (SEC-PRIV-002); the hostname stays so `(Operator) --[operates_host]--> (Host)` still works.
+    """
+    return {"user": info.get("user", ""), "hostname": info.get("hostname", "")}
+
+
 def format_host_context(info: dict[str, Any]) -> str:
     """One-line, human-readable rendering of `get_host_context()` output (empty fields skipped)."""
     desktop = " / ".join(p for p in (info.get("desktop"), info.get("session")) if p)

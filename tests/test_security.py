@@ -41,7 +41,7 @@ def test_db_creates_private_directory_and_files(tmp_path):
 
 
 def test_db_tightens_existing_directory_and_file(tmp_path):
-    parent = tmp_path / "loose"
+    parent = tmp_path / "strand"
     parent.mkdir()
     os.chmod(parent, 0o755)
     db_path = parent / "memory.db"

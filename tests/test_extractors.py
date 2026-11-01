@@ -333,3 +333,96 @@ def test_transient_phrase_does_not_deprecate_but_permanent_phrase_does():
     assert [(e["target"], e["relation"]) for e in permanent["deprecated_edges"]] == [("diff-summaries", "prefers")]
     assert permanent["entities"][0]["archetype"] == "directive"
     assert len(seen) == 2 and "TRANSIENT STEERING" in seen[0]
+
+
+# --- Historical statements are active biography, never deprecations -----------------------------
+
+
+def test_prompt_separates_biography_from_deprecation():
+    from strand.extractors import SYSTEM_PROMPT
+
+    for token in ("WRONG, cancelled or should be forgotten", "I used to own an E34", "previously_owned", "NEVER placed in deprecated_edges"):
+        assert token in SYSTEM_PROMPT, token
+
+
+def test_used_to_own_emits_active_user_explicit_edge_not_deprecation():
+    payload = {
+        "entities": [
+            {"name": "Nic", "archetype": "person", "origin": "user_explicit", "summary": "Operator"},
+            {"name": "E34", "archetype": "vehicle", "summary": "BMW 5 Series"},
+        ],
+        "edges": [{"source": "Nic", "target": "E34", "relation": "previously_owned"}],
+        "deprecated_edges": [],
+    }
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.content)["messages"][1]["content"])
+        return reply(json.dumps(payload))
+
+    result = run(extractor_for(handler)("I used to own an E34.", "Nice, a classic BMW 5 Series."))
+    assert result["deprecated_edges"] == []
+    edge = result["edges"][0]
+    assert (edge["relation"], edge["origin"], edge["confidence"]) == ("previously_owned", "user_explicit", 1.0)
+    assert result["entities"][1]["origin"] == "user_explicit"
+
+
+def test_historical_edge_persists_active_through_engine(tmp_path):
+    content = json.dumps(
+        {
+            "entities": [{"name": "Forester", "archetype": "vehicle", "summary": "Subaru"}],
+            "edges": [{"source": "User", "target": "Forester", "relation": "previously_owned"}],
+        }
+    )
+
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            await db.upsert_entity("User", "person", "The operator")
+            engine = DistillationEngine(db, extractor=lambda q, r: parse_extraction(content))
+            await engine.process_exchange("s", "My previous car was a Forester, sold years ago.", "Noted, a Subaru Forester.")
+            return [dict(r) for r in await db.get_entity_subgraph(1, active_only=True)]
+
+    rows = run(scenario())
+    assert [(r["relation"], r["weight"], r["origin"], r["confidence"]) for r in rows] == [
+        ("previously_owned", 1.0, "user_explicit", 1.0)
+    ]
+
+
+def test_assistant_only_assertion_stays_untagged_for_model_clamp():
+    content = json.dumps({"edges": [{"source": "Alice", "target": "Atlas", "relation": "works_on"}]})
+    edge = parse_extraction(content)["edges"][0]
+    assert "origin" not in edge and "confidence" not in edge
+
+
+def test_system_prompt_documents_host_telemetry_preference_without_collision():
+    from strand.extractors import SYSTEM_PROMPT
+
+    assert "(<Operator>) --[prefers]--> (Host Telemetry Enabled)" in SYSTEM_PROMPT
+    assert "(<Operator>) --[prefers]--> (Host Telemetry On-Demand)" in SYSTEM_PROMPT
+    assert "never deprecates or replaces unrelated directives" in SYSTEM_PROMPT
+    assert "Biographical history is never a deprecation" in SYSTEM_PROMPT  # existing rules intact
+
+
+def test_model_b_telemetry_preference_distills_beside_other_preferences(tmp_path):
+    payload = {
+        "entities": [
+            {"name": "Nic", "archetype": "person", "summary": "Operator", "origin": "user_explicit"},
+            {"name": "Host Telemetry Enabled", "archetype": "preference", "summary": "Specs allowed"},
+        ],
+        "edges": [{"source": "Nic", "target": "Host Telemetry Enabled", "relation": "prefers"}],
+    }
+
+    async def go():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            nic = await db.upsert_entity("Nic", "person", "Operator", origin="user_explicit")
+            terse = await db.upsert_entity("Terse diffs", "preference", "unified diffs")
+            await db.upsert_edge(nic, terse, "prefers")
+            extractor = extractor_for(lambda r: reply(json.dumps(payload)))
+            await DistillationEngine(db, extractor=extractor).process_exchange("s", "Yeah, check it out", RESPONSE)
+            async with db.conn.execute(
+                "SELECT t.name, e.weight FROM edges e JOIN entities t ON t.id = e.target_id "
+                "WHERE e.relation = 'prefers' ORDER BY t.name"
+            ) as cur:
+                return [tuple(r) for r in await cur.fetchall()]
+
+    assert run(go()) == [("Host Telemetry Enabled", 1.0), ("Terse diffs", 1.0)]

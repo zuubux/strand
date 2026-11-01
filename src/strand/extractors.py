@@ -33,6 +33,12 @@ SYSTEM_PROMPT = (
     "discontinuation (sold, switched from A to B, got rid of, quit, no longer using) must emit a "
     "deprecated_edges entry for the superseded relationship, plus the new fact as a normal edge. "
     "Name the same source, target and relation the relationship had. "
+    "Strict boundary for deprecated_edges: emit an edge there only when the user explicitly states that "
+    "a fact or preference was WRONG, cancelled or should be forgotten, or that a current relationship "
+    "has ended. Biographical history is never a deprecation: past possessions, previous employment and "
+    "earlier life facts (e.g. 'I used to own an E34', 'My previous car was a Forester') must be emitted "
+    "as an ACTIVE edge (previously_owned or owned) at normal weight, e.g. (User) --[previously_owned]--> "
+    "(E34), and NEVER placed in deprecated_edges. "
     "Optionally add forgotten_entities: [entity_name, ...]. Use it only when the user explicitly "
     "commands the system to forget, delete, scrub or erase an entity, concept or record "
     "(e.g. 'Forget my old address', 'Delete the entity for Project Titan', 'Forget X'); list the "
@@ -72,6 +78,15 @@ SYSTEM_PROMPT = (
     '(<Declared Name>) --[operates_host]--> (<Hostname>) using the hostname given in the Host line. '
     "Use the declared name instead of User as the source of the operator's other edges. "
     "Questions, refusals and non-names (e.g. 'why?', 'nothing', 'stop') declare no name. "
+    "Host telemetry preference: when the operator answers a question about whether the assistant may "
+    "inspect their hardware specs (CPU/RAM/OS), in onboarding or later chat, emit one edge from the "
+    "operator (the declared name, else User) with relation prefers: agreement (e.g. 'yeah, check it "
+    "out', 'tune into the iron') is (<Operator>) --[prefers]--> (Host Telemetry Enabled); a decline "
+    "or on-demand answer (e.g. 'keep it on-demand', 'leave it local') is (<Operator>) --[prefers]--> "
+    "(Host Telemetry On-Demand). Use archetype \"preference\" for that entity. Only deprecate the "
+    "opposite Host Telemetry edge when the operator reverses this choice; this preference never "
+    "deprecates or replaces unrelated directives, traits, preferences or person attributes, and a "
+    "turn without a clear hardware answer emits no Host Telemetry edge. "
     'If nothing is worth keeping return {"entities": [], "edges": [], "deprecated_edges": [], '
     '"forgotten_entities": []}.'
 )
@@ -153,12 +168,27 @@ def collapse_containers(
     return kept, rewrite(edges), rewrite(deprecated)
 
 
+USER_ANCHORED_RELATIONS = frozenset({"owns", "owned", "previously_owned", "prefers", "demands"})
+_OPERATOR_ALIASES = frozenset({"user", "operator", "me", "i"})
+
+
+def _is_user_anchored(edge: dict[str, str], operators: set[str]) -> bool:
+    """True for a first-person declaration: (Operator) -[owns|previously_owned|prefers|demands]-> (...)."""
+    source = edge["source"]
+    return edge["relation"].casefold().replace(" ", "_") in USER_ANCHORED_RELATIONS and (
+        source in operators or source.casefold() in _OPERATOR_ALIASES
+    )
+
+
 def parse_extraction(content: str) -> Extraction:
     """Parse model output into an extraction dict; malformed input yields empty lists.
 
     Only whitelisted fields are copied. Model-emitted `origin`/`confidence` are dropped (the engine
     applies model_inferred at MODEL_CONFIDENCE) except for the declared operator: a `person` with
-    `origin: user_explicit` keeps user_explicit at 1.0, as does its `operates_host` edge.
+    `origin: user_explicit` keeps user_explicit at 1.0, as does its `operates_host` edge. Direct
+    first-person declarations anchored to the operator (`owns`, `owned`, `previously_owned`,
+    `prefers`, `demands`) are tagged user_explicit at 1.0 along with their target entity; every
+    other item stays untagged and is clamped to model_inferred by the engine.
     """
     empty: Extraction = {
         "entities": [], "edges": [], "deprecated_edges": [], "forgotten_entities": [], "summary": ""
@@ -185,7 +215,13 @@ def parse_extraction(content: str) -> Extraction:
             edge = {k: _text(item[k]) for k in ("source", "target", "relation")}
             if edge["relation"] == OPERATES_HOST and edge["source"] in operators:
                 edge.update(origin=USER_ORIGIN, confidence=USER_CONFIDENCE)
+            elif _is_user_anchored(edge, operators):
+                edge.update(origin=USER_ORIGIN, confidence=USER_CONFIDENCE)  # direct user declaration
             edges.append(edge)
+    declared = {e["target"] for e in edges if e.get("origin") == USER_ORIGIN and e["relation"] != OPERATES_HOST}
+    for entity in entities:
+        if entity["name"] in declared and "origin" not in entity:
+            entity.update(origin=USER_ORIGIN, confidence=USER_CONFIDENCE)
     deprecated = []
     for item in data.get("deprecated_edges") or []:
         if isinstance(item, dict) and all(_text(item.get(k)) for k in ("source", "target", "relation")):

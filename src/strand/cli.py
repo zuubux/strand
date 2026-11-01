@@ -28,6 +28,7 @@ from .embed import (
     EmbeddingManager,
     EmbeddingUnavailable,
     fastembed_available,
+    fastembed_cache_dir,
     model_cache_dir,
 )
 from .extractors import DEFAULT_EXTRACTOR_URL
@@ -262,7 +263,7 @@ async def cmd_doctor(db: DatabaseManager, args: argparse.Namespace) -> int:
         if cached:
             print(f"{_check(True)} model cache: {DEFAULT_MODEL} cached at {cached}")
         else:
-            print(f"{_check(None)} model cache: {DEFAULT_MODEL} not cached (downloads on first use)")
+            print(f"{_check(None)} model cache: {DEFAULT_MODEL} not cached in {fastembed_cache_dir()} (downloads on first use)")
     else:
         print(f"{_check(None)} fastembed: not installed; {UNAVAILABLE_MESSAGE}")
         print(f"{_check(None)} model cache: n/a")

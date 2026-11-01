@@ -2,7 +2,6 @@
 
 import importlib.util
 import os
-import tempfile
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -10,6 +9,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from .common import EMBEDDING_DIM
 from .logging import get_logger
+from .perms import secure_parent_dir
 
 logger = get_logger("embed")
 
@@ -29,13 +29,36 @@ def fastembed_available() -> bool:
         return False
 
 
-def model_cache_dir(model_name: str = DEFAULT_MODEL) -> Path | None:
-    """Best-effort lookup of a cached copy of `model_name` in the fastembed cache.
+def fastembed_cache_dir() -> Path:
+    """Isolated model-weight cache (SEC-CACHE-003): never the shared `/tmp/fastembed_cache`.
 
-    The cache root is `$FASTEMBED_CACHE_PATH` or `<tmp>/fastembed_cache`; a model counts
-    as cached when a directory there contains the model's short name.
+    `$FASTEMBED_CACHE_PATH` is an explicit operator override; otherwise
+    `$XDG_CACHE_HOME/strand/fastembed`, falling back to `~/.cache/strand/fastembed`.
     """
-    root = Path(os.environ.get("FASTEMBED_CACHE_PATH") or Path(tempfile.gettempdir()) / "fastembed_cache")
+    override = os.environ.get("FASTEMBED_CACHE_PATH")
+    if override:
+        return Path(override).expanduser()
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg).expanduser() if xdg and os.path.isabs(os.path.expanduser(xdg)) else Path.home() / ".cache"
+    return base / "strand" / "fastembed"
+
+
+def ensure_cache_dir(path: Path) -> Path:
+    """Create the cache directory (and a managed `strand` parent) with mode 0700."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    secure_parent_dir(path.parent)  # 0700 only when the parent is a Strand-managed `strand` dir
+    path.mkdir(exist_ok=True, mode=0o700)
+    os.chmod(path, 0o700)
+    return path
+
+
+def model_cache_dir(model_name: str = DEFAULT_MODEL) -> Path | None:
+    """Best-effort lookup of a cached copy of `model_name` in the isolated fastembed cache.
+
+    The cache root is `fastembed_cache_dir()`; a model counts as cached when a directory
+    there contains the model's short name.
+    """
+    root = fastembed_cache_dir()
     needle = model_name.rsplit("/", 1)[-1].casefold()
     try:
         for entry in sorted(root.iterdir()):
@@ -90,7 +113,11 @@ class EmbeddingManager:
                     if factory is None:
                         from fastembed import TextEmbedding
 
-                        factory = TextEmbedding
+                        cache_dir = str(ensure_cache_dir(fastembed_cache_dir()))
+
+                        def factory(name: str) -> Any:
+                            return TextEmbedding(name, cache_dir=cache_dir)
+
                     logger.info("Loading embedding model %s", self.model_name)
                     self._model = factory(self.model_name)
                 except Exception as exc:

@@ -903,3 +903,173 @@ def test_save_config_decay_half_life_validation(qapp, home):
     for bad in (0, -1, "nan", "abc"):
         assert b.saveConfig({"decay_half_life_days": bad}) is False
     assert json.loads(path.read_text())["decay_half_life_days"] == 7.0
+
+
+# -- OBS-ERG-003 pacing / OBS-UI-002 hybrid blocks / grounding pulse ---------------------
+def test_pacing_buffer_accumulates_and_drains_on_timer(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("x")))
+    events = collect(b)
+    for word in ("alpha ", "beta ", "gamma ", "delta "):
+        b._relay(b._generation, True, word)
+    assert events == [("chunk", "alpha ")] and b.buffered == 3  # first token shows at once
+    b._tick()
+    b._tick()
+    drained = "".join(t for kind, t in events if kind == "chunk")
+    assert drained.startswith("alpha ") and b.buffered < 3
+    for _ in range(200):
+        b._tick()
+    assert b.buffered == 0
+    assert "".join(t for kind, t in events) == "alpha beta gamma delta "
+    b._deliver_end(b._generation, True, b.streamFinished)
+    assert events[-1] == ("done", None) and not b._timer.isActive()
+
+
+def test_flush_stream_dumps_full_buffer_immediately(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("x")))
+    events = collect(b)
+    for word in ("one ", "two ", "three "):
+        b._relay(b._generation, True, word)
+    assert events == [("chunk", "one ")] and b.buffered == 2
+    assert b.flush_stream() == len("two three ")
+    assert b.buffered == 0
+    assert "".join(t for _, t in events) == "one two three "
+    assert b.flush_stream() == 0  # idempotent on an empty buffer
+
+
+def test_default_pace_is_about_67_tps_with_small_per_tick_slices(qapp):
+    assert bridge_mod.PACE_TOKENS_PER_SEC == 67.0
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("x")))
+    assert b._pace_tps == 67.0
+    events = collect(b)
+    b._relay(b._generation, True, "t0 ")  # first token shows at once
+    for _ in range(200):
+        b._relay(b._generation, True, "tok ")  # one token per chunk
+    ticks = round(1000 / bridge_mod.PACE_INTERVAL_MS)  # ~1 second of ticks
+    for _ in range(ticks):
+        b._tick()
+    shown = 200 - b.buffered  # tokens drained in ~1 second
+    assert 62 <= shown <= 72  # ~65-70 tokens/s (energetic, ~270 chars/s)
+    drained_chars = sum(len(t) for k, t in events if k == "chunk") - len("t0 ")
+    assert 3.5 <= drained_chars / ticks <= 5.5  # ~4-5 characters per 16 ms tick
+    assert b.flush_stream() == 4 * (200 - shown)
+    assert b.buffered == 0
+
+
+def test_paced_turn_defers_finish_until_drained_and_flush_completes_it(qapp):
+    import time
+
+    b = make_bridge(lambda r: httpx.Response(200, content=sse(*[f"w{i} " for i in range(30)])))
+    events = collect(b)
+    threads = []
+    orig = b._run_async
+    b._run_async = lambda *a, **k: threads.append(orig(*a, **k)) or threads[-1]
+    b.sendMessage("go")
+    threads[0].join(5)
+    QCoreApplication.processEvents()
+    assert b.busy and ("done", None) not in events  # worker done, UI still draining
+    b.flush_stream()
+    QCoreApplication.processEvents()
+    assert events[-1] == ("done", None) and not b.busy
+    assert "".join(t for k, t in events if k == "chunk") == "".join(f"w{i} " for i in range(30))
+    assert b.history[-1]["content"] == "".join(f"w{i} " for i in range(30))
+
+
+def test_pacing_disabled_is_passthrough(qapp):
+    factory = lambda: httpx.AsyncClient(  # noqa: E731
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, content=sse("a", "b"))), base_url="http://strand"
+    )
+    b = Bridge(config=Config(), model="m", client_factory=factory, pace_tps=0)
+    events = collect(b)
+    asyncio.run(b._stream([{"role": "user", "content": "x"}], paced=True))
+    assert events == [("chunk", "a"), ("chunk", "b"), ("done", None)]
+
+
+def test_reset_discards_buffered_chunks(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("x")))
+    events = collect(b)
+    b._relay(b._generation, True, "shown ")
+    b._relay(b._generation, True, "stale ")
+    assert b.buffered == 1
+    b.newConversation()
+    assert b.buffered == 0 and b.flush_stream() == 0
+    assert [e for e in events if e[0] == "chunk"] == [("chunk", "shown ")]
+
+
+def test_grounding_pulse_from_proxy_header_settles_on_first_token(qapp):
+    from strand.proxy import GROUNDING_HEADER
+    from strand.ui.bridge import GROUNDING_HEADER_NAME, grounding_summary, parse_grounding
+
+    assert GROUNDING_HEADER == GROUNDING_HEADER_NAME
+    assert parse_grounding("entities=2 edges=1 directives=0") == {"entities": 2, "edges": 1, "directives": 0}
+    assert grounding_summary(parse_grounding("entities=2 edges=1 directives=0")) == "2 entities \u2022 1 edges"
+
+    pulses = []
+    headers = {"content-type": "text/event-stream", GROUNDING_HEADER: "entities=2 edges=1"}
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("hi"), headers=headers))
+    b.groundingChanged.connect(lambda: pulses.append(b.groundingPulse))
+    asyncio.run(b._stream([{"role": "user", "content": "x"}]))
+    assert pulses[0] is True and pulses[-1] is False and b.groundingSummary == "2 entities \u2022 1 edges"
+
+    ungrounded = make_bridge(lambda r: httpx.Response(200, content=sse("hi"), headers={GROUNDING_HEADER: "entities=0 edges=0"}))
+    seen = []
+    ungrounded.groundingChanged.connect(lambda: seen.append(ungrounded.groundingPulse))
+    asyncio.run(ungrounded._stream([{"role": "user", "content": "x"}]))
+    assert True not in seen
+
+
+def test_proxy_emits_grounding_header():
+    from strand import proxy
+
+    assert proxy._delta_log_fields("") == "entities=0 edges=0"
+    assert proxy.GROUNDING_HEADER == "X-Strand-Grounding"
+
+
+def test_split_blocks_hybrid_layout():
+    from strand.ui.bridge import split_blocks
+
+    text = (
+        "Here you go.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nMiddle.\n"
+        "```python\nprint(1)\n```\nname: x\nport: 8088\nmode: fast\nDone!"
+    )
+    kinds = [(b["kind"], b["code"]) for b in split_blocks(text)]
+    assert kinds == [
+        ("prose", False), ("table", False), ("prose", False),
+        ("code", True), ("data", True), ("prose", False),
+    ]
+    # Two key: value lines in prose stay conversational.
+    assert [b["kind"] for b in split_blocks("Note: this\nTip: that")] == ["prose"]
+    assert split_blocks("") == []
+
+
+def test_split_blocks_splits_paragraphs_into_bubbles():
+    from strand.ui.bridge import operator_name, split_blocks
+
+    text = (
+        "First thought.\nSame paragraph.\n\nSecond thought.\n\n\nThird thought.\n"
+        "```py\na = 1\n\nb = 2\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\nOutro."
+    )
+    blocks = split_blocks(text)
+    assert [(b["kind"], b["text"]) for b in blocks] == [
+        ("prose", "First thought.\nSame paragraph."),
+        ("prose", "Second thought."),
+        ("prose", "Third thought."),
+        ("code", "a = 1\n\nb = 2"),
+        ("table", "| a | b |\n|---|---|\n| 1 | 2 |"),
+        ("prose", "Outro."),
+    ]
+    assert operator_name({"STRAND_UI_OPERATOR": " Nic "}) == "Nic"
+    assert operator_name({"STRAND_UI_OPERATOR": ""})
+
+
+def test_qml_assistant_flow_bubble_hugs_and_tab_flushes(qapp):
+    from PySide6.QtCore import QMetaObject, Qt
+
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    win.setWidth(900)
+    win.setHeight(640)
+    win.show()
+    assert win.property("assistantFamily") and win.property("assistantFamily") != win.property("monoFamily")
+    QMetaObject.invokeMethod(win, "flushStream", Qt.ConnectionType.DirectConnection)  # idle: no-op
+    win.hide()
+    engine.deleteLater()

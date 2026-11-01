@@ -10,10 +10,18 @@ from typing import Any
 
 import httpx
 
-from .common import DEFAULT_COMPACTION_THRESHOLD_HOURS, MAX_SUMMARY_LEN, MODEL_CONFIDENCE, extract_json, is_private
+from .common import (
+    DEFAULT_COMPACTION_THRESHOLD_HOURS,
+    MAX_SUMMARY_LEN,
+    MODEL_CONFIDENCE,
+    PERSONALITY_ARCHETYPES,
+    extract_json,
+    is_private,
+)
 from .db import DatabaseManager
 from .extractors import DEFAULT_EXTRACTOR_URL
 from .logging import get_logger
+from .onboarding import OPERATES_HOST, OPERATOR_ALIAS, count_operators
 from .sanitize import sanitize_text
 
 logger = get_logger("compactor")
@@ -27,13 +35,26 @@ _MAX_INPUT_CHARS = 12000
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 
 SYSTEM_PROMPT = (
-    "You consolidate a finished conversation session into durable knowledge. Given the session's "
-    "episode narratives and the known entities, reply with strict JSON only, shaped as "
-    '{"entity_summaries": [{"name": str, "summary": str}], "session_summary": str}. '
-    "Each summary is one or two sentences combining the entity's existing summary with what the "
-    "session added. Only include entities from the provided list. "
-    'If nothing is worth keeping return {"entity_summaries": [], "session_summary": ""}.'
+    "You consolidate a finished conversation session into durable, multi-horizon knowledge. Given the "
+    "session's episode narratives and the known entities, reply with strict JSON only, shaped as "
+    '{"entity_summaries": [{"name": str, "summary": str}], "session_summary": str, '
+    '"discovered_aliases": [{"canonical_name": str, "alias": str}], '
+    '"operator_profile": {"focus_summary": str, "inferred_traits": [{"name": str, '
+    '"archetype": "preference"|"trait", "relation": "prefers"|"enforces", "summary": str}]}}. '
+    "entity_summaries: one or two sentences per touched entity, combining its existing summary with what "
+    "the session added; only include entities from the provided list. "
+    "discovered_aliases: recurring nicknames or conversational shorthand that refer to a known entity "
+    '(e.g. "KK" for "Karen", "the box" for a host or server); canonical_name must be a provided entity. '
+    "operator_profile.focus_summary: a concise one or two sentence rolling summary of the operator's "
+    "recent work and topics. operator_profile.inferred_traits: sustained interaction preferences "
+    "(e.g. terse diffs, specific test flags, a technical tone). Ignore one-off conversational steering "
+    "and transient requests; only emit a trait or preference that reflects a sustained pattern across "
+    "the provided episodes. "
+    'If nothing is worth keeping return {"entity_summaries": [], "session_summary": "", '
+    '"discovered_aliases": [], "operator_profile": {"focus_summary": "", "inferred_traits": []}}.'
 )
+
+TRAIT_RELATIONS = frozenset({"prefers", "enforces"})
 
 
 def _text(value: Any) -> str:
@@ -50,6 +71,59 @@ def parse_compaction(content: str) -> dict[str, Any] | None:
         if isinstance(item, dict) and _text(item.get("name")) and _text(item.get("summary")):
             summaries.append({"name": _text(item["name"]), "summary": _text(item["summary"])})
     return {"entity_summaries": summaries, "session_summary": _text(data.get("session_summary"))}
+
+
+def _dicts(value: Any) -> list[dict[str, Any]]:
+    return [i for i in value if isinstance(i, dict)] if isinstance(value, list) else []
+
+
+def parse_compaction_output(raw_text: str) -> dict[str, Any]:
+    """Defensively parse multi-horizon compaction output; never raises, never returns None.
+
+    Missing or malformed keys fall back to empty lists/strings. Traits with an archetype outside
+    `PERSONALITY_ARCHETYPES` or a relation outside `TRAIT_RELATIONS` are dropped. Inferred traits and
+    the operator focus summary (`operator_profile["origin"]`/`["confidence"]`) are always tagged
+    `model_inferred` at 0.60, regardless of anything the model claimed.
+    """
+    empty_profile = {"focus_summary": "", "inferred_traits": [], "origin": COMPACTION_ORIGIN, "confidence": SLM_CONFIDENCE}
+    result: dict[str, Any] = {
+        "entity_summaries": [],
+        "session_summary": "",
+        "discovered_aliases": [],
+        "operator_profile": empty_profile,
+    }
+    try:
+        data = extract_json(raw_text if isinstance(raw_text, str) else "")
+    except Exception:
+        data = None
+    if data is None:
+        return result
+    for item in _dicts(data.get("entity_summaries")):
+        if _text(item.get("name")) and _text(item.get("summary")):
+            result["entity_summaries"].append({"name": _text(item["name"]), "summary": _text(item["summary"])})
+    result["session_summary"] = _text(data.get("session_summary"))
+    for item in _dicts(data.get("discovered_aliases")):
+        canonical, alias = _text(item.get("canonical_name")), _text(item.get("alias"))
+        if canonical and alias and canonical.lower() != alias.lower():
+            result["discovered_aliases"].append({"canonical_name": canonical, "alias": alias})
+    profile = data.get("operator_profile")
+    if isinstance(profile, dict):
+        empty_profile["focus_summary"] = _text(profile.get("focus_summary"))[:MAX_SUMMARY_LEN]
+        for item in _dicts(profile.get("inferred_traits")):
+            name, summary = _text(item.get("name")), _text(item.get("summary"))
+            archetype, relation = _text(item.get("archetype")).lower(), _text(item.get("relation")).lower()
+            if name and summary and archetype in PERSONALITY_ARCHETYPES and relation in TRAIT_RELATIONS:
+                empty_profile["inferred_traits"].append(
+                    {
+                        "name": name,
+                        "archetype": archetype,
+                        "relation": relation,
+                        "summary": summary[:MAX_SUMMARY_LEN],
+                        "origin": COMPACTION_ORIGIN,
+                        "confidence": SLM_CONFIDENCE,
+                    }
+                )
+    return result
 
 
 class SessionCompactor:
@@ -114,10 +188,11 @@ class SessionCompactor:
         except Exception as exc:
             logger.warning("compaction SLM unavailable: %s", exc)
             return None
-        parsed = parse_compaction(content if isinstance(content, str) else "")
-        if parsed is None:
+        text = content if isinstance(content, str) else ""
+        if extract_json(text) is None:
             logger.warning("compaction SLM returned unparseable output")
-        return parsed
+            return None
+        return parse_compaction_output(text)
 
     @staticmethod
     def _heuristic(narratives: list[str], entities: list[dict[str, Any]]) -> dict[str, Any]:
@@ -134,6 +209,77 @@ class SessionCompactor:
             if sentences:
                 summaries.append({"name": entity["name"], "summary": " ".join(sentences)[:MAX_SUMMARY_LEN]})
         return {"entity_summaries": summaries, "session_summary": ""}
+
+    async def _operator(self) -> tuple[int, str] | None:
+        """(id, name) of the primary operator: declared person with `operates_host`, else `User`."""
+        if await count_operators(self.db):
+            async with self.db.conn.execute(
+                "SELECT e.id, e.name FROM entities e JOIN edges d ON d.source_id = e.id "
+                "WHERE e.archetype = 'person' AND e.origin = 'user_explicit' AND d.relation = ? "
+                "ORDER BY e.updated_at DESC, e.id DESC LIMIT 1",
+                (OPERATES_HOST,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is not None:
+                return int(row[0]), row[1]
+        return await self.db.find_entity(OPERATOR_ALIAS)
+
+    async def _apply_aliases(self, aliases: list[dict[str, str]]) -> None:
+        for item in aliases:
+            found = await self.db.find_entity(item["canonical_name"])
+            if found is None:
+                continue
+            async with self.db.conn.execute(
+                "SELECT archetype, metadata FROM entities WHERE id = ?", (found[0],)
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None or is_private(row[0], row[1]):
+                continue
+            alias = sanitize_text(item["alias"])
+            if alias:
+                await self.db.merge_entity_alias(
+                    found[0], alias, summary="", origin=COMPACTION_ORIGIN, confidence=SLM_CONFIDENCE
+                )
+
+    async def _apply_operator_profile(self, profile: dict[str, Any]) -> None:
+        traits, focus = profile.get("inferred_traits") or [], profile.get("focus_summary") or ""
+        if not traits and not focus:
+            return
+        operator = await self._operator()
+        if operator is None:
+            return
+        operator_id, operator_name = operator
+        for trait in traits:
+            existing = await self.db.find_entity(trait["name"])
+            name = existing[1] if existing else sanitize_text(trait["name"])
+            trait_id = await self.db.upsert_entity(
+                name,
+                trait["archetype"],
+                sanitize_text(trait["summary"])[:MAX_SUMMARY_LEN],
+                origin=COMPACTION_ORIGIN,
+                confidence=SLM_CONFIDENCE,
+            )
+            async with self.db.conn.execute(
+                "SELECT json_extract(metadata, '$.deprecated') FROM edges "
+                "WHERE source_id = ? AND target_id = ? AND relation = ?",
+                (operator_id, trait_id, trait["relation"]),
+            ) as cur:
+                edge = await cur.fetchone()
+            if edge is not None and edge[0]:
+                continue  # a deprecated stance is never revived by inference
+            await self.db.upsert_edge(
+                operator_id,
+                trait_id,
+                trait["relation"],
+                weight=1.0,
+                origin=COMPACTION_ORIGIN,
+                confidence=SLM_CONFIDENCE,
+            )
+        if focus:
+            # Provenance precedence in the DB keeps user_explicit summaries intact.
+            await self.db.update_entity_summary(
+                operator_name, sanitize_text(focus)[:MAX_SUMMARY_LEN], COMPACTION_ORIGIN, SLM_CONFIDENCE
+            )
 
     async def compact_session(self, session_id: str) -> dict[str, Any]:
         """Compact one session. Never raises; `skipped` is True when nothing was marked."""
@@ -165,6 +311,8 @@ class SessionCompactor:
                 summary = sanitize_text(item["summary"])[:MAX_SUMMARY_LEN]
                 if await self.db.update_entity_summary(item["name"], summary, COMPACTION_ORIGIN, confidence):
                     updated += 1
+            await self._apply_aliases(parsed.get("discovered_aliases") or [])
+            await self._apply_operator_profile(parsed.get("operator_profile") or {})
             await self.db.mark_episodes_compacted([e["id"] for e in episodes])
             result.update(
                 episodes=len(episodes),

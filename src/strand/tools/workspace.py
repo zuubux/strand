@@ -43,13 +43,24 @@ def is_safe_path(target: str | Path, roots: list[Path]) -> tuple[bool, Path | st
             if resolved.is_relative_to(canonical):
                 return True, resolved
         return False, "path is outside the approved workspace roots"
-    # Relative: never resolve against the process cwd (systemd => $HOME); try each root.
-    first_valid: Path | None = None
+    # Relative: try each root first (cwd is $HOME under systemd), then the process cwd, which
+    # is accepted only if the result still resolves inside an approved root.
+    candidates: list[tuple[Path, Path]] = []  # (candidate, bounding root)
     for canonical in canonical_roots:
         try:
-            candidate = (canonical / target_str).resolve()
+            candidates.append(((canonical / target_str).resolve(), canonical))
         except (OSError, RuntimeError, ValueError):
             continue
+    try:
+        cwd_candidate = (Path(os.getcwd()) / target_str).resolve()
+        for canonical in canonical_roots:
+            if cwd_candidate.is_relative_to(canonical):
+                candidates.append((cwd_candidate, canonical))
+                break
+    except (OSError, RuntimeError, ValueError):
+        pass
+    first_valid: Path | None = None
+    for candidate, canonical in candidates:
         if not candidate.is_relative_to(canonical):
             continue
         if candidate.exists():

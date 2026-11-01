@@ -17,6 +17,8 @@ class SessionState:
     seen_edge_ids: set[int] = field(default_factory=set)
     seen_episode_ids: set[int] = field(default_factory=set)
     last_active: float = 0.0
+    # SEC-PRIV-002: in-memory opt-in to ambient hardware telemetry; dies with the session.
+    allow_host_telemetry: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +110,15 @@ class SessionLedger:
         self._sessions[session_id] = state
         state.last_active = now
         return state
+
+    def allow_host_telemetry(self, session_id: str) -> bool:
+        """True when `session_id` opted in to host hardware telemetry (False if unknown)."""
+        state = self._sessions.get(session_id)
+        return state is not None and state.allow_host_telemetry
+
+    def set_allow_host_telemetry(self, session_id: str, allowed: bool) -> None:
+        """Toggle the session-level host telemetry override without restarting the daemon."""
+        self._touch(session_id).allow_host_telemetry = bool(allowed)
 
     def seen_episode_ids(self, session_id: str) -> frozenset[int]:
         """Episode ids already injected into `session_id` (empty for an unknown session)."""

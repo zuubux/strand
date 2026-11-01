@@ -15,6 +15,7 @@ from .common import (
     DEFAULT_CONTINUITY_MAX_EPISODES,
     DEFAULT_DEDUP_DISTANCE_THRESHOLD,
 )
+from .perms import secure_parent_dir
 
 DEFAULT_UPSTREAM_URL = "https://api.openai.com/v1"
 DEFAULT_HOST = "127.0.0.1"
@@ -50,6 +51,7 @@ ENV_VARS = {
     "persona_prompt": "STRAND_PERSONA_PROMPT",
     "workspace_roots": "STRAND_WORKSPACE_ROOTS",
     "tools_enabled": "STRAND_TOOLS_ENABLED",
+    "enable_host_telemetry": "STRAND_ENABLE_HOST_TELEMETRY",
 }
 
 
@@ -133,6 +135,8 @@ class Config:
     # Ring-0 ambient read: approved workspace roots and the tool-runner master switch.
     workspace_roots: list[str] = field(default_factory=lambda: list(DEFAULT_WORKSPACE_ROOTS))
     tools_enabled: bool = True
+    # SEC-PRIV-002: ambient hardware specs (OS, CPU, RAM) may leave the machine only when True.
+    enable_host_telemetry: bool = False
     # True when host or port came from the environment or config.json (forces TCP).
     tcp_explicit: bool = field(default=False, compare=False)
 
@@ -218,6 +222,7 @@ class Config:
             persona_prompt=str(pick("persona_prompt", "")).strip(),
             workspace_roots=_as_roots(pick("workspace_roots", list(DEFAULT_WORKSPACE_ROOTS))),
             tools_enabled=_as_bool(pick("tools_enabled", True)),
+            enable_host_telemetry=_as_bool(pick("enable_host_telemetry", False)),
             tcp_explicit=bool(pick("host", "") or pick("port", "")),
         )
 
@@ -273,7 +278,7 @@ def save_config_value(key: str, value: Any, config_path: Path | None = None) -> 
         "continuity_horizon_days",
     ):
         value = float(value)
-    elif key in ("decay_enabled", "tools_enabled"):
+    elif key in ("decay_enabled", "tools_enabled", "enable_host_telemetry"):
         value = _as_bool(value)
     elif key == "workspace_roots":
         value = _as_roots(value)
@@ -285,10 +290,7 @@ def save_config_value(key: str, value: Any, config_path: Path | None = None) -> 
     data = _read_file(path, strict=True)
     data[key] = value
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        os.chmod(path.parent, 0o700)
-    except PermissionError:
-        pass
+    secure_parent_dir(path.parent)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

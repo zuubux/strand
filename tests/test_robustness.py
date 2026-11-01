@@ -82,7 +82,7 @@ def test_prepare_socket_tolerates_chmod_permission_error(tmp_path, monkeypatch):
 
 
 def test_save_config_value_creates_0700_parent(tmp_path):
-    path = tmp_path / "cfg" / "config.json"
+    path = tmp_path / ".config" / "strand" / "config.json"
     save_config_value("log_level", "debug", path)
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     path.parent.chmod(0o755)

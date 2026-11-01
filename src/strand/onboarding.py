@@ -116,7 +116,47 @@ _GUIDELINES = (
 )
 
 
-def onboarding_directive(host_info: dict[str, Any], mode: str = MODE_DAY_ZERO, first_turn: bool = True) -> str:
+TELEMETRY_ENABLED = "Host Telemetry Enabled"
+TELEMETRY_ON_DEMAND = "Host Telemetry On-Demand"
+TELEMETRY_RELATION = "prefers"
+TELEMETRY_GATE_QUESTION = (
+    "I keep things pretty locked down by default—I don't inspect your core hardware or pass CPU/RAM "
+    "specs upstream unless you want me tuned into the iron. Should I check out the hardware specs of "
+    "the rig, or keep that strictly on-demand?"
+)
+TELEMETRY_DECLINED_ACK = "Understood, keeping machine specs strictly local and on-demand"
+TELEMETRY_GATE_TURN = 4  # first operator turn on which the telemetry check-in may be raised
+
+
+async def telemetry_preference(db: DatabaseManager) -> bool | None:
+    """Operator's latest active hardware-telemetry stance recorded by Model B (SEC-PRIV-002).
+
+    Reads `(<Operator>) --[prefers]--> (Host Telemetry Enabled | Host Telemetry On-Demand)`:
+    True for Enabled, False for On-Demand, None when neither edge is active. No schema change.
+    """
+    async with db.conn.execute(
+        "SELECT t.name FROM edges e JOIN entities t ON t.id = e.target_id "
+        "JOIN entities s ON s.id = e.source_id "
+        "WHERE e.relation = ? AND e.weight > 0 AND s.archetype = 'person' "
+        "AND lower(t.name) IN (?, ?) ORDER BY e.updated_at DESC, e.id DESC LIMIT 1",
+        (TELEMETRY_RELATION, TELEMETRY_ENABLED.lower(), TELEMETRY_ON_DEMAND.lower()),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return str(row[0]).lower() == TELEMETRY_ENABLED.lower()
+
+
+def onboarding_directive(
+    host_info: dict[str, Any],
+    mode: str = MODE_DAY_ZERO,
+    first_turn: bool = True,
+    turn: int | None = None,
+    telemetry_decision: bool | None = None,
+) -> str:
+    """Build the directive. `turn` (1-based operator turn count) overrides `first_turn` when given."""
+    if turn is not None:
+        first_turn = turn <= 1
     hostname = str(host_info.get("hostname") or "").strip() or "localhost"
     head = (
         "[Onboarding Directive: Grounding & Resonance]\n"
@@ -151,13 +191,38 @@ def onboarding_directive(host_info: dict[str, Any], mode: str = MODE_DAY_ZERO, f
             "yet, and do not use the Linux account name as a fallback.\n"
         )
     else:
+        step = turn if turn is not None else 2
         body = (
-            "- Subsequent Turns Directive: once the operator gives their name, greet them by it, "
-            f"acknowledge that you are running locally on {hostname}, state your mission in two sentences "
-            "(sovereign working memory and privacy on this local machine), then gently ask what they "
-            "typically build, fix, or troubleshoot at this desk.\n"
-            "  * Over the next 2-3 turns, let the conversation naturally explore their primary projects/stack "
-            "and preferred communication rules (e.g. terse diffs, direct answers, zero corporate apologies) "
-            "without feeling like an HR questionnaire.\n"
+            "- Turn 2/3 Directive: once the operator gives their name, greet them by it, quietly note "
+            f"\"Looks like I'm running locally on {hostname}\", and state your mission in two sentences: "
+            "you are their sovereign working memory and privacy layer on this local machine, holding their "
+            "context close, and you strip sensitive data before anything leaves it. Then gently ask what they "
+            "typically "
+            "build, fix, or troubleshoot at this desk.\n"
+            "  * Over the next turns, let the conversation naturally explore their primary projects/stack, "
+            "tools and preferred communication rules (e.g. terse diffs, direct answers, zero corporate "
+            "apologies) without feeling like an HR questionnaire.\n"
         )
+        if step >= TELEMETRY_GATE_TURN:
+            if telemetry_decision is None:
+                body += (
+                    "- Turn 4/5 Telemetry Gate: while exploring their workbench, stacks and tools, casually "
+                    "check in on hardware awareness, in your own warm words, with exactly this question "
+                    f'(still only ONE question this turn): "{TELEMETRY_GATE_QUESTION}"\n'
+                    "  * If they agree (e.g. 'Yeah, check it out', 'Tune into the iron'), acknowledge it and "
+                    "say machine specs are now active.\n"
+                    f'  * If they decline (e.g. "Keep it on-demand", "Leave it local"), reply smoothly: '
+                    f'"{TELEMETRY_DECLINED_ACK}".\n'
+                    "  * Do not raise the hardware question again once they have answered.\n"
+                )
+            elif telemetry_decision:
+                body += (
+                    "- Telemetry Gate (resolved): the operator opted in; machine specs are now active. "
+                    "Do not ask about hardware again.\n"
+                )
+            else:
+                body += (
+                    f"- Telemetry Gate (resolved): the operator declined. {TELEMETRY_DECLINED_ACK}. "
+                    "Do not ask about hardware again.\n"
+                )
     return head + body + _GUIDELINES.rstrip("\n")

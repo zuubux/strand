@@ -189,3 +189,39 @@ def test_relative_traversal_rejected(tmp_path, monkeypatch):
         ok, reason = is_safe_path(target, [root.resolve()])
         assert ok is False and isinstance(reason, str)
         assert read_file(target, [root.resolve()])["error"] == "access_denied"
+
+
+def test_systemd_cwd_outside_roots_relative_resolution(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    root = home / "Projects"
+    (root / "repo").mkdir(parents=True)
+    (root / "repo" / "file.txt").write_text("hello")
+    (root / "top.txt").write_text("top")
+    (home / "outside.txt").write_text("secret")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(tmp_path)  # simulated systemd cwd, outside the approved root
+    roots = [root.resolve()]
+    ok, resolved = is_safe_path("repo/file.txt", roots)
+    assert ok and resolved == (root / "repo" / "file.txt").resolve()
+    assert read_file("repo/file.txt", roots)["content"] == "hello"
+    assert read_file("top.txt", roots)["content"] == "top"
+    names = [e["name"] for e in list_directory("repo", roots)["entries"]]
+    assert names == ["file.txt"]
+    assert read_file("~/Projects/repo/file.txt", roots)["content"] == "hello"
+    assert list_directory("~/Projects", roots)["path"] == str(root.resolve())
+    for target in ("../../etc/shadow", "../outside.txt", "~/outside.txt"):
+        assert is_safe_path(target, roots)[0] is False
+        assert read_file(target, roots)["error"] == "access_denied"
+        assert list_directory(target, roots)["error"] == "access_denied"
+
+
+def test_relative_path_accepts_cwd_inside_root(tmp_path, monkeypatch):
+    first, second = _root(tmp_path), tmp_path / "other"
+    (second / "pkg").mkdir(parents=True)
+    (second / "pkg" / "m.py").write_text("z")
+    monkeypatch.chdir(second)
+    ok, resolved = is_safe_path("pkg/m.py", [first, second.resolve()])
+    assert ok and resolved == (second / "pkg" / "m.py").resolve()
+    # cwd outside every root contributes nothing
+    monkeypatch.chdir(tmp_path)
+    assert is_safe_path("../x", [first])[0] is False

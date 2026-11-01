@@ -1,4 +1,5 @@
 import asyncio
+import stat
 import sys
 
 import pytest
@@ -180,3 +181,62 @@ def test_upsert_auto_embeds_with_name_summary_text(db_path):
     assert mock.calls == ["Atlas: Main project", "Bare"]
     assert nearest == [atlas]
     assert _embedding_ids(db_path) == sorted([atlas, bare])
+
+
+# --- SEC-CACHE-003: isolated fastembed cache --------------------------------
+
+
+def _install_fake_fastembed(monkeypatch):
+    import types
+
+    seen = {}
+
+    class FakeTextEmbedding:
+        def __init__(self, model_name, **kwargs):
+            seen["model"] = model_name
+            seen["kwargs"] = kwargs
+
+        def embed(self, texts):
+            for _ in texts:
+                yield [0.25] * EMBEDDING_DIM
+
+    module = types.ModuleType("fastembed")
+    module.TextEmbedding = FakeTextEmbedding
+    monkeypatch.setitem(sys.modules, "fastembed", module)
+    return seen
+
+
+def test_manager_passes_isolated_cache_dir_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.delenv("FASTEMBED_CACHE_PATH", raising=False)
+    seen = _install_fake_fastembed(monkeypatch)
+    EmbeddingManager("some/model").embed("hello")
+    expected = tmp_path / ".cache" / "strand" / "fastembed"
+    assert seen["model"] == "some/model"
+    assert seen["kwargs"] == {"cache_dir": str(expected)}
+    assert stat.S_IMODE(expected.stat().st_mode) == 0o700
+    assert stat.S_IMODE(expected.parent.stat().st_mode) == 0o700
+
+
+def test_manager_honours_xdg_cache_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.delenv("FASTEMBED_CACHE_PATH", raising=False)
+    seen = _install_fake_fastembed(monkeypatch)
+    EmbeddingManager().embed("hello")
+    expected = tmp_path / "xdg" / "strand" / "fastembed"
+    assert seen["kwargs"] == {"cache_dir": str(expected)}
+    assert stat.S_IMODE(expected.stat().st_mode) == 0o700
+    assert "/tmp/fastembed_cache" not in seen["kwargs"]["cache_dir"]
+
+
+def test_cache_dir_tightens_loose_existing_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.delenv("FASTEMBED_CACHE_PATH", raising=False)
+    loose = tmp_path / "strand" / "fastembed"
+    loose.mkdir(parents=True)
+    loose.chmod(0o755)
+    _install_fake_fastembed(monkeypatch)
+    EmbeddingManager().embed("x")
+    assert stat.S_IMODE(loose.stat().st_mode) == 0o700

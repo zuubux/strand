@@ -20,6 +20,7 @@ from .distill import DistillationEngine
 from .embed import create_embedder
 from .extractors import DEFAULT_EXTRACTOR_URL, LLMExtractor
 from .logging import get_logger, setup_logging
+from .perms import secure_parent_dir
 from .proxy import create_app
 from .resolver import ContextResolver
 from .session import SessionLedger
@@ -83,13 +84,10 @@ def _remove_stale_socket(path: Path) -> None:
 
 
 def prepare_socket(socket_path: str) -> None:
-    """Create the 0700 parent dir and remove any stale (dead) socket file."""
+    """Create the parent dir (0700 if managed) and remove any stale (dead) socket file."""
     path = Path(socket_path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        os.chmod(path.parent, 0o700)
-    except PermissionError:
-        pass  # e.g. a directory we do not own such as /tmp
+    secure_parent_dir(path.parent)  # 0700 only for a Strand-managed dir; never $HOME or /tmp
     _remove_stale_socket(path)
 
 

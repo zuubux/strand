@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import getpass
 import json
 import os
 import re
@@ -17,12 +18,13 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
-from PySide6.QtCore import Property, QObject, Signal, Slot
+from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
 
 from strand.config import (
     Config,
@@ -32,6 +34,7 @@ from strand.config import (
     default_config_path,
     load_config,
 )
+from strand.perms import secure_parent_dir
 from strand.onboarding import ONBOARD_TRIGGER, ONBOARDING_HEADER, ONBOARDING_MODE
 
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -52,13 +55,40 @@ SETTINGS_KEYS: dict[str, str] = {
     "decay_half_life_days": "float",
     "fail_closed_private": "bool",
     "redact_secrets": "bool",
+    "enable_host_telemetry": "bool",
 }
+# Client-side presentation pacing (OBS-ERG-003): the socket is never throttled, only the
+# drain of the in-memory buffer into the transcript.
+PACE_TOKENS_PER_SEC = 67.0  # ~65-70 t/s (~270 chars/s): ~1.07 token (~4-5 chars) credit per 16 ms tick
+PACE_INTERVAL_MS = 16
+CHARS_PER_TOKEN = 4
+GROUNDING_HEADER_NAME = "X-Strand-Grounding"
+GROUNDING_HOLD_S = 0.15  # grounded turns: the pulse is perceptible before the first token
+GROUNDING_RE = re.compile(r"(\w+)=(\d+)")
+TABLE_LINE_RE = re.compile(r"^[ \t]*\|.*\|[ \t]*$")
+KV_LINE_RE = re.compile(r"^[ \t]*[A-Za-z_][\w.-]*[ \t]*(?::|=)[ \t]+\S")
+PARAGRAPH_SPLIT_RE = re.compile(r"\n[ \t]*\n")
 COMMAND_RE = re.compile(r"^/([A-Za-z]+)(?:[ \t]+(.*))?$", re.DOTALL)
 FENCE_RE = re.compile(r"^[ \t]{0,3}```[ \t]*([\w+.#-]*)[ \t]*$")
 HELP_TEXT = (
     "Commands: /new (fresh session), /private on|off (send X-Strand-Allow-Private), "
     "/model <name> (switch model), /onboard (fresh session, Strand opens the grounding conversation), /help. Ctrl+L new session, Ctrl+D diagnostics, Esc stop/clear."
 )
+
+
+def operator_name(env: Mapping[str, str] | None = None) -> str:
+    """Operator display name: explicit env override, else the capitalised login name, else `Operator`."""
+    env = os.environ if env is None else env
+    name = (env.get("STRAND_UI_OPERATOR") or "").strip()
+    if not name:
+        try:
+            name = getpass.getuser().strip()
+        except Exception:
+            name = ""
+        if name.lower() in ("root", ""):
+            name = ""
+        name = name[:1].upper() + name[1:]
+    return name or "Operator"
 
 
 def parse_command(text: str) -> tuple[str, str] | None:
@@ -100,6 +130,69 @@ def split_markdown(text: str) -> list[dict[str, Any]]:
             buf.append(line)
     flush()
     return segments
+
+
+def split_blocks(text: str) -> list[dict[str, Any]]:
+    """Presentation blocks `{kind, code, lang, text}` for an assistant reply.
+
+    `prose` renders in a conversational bubble; `code` (fences), `table` (markdown pipe tables)
+    and `data` (multi-line structured data) break out onto the canvas.
+    """
+    blocks: list[dict[str, Any]] = []
+
+    def add(kind: str, body: str, lang: str = "") -> None:
+        blocks.append({"kind": kind, "code": kind in ("code", "data"), "lang": lang, "text": body})
+
+    for segment in split_markdown(text):
+        if segment["code"]:
+            add("code", segment["text"], segment["lang"])
+            continue
+        lines = segment["text"].split("\n")
+        prose: list[str] = []
+
+        def flush_prose() -> None:
+            body = "\n".join(prose)
+            # Blank-line separated paragraphs are individual conversational bubbles.
+            for paragraph in PARAGRAPH_SPLIT_RE.split(body):
+                if paragraph.strip():
+                    add("prose", paragraph.strip("\n"))
+            prose.clear()
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            run, kind, minimum = i, "", 0
+            if TABLE_LINE_RE.match(line):
+                while run < len(lines) and TABLE_LINE_RE.match(lines[run]):
+                    run += 1
+                kind, minimum = "table", 2
+            elif KV_LINE_RE.match(line):
+                while run < len(lines) and KV_LINE_RE.match(lines[run]):
+                    run += 1
+                kind, minimum = "data", 3
+            elif line.strip() in ("{", "["):
+                while run < len(lines) and lines[run].strip():
+                    run += 1
+                kind, minimum = "data", 3
+            if kind and run - i >= minimum:
+                flush_prose()
+                add(kind, "\n".join(lines[i:run]), kind)
+                i = run
+            else:
+                prose.append(line)
+                i += 1
+        flush_prose()
+    return blocks
+
+
+def parse_grounding(value: str | None) -> dict[str, int]:
+    """Parse the proxy's `entities=2 edges=1 ...` grounding header into counts."""
+    return {key: int(num) for key, num in GROUNDING_RE.findall(value or "")}
+
+
+def grounding_summary(counts: Mapping[str, int]) -> str:
+    """`2 entities • 1 edges` style summary of the non-zero counts."""
+    return " \u2022 ".join(f"{n} {key}" for key, n in counts.items() if n)
 
 
 def resolve_model(
@@ -172,6 +265,8 @@ class Bridge(QObject):
     streamAborted = Signal()
     conversationReset = Signal()
     extractorStatusChanged = Signal(bool, str)
+    groundingChanged = Signal()
+    _wake = Signal()
 
     def __init__(
         self,
@@ -180,8 +275,23 @@ class Bridge(QObject):
         client_factory: Callable[[], httpx.AsyncClient] | None = None,
         parent: QObject | None = None,
         probe_factory: Callable[[], httpx.AsyncClient] | None = None,
+        pace_tps: float = PACE_TOKENS_PER_SEC,
     ) -> None:
         super().__init__(parent)
+        # Pacing buffer: (generation, text) chunks drained by a GUI-thread timer.
+        self._pace_tps = pace_tps
+        self._buffer: deque[tuple[int, str]] = deque()
+        self._end: tuple[int, Signal, tuple[Any, ...], bool] | None = None
+        self._release_busy = False
+        self._credit = 0.0
+        self._hold_until = 0.0
+        self._shown = False
+        self._pulse = False
+        self._grounding = ""
+        self._timer = QTimer(self)
+        self._timer.setInterval(PACE_INTERVAL_MS)
+        self._timer.timeout.connect(self._tick)
+        self._wake.connect(self._on_wake)
         self._probe_factory = probe_factory
         self._config = config if config is not None else load_config()
         self._model = resolve_model(self._config, explicit=model)
@@ -221,6 +331,11 @@ class Bridge(QObject):
     @Property(bool, notify=privateChanged)
     def privateMode(self) -> bool:
         return self._private
+
+    @Property(str, constant=True)
+    def operatorName(self) -> str:
+        """Display name for the user identity header (`$STRAND_UI_OPERATOR`, login name, `Operator`)."""
+        return operator_name()
 
     @Property(str, constant=True)
     def transport(self) -> str:
@@ -263,9 +378,142 @@ class Bridge(QObject):
     def busy(self) -> bool:
         return self._busy
 
+    @Property(bool, notify=groundingChanged)
+    def groundingPulse(self) -> bool:
+        """True from the moment memory was retrieved until the first token is shown."""
+        return self._pulse
+
+    @Property(str, notify=groundingChanged)
+    def groundingSummary(self) -> str:
+        return self._grounding
+
+    @property
+    def buffered(self) -> int:
+        """Chunks waiting in the pacing buffer."""
+        return len(self._buffer)
+
     @property
     def history(self) -> list[dict[str, str]]:
         return list(self._history)
+
+    # -- client-side stream pacing (OBS-ERG-003) ---------------------------------------
+    def _set_grounding(self, pulse: bool, summary: str | None = None) -> None:
+        summary = self._grounding if summary is None else summary
+        if pulse != self._pulse or summary != self._grounding:
+            self._pulse, self._grounding = pulse, summary
+            self.groundingChanged.emit()
+
+    def _note_grounding(self, value: str | None) -> None:
+        counts = parse_grounding(value)
+        grounded = any(counts.values())
+        if grounded:
+            self._hold_until = time.monotonic() + GROUNDING_HOLD_S
+        self._set_grounding(grounded, grounding_summary(counts))
+
+    def _emit_text(self, text: str) -> None:
+        self._shown = True
+        self._set_grounding(False)  # first visible token settles the pulse
+        self.chunkReceived.emit(text)
+
+    def _relay(self, generation: int, paced: bool, text: str) -> None:
+        """Hand a socket chunk to the UI: straight through, or via the pacing buffer."""
+        if paced and self._pace_tps > 0:
+            self._buffer.append((generation, text))
+            self._wake.emit()
+        else:
+            self._emit_text(text)
+
+    def _deliver_end(
+        self, generation: int, paced: bool, signal: Signal, *args: Any, immediate: bool = False
+    ) -> None:
+        """Emit a terminal signal, after the buffer drains when paced (immediately on error/abort)."""
+        if paced and self._pace_tps > 0:
+            with self._lock:
+                self._end = (generation, signal, args, immediate)
+            self._wake.emit()
+        else:
+            self._set_grounding(False)
+            signal.emit(*args)
+
+    def _turn_done(self) -> None:
+        """Worker finished: release `busy` now, or once the paced buffer has drained."""
+        with self._lock:
+            if self._buffer or self._end is not None:
+                self._release_busy = True
+                return
+            self._set_busy(False)
+
+    @Slot()
+    def _on_wake(self) -> None:
+        if self._buffer and not self._timer.isActive():
+            self._timer.start()
+        if self._buffer and not self._shown:
+            self._credit = max(self._credit, 1.0)  # the first token never waits for the timer
+            text = self._drain_text(False)
+            if text:
+                self._emit_text(text)
+        if not self._buffer:
+            self._settle()
+
+    def _drain_text(self, everything: bool) -> str:
+        out: list[str] = []
+        if not everything and time.monotonic() < self._hold_until:
+            return ""
+        while everything or self._credit > 0:
+            try:
+                generation, text = self._buffer.popleft()
+            except IndexError:
+                break
+            if generation != self._generation:
+                continue  # stale chunk of a reset conversation
+            out.append(text)
+            if not everything:
+                self._credit -= max(1, -(-len(text) // CHARS_PER_TOKEN))
+        return "".join(out)
+
+    def _tick(self) -> None:
+        self._credit += self._pace_tps * PACE_INTERVAL_MS / 1000
+        text = self._drain_text(False)
+        if text:
+            self._emit_text(text)
+        if not self._buffer:
+            self._credit = min(self._credit, 0.0)  # no burst after an idle gap
+        self._settle()
+
+    def _settle(self) -> None:
+        """Emit the pending terminal signal once the buffer is empty; then release `busy`."""
+        with self._lock:
+            end = self._end
+            if self._buffer and not (end is not None and end[3]):
+                return
+            self._end = None
+        if self._buffer:  # error/abort: show everything received so far at once
+            text = self._drain_text(True)
+            if text:
+                self._emit_text(text)
+        if end is not None and end[0] == self._generation:
+            self._set_grounding(False)
+            end[1].emit(*end[2])
+        with self._lock:
+            if self._release_busy and not self._buffer and self._end is None:
+                self._release_busy = False
+                self._set_busy(False)
+            idle = not self._buffer and self._end is None
+        if idle:
+            self._timer.stop()
+            self._credit = 0.0
+
+    @Slot(result=int)
+    def flush_stream(self) -> int:
+        """Instantly drain the pacing buffer into the transcript (Tab fast-forward).
+
+        Returns the number of characters released.
+        """
+        text = self._drain_text(True)
+        if text:
+            self._emit_text(text)
+        self._settle()
+        return len(text)
 
     # -- transport -------------------------------------------------------------------
     def make_client(self) -> httpx.AsyncClient:
@@ -306,12 +554,18 @@ class Bridge(QObject):
             ok = False
         self._set_status(status_label(self._uds_path, self._base_url) if ok else "Disconnected")
 
-    async def _stream(self, messages: list[dict[str, str]], generation: int | None = None) -> None:
+    async def _stream(
+        self, messages: list[dict[str, str]], generation: int | None = None, paced: bool = False
+    ) -> None:
         """Stream one completion; emits chunk/finished/error/aborted signals, never raises httpx errors.
 
         `generation` ties the turn to the conversation it started in: if the conversation was
-        reset meanwhile, history is left alone (the new session must stay clean).
+        reset meanwhile, history is left alone (the new session must stay clean). `paced` routes
+        text through the client-side pacing buffer (the socket read itself is never throttled).
         """
+        gen = self._generation if generation is None else generation
+        self._shown = False
+        self._set_grounding(False, "")
         body: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
@@ -331,7 +585,8 @@ class Bridge(QObject):
                         detail = (await resp.aread()).decode("utf-8", "replace").strip()
                         error = f"HTTP {resp.status_code}: {detail[:300]}" if detail else f"HTTP {resp.status_code}"
                     else:
-                        error = await self._consume(resp, parts, started)
+                        self._note_grounding(resp.headers.get(GROUNDING_HEADER_NAME))
+                        error = await self._consume(resp, parts, started, gen, paced)
                         self._set_status(status_label(self._uds_path, self._base_url))
         except asyncio.CancelledError:
             aborted = True
@@ -368,21 +623,27 @@ class Bridge(QObject):
                     self._history.append({"role": "assistant", "content": "".join(parts)})
                 elif self._history and self._history[-1]["role"] == "user":
                     self._history.pop()
-            self.streamAborted.emit()
+            self._deliver_end(gen, paced, self.streamAborted, immediate=True)
             return
         if error is not None:
             if current and self._history and self._history[-1]["role"] == "user":
                 self._history.pop()
-            self.errorOccurred.emit(error)
+            self._deliver_end(gen, paced, self.errorOccurred, error, immediate=True)
             return
         if current:
             self._history.append({"role": "assistant", "content": "".join(parts)})
-        self.streamFinished.emit()
+        self._deliver_end(gen, paced, self.streamFinished)
 
     async def _consume(
-        self, resp: httpx.Response, parts: list[str], started: float | None = None
+        self,
+        resp: httpx.Response,
+        parts: list[str],
+        started: float | None = None,
+        generation: int | None = None,
+        paced: bool = False,
     ) -> str | None:
         """Relay SSE tokens; returns an error message, or None on a clean finish."""
+        gen = self._generation if generation is None else generation
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         buffer = ""
         # SSE is split on "\n" only (never splitlines), matching the proxy.
@@ -394,7 +655,7 @@ class Bridge(QObject):
                 if kind == "token":
                     self._note_first_token(parts, started)
                     parts.append(value)
-                    self.chunkReceived.emit(value)
+                    self._relay(gen, paced, value)
                 elif kind == "error":
                     return value
                 elif kind == "done":
@@ -404,7 +665,7 @@ class Bridge(QObject):
         if kind == "token":
             self._note_first_token(parts, started)
             parts.append(value)
-            self.chunkReceived.emit(value)
+            self._relay(gen, paced, value)
         elif kind == "error":
             return value
         return None
@@ -480,8 +741,8 @@ class Bridge(QObject):
         messages = list(self._history)
         generation = self._generation
         self._run_async(
-            lambda: self._stream(messages, generation),
-            on_done=lambda: self._set_busy(False),
+            lambda: self._stream(messages, generation, paced=True),
+            on_done=self._turn_done,
             cancellable=True,
         )
 
@@ -506,6 +767,7 @@ class Bridge(QObject):
             "upstream_api_key_set": bool(cfg.upstream_api_key),
             "fail_closed_private": _as_bool(file_values.get("fail_closed_private", True)),
             "redact_secrets": _as_bool(file_values.get("redact_secrets", True)),
+            "enable_host_telemetry": cfg.enable_host_telemetry,
         }
 
     @Slot("QVariantMap", result=bool)
@@ -534,10 +796,7 @@ class Bridge(QObject):
                     updates[key] = text
             current.update(updates)
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            try:
-                os.chmod(path.parent, 0o700)
-            except PermissionError:
-                pass
+            secure_parent_dir(path.parent)
             fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config-", suffix=".tmp")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -621,6 +880,8 @@ class Bridge(QObject):
         self._generation += 1
         if self._busy:
             self.abort()
+        self._buffer.clear()
+        self._set_grounding(False, "")
         self._history.clear()
         self._turn = {}
         self._onboarding = False
@@ -710,3 +971,8 @@ class Bridge(QObject):
     @Slot(str, result="QVariantList")
     def segments(self, text: str) -> list[dict[str, Any]]:
         return split_markdown(text)
+
+    @Slot(str, result="QVariantList")
+    def blocks(self, text: str) -> list[dict[str, Any]]:
+        """Presentation blocks (prose bubbles vs. canvas payloads) for an assistant reply."""
+        return split_blocks(text)

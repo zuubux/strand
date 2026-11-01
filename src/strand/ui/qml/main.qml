@@ -10,27 +10,73 @@ ApplicationWindow {
     minimumWidth: 420
     minimumHeight: 360
     title: "Strand"
-    color: "#16191D"
+    color: theme.canvas
 
-    readonly property color panel: "#1E2228"
-    readonly property color border: "#2C323A"
-    readonly property color userBubble: "#2B5C8A"
-    readonly property color botBubble: "#232830"
-    readonly property color textColor: "#E6E9ED"
-    readonly property color dim: "#7F8A96"
-    readonly property color accent: "#3DAEE9"
-    readonly property color codeBg: "#0B0D10"
-    readonly property color codeHeaderBg: "#13161B"
-    readonly property color codeBorder: Qt.rgba(1, 1, 1, 0.06)
-    readonly property color userRecess: "#12161B"
-    readonly property color userBorder: "#34404E"
+    // Centralized theme tokens: every colour and font stack used by the transcript,
+    // identity headers, cards and input dock is defined here and nowhere else.
+    QtObject {
+        id: theme
+        // Surfaces
+        readonly property color canvas: "#090b0e"
+        readonly property color panel: "#1E2228"
+        readonly property color border: "#2C323A"
+        // User voice: deep slate-indigo bubble, indigo hairline, clean sans.
+        readonly property color userSurface: "#141c2b"
+        readonly property color userBorder: Qt.rgba(99 / 255, 102 / 255, 241 / 255, 0.20)
+        // Assistant voice: dark carbon bubble, cyan hairline, high-contrast text.
+        readonly property color assistantSurface: "#11161d"
+        readonly property color assistantBorder: Qt.rgba(56 / 255, 189 / 255, 248 / 255, 0.18)
+        readonly property color assistantText: "#f1f5f9"
+        // Cards / code / tables: recessed monospace substrate.
+        readonly property color cardSurface: "#0c0f14"
+        readonly property color cardHeader: "#10141a"
+        readonly property color cardBorder: Qt.rgba(1, 1, 1, 0.06)
+        readonly property color codeText: "#D6DEE7"
+        // Text & accents
+        readonly property color text: "#E6E9ED"
+        readonly property color dim: "#7F8A96"
+        readonly property color accent: "#3DAEE9"
+        readonly property color cyan: "#38bdf8"
+        readonly property color cyanSoft: "#7dd3fc"
+        readonly property color amber: "#f59e0b"
+        readonly property color warn: "#fbbf24"
+        readonly property color diffAdded: "#34d399"
+        readonly property color diffRemoved: "#f87171"
+        // Input dock
+        readonly property color dockSurface: "#11161d"
+        readonly property color dockBorder: Qt.rgba(1, 1, 1, 0.08)
+        readonly property color fieldSurface: canvas
+        // Geometry
+        readonly property int dockMaxWidth: 760
+        readonly property int dockMargin: 96
+    }
+
+    readonly property color panel: theme.panel
+    readonly property color border: theme.border
+    readonly property color textColor: theme.text
+    readonly property color dim: theme.dim
+    readonly property color accent: theme.accent
+    readonly property color codeBg: theme.cardSurface
+    readonly property color codeHeaderBg: theme.cardHeader
+    readonly property color codeBorder: theme.cardBorder
+    readonly property color userRecess: theme.userSurface
+    readonly property color userBorder: theme.userBorder
     readonly property color diffAdded: "#34d399"
-    readonly property color diffRemoved: "#f87171"
+    readonly property color diffRemoved: theme.diffRemoved
+    readonly property color assistantSurface: theme.assistantSurface
+    readonly property color assistantBorder: theme.assistantBorder
+    readonly property color assistantText: theme.assistantText
 
     // Typography cascade: the workstation's system font first, then portable fallbacks.
     readonly property var uiFamilies: [Qt.application.font.family, "Inter", "-apple-system", "Segoe UI", "Noto Sans", "sans-serif"]
     // Monospace substrate: code, diffs, specs and telemetry tokens.
     readonly property var monoFamilies: ["JetBrains Mono", "Fira Code", "monospace"]
+    // User voice: clean Inter / system sans.
+    readonly property var userFamilies: ["Inter", Qt.application.font.family, "-apple-system", "Segoe UI", "Noto Sans", "sans-serif"]
+    // Assistant voice: an articulate proportional sans, distinct from the user's, never monospaced.
+    readonly property var assistantFamilies: ["IBM Plex Sans", "Source Sans 3", "Inter", "Noto Sans", "Segoe UI", "sans-serif"]
+
+    readonly property string operatorName: bridge && bridge.operatorName ? bridge.operatorName : "Operator"
 
     readonly property int bodyPixelSize: 14
     readonly property real narrativeLineHeight: 1.65
@@ -48,6 +94,8 @@ ApplicationWindow {
     }
     readonly property string uiFamily: firstFamily(uiFamilies)
     readonly property string monoFamily: firstFamily(monoFamilies)
+    readonly property string assistantFamily: firstFamily(assistantFamilies)
+    readonly property string userFamily: firstFamily(userFamilies)
 
     // Sleek compact action button shared by the settings modal.
     component SleekButton: Button {
@@ -75,7 +123,7 @@ ApplicationWindow {
             radius: 6
             color: sleek.hovered ? Qt.rgba(1, 1, 1, 0.10) : Qt.rgba(1, 1, 1, 0.05)
             border.width: 1
-            border.color: sleek.pressed ? "#38bdf8" : (sleek.hovered ? Qt.rgba(1, 1, 1, 0.20) : Qt.rgba(1, 1, 1, 0.08))
+            border.color: sleek.pressed ? theme.cyan : (sleek.hovered ? Qt.rgba(1, 1, 1, 0.20) : Qt.rgba(1, 1, 1, 0.08))
             Behavior on color { ColorAnimation { duration: 120 } }
             Behavior on border.color { ColorAnimation { duration: 120 } }
         }
@@ -105,7 +153,7 @@ ApplicationWindow {
             radius: 14
             color: seg.selected ? Qt.rgba(1, 1, 1, 0.10) : "transparent"
             border.width: 1
-            border.color: seg.selected ? "#38bdf8" : (seg.hovered ? Qt.rgba(1, 1, 1, 0.12) : "transparent")
+            border.color: seg.selected ? theme.cyan : (seg.hovered ? Qt.rgba(1, 1, 1, 0.12) : "transparent")
         }
     }
 
@@ -136,7 +184,7 @@ ApplicationWindow {
             text: consequence.uncheckedText
             visible: !consequence.active
             wrapMode: Text.WordWrap
-            color: consequence.warnUnchecked ? "#fbbf24" : root.dim
+            color: consequence.warnUnchecked ? theme.warn : root.dim
             font.family: root.uiFamily
             font.pixelSize: 11
         }
@@ -155,14 +203,14 @@ ApplicationWindow {
             width: 16
             height: 16
             radius: 3
-            color: "#090b0e"
+            color: theme.fieldSurface
             border.width: 1
             border.color: cbox.checked || cbox.hovered ? Qt.rgba(1, 1, 1, 0.22) : Qt.rgba(1, 1, 1, 0.12)
             Text {
                 anchors.centerIn: parent
                 visible: cbox.checked
                 text: "\u2713"
-                color: "#34d399"
+                color: theme.diffAdded
                 font.family: root.uiFamily
                 font.pixelSize: 12
                 font.bold: true
@@ -227,7 +275,7 @@ ApplicationWindow {
         var lines = text.split("\n")
         for (var i = 0; i < lines.length; i++) {
             var line = lines[i]
-            var color = "#D6DEE7"
+            var color = theme.codeText
             if (line.indexOf("+++") === 0 || line.indexOf("---") === 0)
                 color = root.dim
             else if (line.indexOf("@@") === 0)
@@ -261,6 +309,12 @@ ApplicationWindow {
     }
 
     function toggleDrawer() { drawerOpen = !drawerOpen }
+
+    // Tab while streaming: fast-forward the paced buffer onto the transcript at once.
+    function flushStream() {
+        if (bridge && bridge.busy)
+            bridge.flush_stream()
+    }
 
     // Esc: stop the running stream; else dismiss the telemetry drawer; else clear the input.
     function openSettings() {
@@ -391,6 +445,57 @@ ApplicationWindow {
         }
     }
 
+    // Assistant dialogue bubble: hugs its content (an invisible no-wrap twin measures the
+    // natural width) up to the flow width; the visible text wraps inside it, one-way.
+    Component {
+        id: proseBubble
+        Item {
+            id: pb
+            readonly property real hPad: 14
+            readonly property real vPad: 10
+            readonly property real natural: Math.ceil(measure.implicitWidth) + 2 * hPad + 2
+            width: Math.min(natural, parent ? parent.width : natural)
+            implicitWidth: width
+            implicitHeight: prose.implicitHeight + 2 * vPad
+            height: implicitHeight
+            Text {
+                id: measure
+                visible: false
+                wrapMode: Text.NoWrap
+                textFormat: Text.MarkdownText
+                text: segment.text
+                font.family: root.assistantFamily
+                font.pixelSize: root.bodyPixelSize
+                font.letterSpacing: root.narrativeLetterSpacing
+            }
+            Rectangle {
+                objectName: "assistantBubble"
+                anchors.fill: parent
+                radius: 12
+                color: root.assistantSurface
+                border.color: root.assistantBorder
+                border.width: 1
+            }
+            Text {
+                id: prose
+                x: pb.hPad
+                y: pb.vPad
+                width: pb.width - 2 * pb.hPad
+                wrapMode: Text.Wrap
+                textFormat: Text.MarkdownText
+                text: segment.text
+                color: theme.assistantText
+                linkColor: root.accent
+                font.family: root.assistantFamily
+                font.pixelSize: root.bodyPixelSize
+                font.kerning: true
+                font.letterSpacing: root.narrativeLetterSpacing
+                lineHeightMode: Text.ProportionalHeight
+                lineHeight: root.narrativeLineHeight
+            }
+        }
+    }
+
     // Pillowed technical card: recessed body, 1px hairline border, header bar with the
     // title (diff file path) and language tag. Unified diffs colour removed/added lines.
     Component {
@@ -449,7 +554,7 @@ ApplicationWindow {
                 wrapMode: TextEdit.WrapAnywhere
                 textFormat: card.diff ? TextEdit.RichText : TextEdit.PlainText
                 text: card.diff ? root.diffHtml(segment.text) : segment.text
-                color: "#D6DEE7"
+                color: theme.codeText
                 selectionColor: root.accent
                 font.family: root.monoFamily
                 font.pixelSize: 13
@@ -459,6 +564,7 @@ ApplicationWindow {
 
     Shortcut { sequence: "Ctrl+L"; context: Qt.WindowShortcut; onActivated: root.newSession() }
     Shortcut { sequence: "Ctrl+D"; context: Qt.WindowShortcut; onActivated: root.toggleDrawer() }
+    Shortcut { sequence: "Tab"; enabled: bridge ? bridge.busy : false; context: Qt.WindowShortcut; onActivated: root.flushStream() }
     Shortcut { sequence: "Escape"; context: Qt.WindowShortcut; onActivated: root.handleEscape() }
 
     RowLayout {
@@ -493,15 +599,19 @@ ApplicationWindow {
                         height: 6
                         radius: 3
                         readonly property bool busy: bridge ? bridge.busy : false
-                        color: "#38bdf8"
+                        // Grounding pulse: memory retrieved, first token not yet shown.
+                        readonly property bool grounding: bridge ? bridge.groundingPulse : false
+                        color: grounding ? theme.cyanSoft : theme.cyan
+                        Behavior on color { ColorAnimation { duration: 320 } }
                         opacity: 0.85
                         layer.enabled: true
+                        NumberAnimation { id: settle; target: brandDot; property: "opacity"; to: 0.85; duration: 320; easing.type: Easing.OutSine }
                         SequentialAnimation {
                             running: brandDot.busy
                             loops: Animation.Infinite
-                            onRunningChanged: if (!running) brandDot.opacity = 0.85
-                            NumberAnimation { target: brandDot; property: "opacity"; from: 0.85; to: 0.35; duration: 700; easing.type: Easing.InOutSine }
-                            NumberAnimation { target: brandDot; property: "opacity"; from: 0.35; to: 0.85; duration: 700; easing.type: Easing.InOutSine }
+                            onRunningChanged: if (!running) settle.start(); else settle.stop()
+                            NumberAnimation { target: brandDot; property: "opacity"; to: brandDot.grounding ? 0.25 : 0.35; duration: brandDot.grounding ? 520 : 700; easing.type: Easing.InOutSine }
+                            NumberAnimation { target: brandDot; property: "opacity"; to: 0.9; duration: brandDot.grounding ? 520 : 700; easing.type: Easing.InOutSine }
                         }
                     }
                 }
@@ -528,7 +638,7 @@ ApplicationWindow {
                     id: lockGlyph
                     anchors.centerIn: parent
                     text: lockButton.active ? "\uD83D\uDD12\uFE0E" : "\uD83D\uDD13\uFE0E"
-                    color: lockButton.active ? "#f59e0b" : Qt.rgba(1, 1, 1, 0.25)
+                    color: lockButton.active ? theme.amber : Qt.rgba(1, 1, 1, 0.25)
                     font.pixelSize: 13
                 }
                 MouseArea {
@@ -549,7 +659,7 @@ ApplicationWindow {
             Layout.fillHeight: true
             model: transcript
             clip: true
-            spacing: 10
+            spacing: 0
             topMargin: 14
             bottomMargin: 14
             boundsBehavior: Flickable.StopAtBounds
@@ -577,13 +687,72 @@ ApplicationWindow {
                 required property string body
                 required property bool pending
                 required property string trail
+                required property int index
                 readonly property bool isUser: role === "user"
+                // Turn hierarchy: the first row of a speaker group carries an identity header and a
+                // wide gap above it (30px); rows continuing a turn sit tight (6px).
+                readonly property string prevRole: index > 0 ? transcript.get(index - 1).role : ""
+                readonly property bool showHeader: (isUser || role === "assistant") && prevRole !== role
+                readonly property real headerHeight: showHeader ? 24 : 0
+                readonly property real topGap: index === 0 ? 0 : (prevRole === role ? 6 : (role === "note" || prevRole === "note" ? 12 : 30))
+                readonly property real bodyTop: topGap + headerHeight
+                // Assistant answers flow as bubbles + canvas payloads; the thinking pill, user
+                // cards and notes keep the single bubble.
+                readonly property bool flowMode: role === "assistant" && !(pending && body.length === 0)
                 width: list.width
-                height: bubble.height
+                height: bodyTop + (flowMode ? flow.height : bubble.height)
+
+                // Identity header: operator name + avatar (right) / STRAND + brand pip (left).
+                Row {
+                    id: identity
+                    objectName: row.isUser ? "userIdentity" : "assistantIdentity"
+                    visible: row.showHeader
+                    y: row.topGap
+                    height: row.headerHeight
+                    spacing: 7
+                    layoutDirection: row.isUser ? Qt.RightToLeft : Qt.LeftToRight
+                    x: row.isUser ? row.width - width - bubble.edge : bubble.edge
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: 16
+                        height: 16
+                        radius: 8
+                        color: row.isUser ? root.userRecess : "transparent"
+                        border.color: row.isUser ? root.userBorder : root.assistantBorder
+                        border.width: 1
+                        Label {
+                            visible: row.isUser
+                            anchors.centerIn: parent
+                            text: root.operatorName.charAt(0).toUpperCase()
+                            color: root.dim
+                            font.pixelSize: 9
+                            font.weight: Font.DemiBold
+                        }
+                        Rectangle {
+                            visible: !row.isUser
+                            anchors.centerIn: parent
+                            width: 6
+                            height: 6
+                            radius: 3
+                            color: theme.cyan
+                            opacity: 0.85
+                        }
+                    }
+                    Label {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: row.isUser ? root.operatorName.toUpperCase() : "STRAND"
+                        color: row.isUser ? root.dim : theme.cyan
+                        opacity: row.isUser ? 1.0 : 0.85
+                        font.pixelSize: 11
+                        font.weight: Font.DemiBold
+                        font.letterSpacing: 1.6
+                    }
+                }
 
                 Item {
                     id: bubble
                     objectName: "bubble"
+                    visible: !row.flowMode
                     readonly property bool isNote: row.role === "note"
                     // One-way geometry: bubble.width derives only from row.width and text metrics,
                     // never from `content` (which wraps to bubble.width), so there are no layout loops.
@@ -602,6 +771,7 @@ ApplicationWindow {
                     }
                     readonly property real naturalWidth: Math.ceil(textMetrics.advanceWidth) + 2 * hPad + 2
                     x: row.isUser ? row.width - width - edge : edge
+                    y: row.bodyTop
                     // Notes use the full column; user cards and the assistant thinking pill shrink to fit;
                     // assistant answers fill their bounded card width.
                     width: (row.isUser || (isAssistant && isThinking)) ? Math.min(maxWidth, naturalWidth) : Math.max(0, maxWidth)
@@ -611,8 +781,8 @@ ApplicationWindow {
                         anchors.fill: parent
                         visible: bubble.boxed
                         radius: 12
-                        color: row.isUser ? root.userRecess : "#13171f"
-                        border.color: row.isUser ? root.userBorder : Qt.rgba(1, 1, 1, 0.06)
+                        color: row.isUser ? root.userRecess : root.assistantSurface
+                        border.color: row.isUser ? root.userBorder : root.assistantBorder
                         border.width: 1
                     }
 
@@ -623,33 +793,6 @@ ApplicationWindow {
                         y: bubble.vPad
                         width: bubble.width - 2 * bubble.hPad
                         spacing: 8
-
-                        // Context-delta whisper: single-line `traversed A • B • Rule` pill.
-                        Rectangle {
-                            id: whisper
-                            objectName: "whisper"
-                            visible: row.role === "assistant" && row.trail.length > 0
-                            height: visible ? 20 : 0
-                            width: visible ? Math.min(parent.width, whisperText.implicitWidth + 20) : 0
-                            radius: 10
-                            color: "transparent"
-                            border.color: root.codeBorder
-                            border.width: 1
-                            Label {
-                                id: whisperText
-                                anchors.left: parent.left
-                                anchors.right: parent.right
-                                anchors.margins: 10
-                                anchors.verticalCenter: parent.verticalCenter
-                                text: "traversed " + row.trail
-                                elide: Text.ElideRight
-                                maximumLineCount: 1
-                                color: root.dim
-                                opacity: 0.8
-                                font.family: root.monoFamily
-                                font.pixelSize: 10
-                            }
-                        }
 
                         // User text and local notes are plain text.
                         TextEdit {
@@ -663,6 +806,7 @@ ApplicationWindow {
                             textFormat: TextEdit.PlainText
                             text: row.body
                             color: bubble.isNote ? root.dim : root.textColor
+                            font.family: root.userFamily
                             font.italic: bubble.isNote
                             selectionColor: root.accent
                             font.pixelSize: root.bodyPixelSize
@@ -670,13 +814,62 @@ ApplicationWindow {
 
                         // Assistant replies: markdown narrative blocks and fenced technical cards.
                         Repeater {
-                            model: !bridge || row.isUser || bubble.isNote ? [] : bridge.segments(row.pending && row.body.length === 0 ? "…" : row.body)
+                            model: !bridge || !bubble.isThinking ? [] : bridge.segments("…")
                             delegate: Loader {
                                 required property var modelData
                                 width: content.width
                                 sourceComponent: modelData.code ? codeBlock : textBlock
                                 property var segment: modelData
                             }
+                        }
+                    }
+                }
+
+                // Hybrid assistant layout: prose in hugging bubbles; fences, tables and
+                // structured data break out onto the recessed canvas.
+                Column {
+                    id: flow
+                    objectName: "assistantFlow"
+                    visible: row.flowMode
+                    x: bubble.edge
+                    y: row.bodyTop
+                    width: Math.max(0, bubble.maxWidth)
+                    spacing: 6
+
+                    // Context-delta whisper: single-line `traversed A • B • Rule` pill.
+                    Rectangle {
+                        id: whisper
+                        objectName: "whisper"
+                        visible: row.role === "assistant" && row.trail.length > 0
+                        height: visible ? 20 : 0
+                        width: visible ? Math.min(parent.width, whisperText.implicitWidth + 20) : 0
+                        radius: 10
+                        color: "transparent"
+                        border.color: root.codeBorder
+                        border.width: 1
+                        Label {
+                            id: whisperText
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.margins: 10
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "traversed " + row.trail
+                            elide: Text.ElideRight
+                            maximumLineCount: 1
+                            color: root.dim
+                            opacity: 0.8
+                            font.family: root.monoFamily
+                            font.pixelSize: 10
+                        }
+                    }
+
+                    Repeater {
+                        model: !bridge || !row.flowMode ? [] : bridge.blocks(row.body)
+                        delegate: Loader {
+                            required property var modelData
+                            width: flow.width
+                            sourceComponent: modelData.kind === "prose" ? proseBubble : codeBlock
+                            property var segment: modelData
                         }
                     }
                 }
@@ -691,43 +884,22 @@ ApplicationWindow {
             Layout.preferredHeight: dock.height + 8 + 36
             // Fully transparent: no shelf, divider or two-tone bar.
 
-            // Natural width of the longest typed line, used to stretch the dock horizontally.
-            TextMetrics {
-                id: typedMetrics
-                font: input.font
-                text: {
-                    var lines = input.text.split("\n")
-                    var longest = ""
-                    for (var i = 0; i < lines.length; i++)
-                        if (lines[i].length > longest.length)
-                            longest = lines[i]
-                    return longest
-                }
-            }
-
             Rectangle {
                 id: dock
                 objectName: "inputDock"
-                readonly property real restingWidth: Math.min(Math.max(500, Math.min(footer.width * 0.65, 780)), footer.width - 24)
-                readonly property real maxWidth: Math.max(restingWidth, Math.min(footer.width - 96, 920))
-                readonly property real wantedWidth: typedMetrics.advanceWidth + input.leftPadding + input.rightPadding + 8
                 readonly property real verticalPadding: input.topPadding + input.bottomPadding
                 anchors.horizontalCenter: parent.horizontalCenter
                 anchors.top: parent.top
                 anchors.topMargin: 8
-                width: Math.min(Math.max(restingWidth, wantedWidth), maxWidth)
+                // Fixed reading measure: never reacts to typed text.
+                width: Math.max(0, Math.min(parent.width - theme.dockMargin, theme.dockMaxWidth))
                 // Tracks the wrapped text height: one line (44) up to 180, then scrolls inside.
                 height: Math.min(Math.max(input.contentHeight + verticalPadding, 44), 180)
                 radius: 14
-                color: "#13171f"
+                color: theme.dockSurface
                 border.width: 1
-                border.color: input.activeFocus ? "#38bdf8" : Qt.rgba(1, 1, 1, 0.08)
-                // Animate only when the input is empty (resting/reset). While typing the width
-                // snaps, so the wrap engine and an in-flight animation never race (BUG-UI-001).
-                Behavior on width {
-                    enabled: input.text.length === 0
-                    NumberAnimation { duration: 150; easing.type: Easing.OutQuad }
-                }
+                border.color: input.activeFocus ? theme.cyan : theme.dockBorder
+                Behavior on height { NumberAnimation { duration: 90; easing.type: Easing.OutQuad } }
 
                 Flickable {
                     id: inputFlick
@@ -1130,7 +1302,7 @@ ApplicationWindow {
                                     topPadding: 8
                                     bottomPadding: 8
                                     placeholderText: "Core stance injected ahead of the personality matrix"
-                                    background: Rectangle { radius: 6; color: "#090b0e"; border.color: root.codeBorder; border.width: 1 }
+                                    background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
                                 }
                             }
                             RowLayout {
@@ -1296,7 +1468,7 @@ ApplicationWindow {
                                 font.pixelSize: 12
                                 leftPadding: 10
                                 rightPadding: 10
-                                background: Rectangle { radius: 6; color: "#090b0e"; border.color: root.codeBorder; border.width: 1 }
+                                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
                             }
                             Label {
                                 Layout.topMargin: 4
@@ -1317,7 +1489,7 @@ ApplicationWindow {
                                 font.pixelSize: 12
                                 leftPadding: 10
                                 rightPadding: 10
-                                background: Rectangle { radius: 6; color: "#090b0e"; border.color: root.codeBorder; border.width: 1 }
+                                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
                             }
                             Label {
                                 Layout.topMargin: 4
@@ -1339,7 +1511,7 @@ ApplicationWindow {
                                 font.pixelSize: 12
                                 leftPadding: 10
                                 rightPadding: 10
-                                background: Rectangle { radius: 6; color: "#090b0e"; border.color: root.codeBorder; border.width: 1 }
+                                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
                             }
                             Item { Layout.fillHeight: true }
                             RowLayout {
@@ -1428,7 +1600,7 @@ ApplicationWindow {
                                 font.pixelSize: 12
                                 leftPadding: 10
                                 rightPadding: 10
-                                background: Rectangle { radius: 6; color: "#090b0e"; border.color: root.codeBorder; border.width: 1 }
+                                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
                                 // Saved on blur/Enter; Test Connection saves too.
                                 onEditingFinished: root.persist({ extractor_url: text })
                             }
@@ -1451,7 +1623,7 @@ ApplicationWindow {
                                 font.pixelSize: 12
                                 leftPadding: 10
                                 rightPadding: 10
-                                background: Rectangle { radius: 6; color: "#090b0e"; border.color: root.codeBorder; border.width: 1 }
+                                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
                                 onEditingFinished: root.persist({ extractor_model: text })
                             }
                             RowLayout {

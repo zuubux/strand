@@ -175,7 +175,9 @@ def _system_text(request):
 
 
 def test_header_triggers_onboarding_directive_without_seeding_from_user(tmp_path, pinned_host):
-    seen, names = _post(tmp_path, {"X-Strand-Mode": "onboarding"}, with_person=True)
+    seen, names = _post(
+        tmp_path, {"X-Strand-Mode": "onboarding", "X-Strand-Host-Telemetry": "true"}, with_person=True
+    )
     system = _system_text(seen[0])
     assert "[Onboarding Directive: Grounding & Resonance]" in system
     assert "host workstation-01, Fedora Linux 44" in system
@@ -238,3 +240,57 @@ def test_onboarding_has_no_procedural_name_anchor():
     assert onboarding.OPENING_LINE == "Hi, I'm Strand. What should I call you?"
     text = onboarding.onboarding_directive({"hostname": "workstation-01"})
     assert onboarding.OPENING_LINE in text and "do not use the Linux account name as a fallback" in text
+
+
+def test_telemetry_gate_directive_offers_opt_in_on_turn_four():
+    from strand.onboarding import TELEMETRY_DECLINED_ACK, TELEMETRY_GATE_QUESTION
+
+    for turn in (4, 5):
+        text = onboarding_directive(HOST, first_turn=False, turn=turn)
+        assert TELEMETRY_GATE_QUESTION in text
+        assert "Should I check out the hardware specs of the rig, or keep that strictly on-demand?" in text
+        assert TELEMETRY_DECLINED_ACK in text and "machine specs are now active" in text
+
+
+def test_telemetry_gate_absent_on_turns_one_to_three_and_hostname_note():
+    assert "hardware" not in onboarding_directive(HOST, first_turn=True, turn=1)
+    for turn in (2, 3):
+        text = onboarding_directive(HOST, first_turn=False, turn=turn)
+        assert "Telemetry Gate" not in text
+        assert "Looks like I'm running locally on workstation-01" in text
+        assert "strip sensitive data" in text
+
+
+def test_telemetry_gate_resolved_does_not_reask():
+    from strand.onboarding import TELEMETRY_GATE_QUESTION
+
+    for decision in (True, False):
+        text = onboarding_directive(HOST, first_turn=False, turn=5, telemetry_decision=decision)
+        assert TELEMETRY_GATE_QUESTION not in text and "Telemetry Gate (resolved)" in text
+
+
+def test_directive_has_no_cpu_ram_tokens_when_telemetry_disabled():
+    from strand.host import redact_host_context
+
+    redacted = redact_host_context(HOST)
+    for turn in (1, 2, 4):
+        text = onboarding_directive(redacted, first_turn=turn <= 1, turn=turn)
+        for token in ("Test CPU", "32 GB", "Fedora", "KDE", "wayland"):
+            assert token not in text
+
+
+def test_telemetry_preference_reads_latest_active_edge(tmp_path):
+    from strand.onboarding import telemetry_preference
+
+    async def go():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            assert await telemetry_preference(db) is None
+            nic = await db.upsert_entity("Nic", "person", "Operator")
+            on = await db.upsert_entity("Host Telemetry On-Demand", "preference", "x")
+            await db.upsert_edge(nic, on, "prefers")
+            first = await telemetry_preference(db)
+            yes = await db.upsert_entity("Host Telemetry Enabled", "preference", "x")
+            await db.upsert_edge(nic, yes, "prefers")
+            return first, await telemetry_preference(db)
+
+    assert run(go()) == (False, True)

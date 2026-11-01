@@ -17,6 +17,7 @@ import sqlite_vec
 from .common import DEFAULT_DEDUP_DISTANCE_THRESHOLD, EMBEDDING_DIM, MIN_EDGE_CONFIDENCE, aliases_of, load_metadata
 from .embed import Embedder, EmbeddingUnavailable
 from .logging import get_logger
+from .perms import secure_parent_dir
 from .schema import run_migrations
 
 logger = get_logger("db")
@@ -177,7 +178,7 @@ class DatabaseManager:
         if self._conn is not None:
             return
         self.db_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _chmod_quiet(self.db_path.parent, 0o700)
+        secure_parent_dir(self.db_path.parent)
         conn = await aiosqlite.connect(str(self.db_path))
         try:
             conn.row_factory = aiosqlite.Row
