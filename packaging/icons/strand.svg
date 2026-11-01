@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Strand</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2433"/>
+      <stop offset="1" stop-color="#0d1117"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" ry="28" fill="url(#bg)" stroke="#8aa4c8" stroke-opacity="0.55" stroke-width="2"/>
+  <!-- Three braided filaments crossing over a central conduit -->
+  <g fill="none" stroke-linecap="round" stroke-width="9">
+    <path d="M38 22 C38 46 90 54 90 64 C90 76 38 84 38 106" stroke="#2ee6c8"/>
+    <path d="M90 22 C90 46 38 54 38 64 C38 76 90 84 90 106" stroke="#7aa2ff"/>
+  </g>
+  <!-- Over-crossings: redraw segments to read as woven -->
+  <g fill="none" stroke-linecap="round" stroke-width="9">
+    <path d="M52 52 C60 57 68 57 76 52" stroke="#2ee6c8"/>
+    <path d="M52 76 C60 71 68 71 76 76" stroke="#7aa2ff"/>
+  </g>
+  <path d="M64 18 L64 110" fill="none" stroke="#f5f7fa" stroke-width="5" stroke-linecap="round" stroke-opacity="0.9"/>
+  <circle cx="64" cy="64" r="7" fill="#f5f7fa"/>
+</svg>

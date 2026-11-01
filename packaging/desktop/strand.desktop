@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Strand
+Comment=Sovereign Cognitive Working Memory Companion
+Exec=strand-gui
+Icon=strand
+Terminal=false
+Categories=Utility;Development;
+StartupWMClass=strand-gui
+StartupNotify=true

@@ -2,7 +2,7 @@
 #
 # Setup (per user, no root needed):
 #   pip install --user .                      # installs `strand`, `strand-gui` and strand.daemon
-#   mkdir -p ~/.config/strand ~/.local/share/strand
+#   mkdir -p ~/.config/strand ~/.local/share/strand ~/.cache/strand
 #   mkdir -p ~/.config/systemd/user && cp packaging/systemd/strand.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now strand
@@ -17,7 +17,7 @@ Description=Strand cognitive working-memory daemon
 
 [Service]
 Type=simple
-# Uses the python3 on the user's PATH, where `pip install --user` put the strand package.
+# Uses the python3 on the service PATH, where `pip install --user` put the strand package (or use %h/.local/bin/strand).
 ExecStart=/usr/bin/env python3 -m strand.daemon
 Restart=on-failure
 RestartSec=3
@@ -25,7 +25,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 RuntimeDirectory=strand
 RuntimeDirectoryMode=0700
-ReadWritePaths=%h/.config/strand %h/.local/share/strand %t/strand
+ReadWritePaths=%h/.config/strand %h/.local/share/strand %h/.cache/strand %t/strand
 PrivateTmp=true
 NoNewPrivileges=true
 

@@ -1,75 +1,117 @@
 # Strand UX & Ergonomics Observations Log
 
-This document tracks real-world friction points, visual bugs, design observations, and security/packaging findings captured during dogfooding sessions on ONYX.
+This document tracks real-world friction points, visual bugs, design observations, and security/packaging findings captured during dogfooding sessions on a development workstation.
 
 ---
 
 ## 1. Active Issues & Pre-Publishing Blockers (Triaged)
 
-### `SEC-PERM-001`: Indiscriminate Parent Directory `chmod 0700` — **RESOLVED**
-* **Component:** `src/strand/db.py`, `daemon.py`, `config.py` (`DatabaseManager.connect`, `prepare_socket`, `save_config_value`)
-* **Symptom:** Setting `STRAND_DB_PATH=~/memory.db` or pointing a socket directly at `~/strand.sock` causes Strand to execute `chmod 0700 ~`, altering permissions on the operator's entire `$HOME` directory.
-* **Root Cause:** POSIX permission enforcement calls `os.chmod(path.parent, 0o700)` blindly without verifying whether Strand created the directory or if it is a pre-existing root directory.
-* **Resolution (implemented):** new `src/strand/perms.py` (`is_managed_dir`, `secure_parent_dir`) is used by `DatabaseManager.connect`, `prepare_socket`, `save_config_value` and the GUI bridge config writer. A directory is Strand-managed only when its own name is `strand` (and it is not `$HOME`); only those get `chmod 0700`. Any other parent (`$HOME`, `/tmp`, arbitrary dirs) is never chmod-ed: a warning is logged if it is group/world accessible, while the DB/WAL/SHM, `config.json` and socket stay `0600`. Missing directories are still created with `mode=0o700`. Regression tests: `tests/test_perms.py`.
-* **Original Resolution Plan:**
-  * Enforce `0700` strictly on directories created and managed directly by Strand (e.g., `~/.config/strand`, `~/.local/share/strand`, `$XDG_RUNTIME_DIR/strand`).
-  * If the parent path is `$HOME` or an unmanaged directory, enforce permissions on the leaf file/socket (`0600`) and emit a warning rather than modifying parent directory permissions.
-
-### `ERG-PATH-004`: Relative Path Sandbox Resolution Under `systemd --user` (Resolved)
-* **Status:** Resolved.
-* **Component:** `src/strand/tools/workspace.py` (`is_safe_path`, `read_file`)
-* **Symptom:** Under `systemd --user`, the working directory defaults to `/home/<user>`. When an LLM executes a tool call using a relative path (e.g., `src/strand/proxy.py`), `Path.resolve()` evaluates it against `$HOME` rather than project directories, returning a false-positive sandbox error (`403: Path outside approved workspace`).
-* **Root Cause:** Relative path checking evaluates against `os.getcwd()` rather than iterating through configured `workspace_roots`.
+### `SEC-LOG-004`: Cleartext Entity and Deprecation Leaks at `INFO` Verbosity — **Resolved**
+* **Status:** Resolved. Per-entity and per-edge traces in `distill.py` (alias merge, consolidation, user-directed forgetting, edge-free inferred drops, `Deprecated edge ... reason=...`) and the `already deprecated` trace in `db.deprecate_edge` are now `logger.debug`. At `INFO`, distillation logs only session ids and aggregate counts (`Recorded episode id=... session=... entities=N edges=N deprecated=N [forgotten=N]`, plus the substantive/skipped gate lines). Tests: `tests/test_distill.py`, `tests/test_config_logging.py`; `tests/test_deprecation.py` and `tests/test_forgetting.py` now capture at `DEBUG` for the traces. No schema change.
+* **Component:** `src/strand/distill.py` (`process_exchange`, `_prune_deprecated_edges`)
+* **Symptom:** Matched entity names, relationship triples, and deprecation rationales are logged at `INFO` level. If an operator copies systemd journal output (`journalctl --user -u strand`) or terminal logs into a public bug tracker or forum, their personal entity graph is exposed.
+* **Root Cause:** Verbose pipeline tracing retained at standard production log levels.
 * **Resolution Plan:**
-  * In `is_safe_path()`, resolve relative paths against each declared entry in `config.workspace_roots` in addition to the current working directory.
-  * Allow execution if the candidate path cleanly resolves inside any approved root.
-* **Architectural Resolution:** `is_safe_path()` expands `~` first. Absolute paths are resolved and must be inside a root. Relative paths are resolved against each canonical root in order (an existing file wins, otherwise the first bounded candidate), then against `os.getcwd()`, accepted only if the result lands inside an approved root. `../` escapes from every candidate stay fail-closed (`access_denied`). `read_file` and `list_directory` share this resolver. No schema change. Regression tests live in `tests/test_tools.py`.
+  * Demote entity-level extraction logs, triple mappings, and deprecation details from `logger.info()` to `logger.debug()`.
+  * Ensure production `INFO` logging tracks strictly operational counts and session identifiers (e.g., `entities=2 edges=1`).
 
-### `OBS-ERG-003`: Stream Throughput Pacing & Grounding Transparency
-* **Component:** `src/strand/ui/bridge.py` & `main.qml`
-* **Symptom:** Flash-Lite delivers responses at 300–400 t/s, snapping multi-paragraph responses onto the screen in under 800 ms. The instant render feels visually jarring and obscures whether local memory retrieval took place.
-* **Exploration Paths:**
-  * Pacing: Implement thought-by-thought or natural block release (~60–80 t/s) in `bridge.py` rather than a brittle character-by-character typewriter simulation.
-  * Transparency: Briefly pulse the header indicator or traversed node pill for ~150 ms prior to stream release to signify local graph traversal.
+### `SEC-CLI-005`: Plaintext Embedded Credentials in Diagnostic Commands (Resolved)
+* **Status:** Resolved. `cli.mask_url` splits the URL with `urllib.parse.urlsplit` and rewrites the user-info as `user:********` (or `********` for a bare token). `strand config show` masks `upstream_url` and `extractor_url`; `strand doctor` masks the extractor URL and prints a masked upstream line. `strand config get <key>` stays raw by design. Unparseable input never raises.
+* **Component:** `src/strand/cli.py` (`cmd_doctor`, `cmd_config_show`)
+* **Symptom:** Running `strand doctor` or `strand config show` prints `upstream_url` and `extractor_url` directly to stdout. If an operator configures HTTP basic authentication (e.g., `https://user:pass@proxy.internal/v1`), credentials appear unmasked in terminal output, screenshots, and shell recordings.
+* **Root Cause:** URLs are output verbatim without splitting the user-info component.
+* **Resolution Plan:**
+  * Parse URLs through `urllib.parse.urlsplit` in diagnostic views.
+  * Mask password or token components (e.g., `https://user:••••••••@proxy.internal/v1`) before rendering to stdout.
 
-### `OBS-POL-005`: Epistemic Evolution & Dynamic Persona Anchor
+### `SEC-NET-006`: Unauthenticated Non-Loopback TCP Startup — **Resolved**
+* **Status:** Resolved. Fail-closed TCP policy: `daemon.enforce_bind_policy` raises `RuntimeError("Refusing to bind unauthenticated TCP on non-loopback interface ...")` when the transport is TCP, the host is not loopback and `api_key` is empty; `_run` logs a `SECURITY` error and exits via `SystemExit` before `build_app`. Override with `--insecure-allow-unauthenticated` or `STRAND_INSECURE_ALLOW_UNAUTHENTICATED=1|true|yes`: the loud `SECURITY` warning is logged and the server boots. UDS mode and loopback TCP (`127.*`, `localhost`, `::1`) are unaffected. No schema change. Tests: `tests/test_final_hardening.py`.
+* **Component:** `src/strand/daemon.py` (`warn_if_exposed`, `main`)
+* **Symptom:** When configured in TCP mode bound to an external or wildcard address (e.g., `0.0.0.0`), the daemon logs a security warning if `api_key` is blank, but still starts the server. This exposes the tool runner, local file inspection, and cognitive graph to any host on the local network without authentication.
+* **Root Cause:** Permissive warn-only fallback for non-loopback bindings.
+* **Resolution Plan:**
+  * If binding beyond loopback (`ipaddress.is_loopback` is False) with no `api_key` configured, refuse to start by default.
+  * Require an explicit CLI override (`--insecure-allow-unauthenticated`) to boot in open TCP mode.
+
+### `BUG-CLI-007`: Unhandled Traceback on Corrupt Node Metadata — **Resolved**
+* **Status:** Resolved. `cmd_inspect` now loads metadata through `common.load_metadata` (malformed JSON or non-object values yield `{}`), so aliases are never read from bad data. When the stored metadata is unparseable or not a JSON object, the `metadata:` line prints `{corrupted}` and the rest of the record (id, name, archetype, origin, confidence, summary, edges) renders normally with exit code 0. Valid metadata is unchanged. No schema change. Tests: `tests/test_cli.py`.
+* **Component:** `src/strand/cli.py` (`cmd_inspect`)
+* **Symptom:** Running `strand inspect <id>` on an entity whose metadata contains non-object or corrupt JSON causes a crash with an unhandled Python `json.decoder.JSONDecodeError` traceback.
+* **Root Cause:** Direct invocation of `json.loads()` instead of using the resilient `common.load_metadata()` helper.
+* **Resolution Plan:**
+  * Replace `json.loads` in `cmd_inspect` with `common.load_metadata`.
+  * Display a clean formatted fallback (`metadata: {corrupted}`) or graceful CLI warning rather than terminating with an unhandled exception.
+
+### `SEC-CONF-008`: Short Secret Masking Information Leak — **Resolved**
+* **Resolution:** `mask_secret` now fully masks any non-empty secret shorter than 16 characters as `********`; secrets of 16+ characters keep the first 3 and last 4 characters (`sk-...abcd`); empty/`None` returns `""`. Tests: `tests/test_config_logging.py`. Note: the function lives in `src/strand/cli.py`, not `config.py`.
+* **Component:** `src/strand/cli.py` (`mask_secret`)
+* **Symptom:** `mask_secret` retains the first and last few characters of any credential. For short bearer tokens or passwords (<16 chars), this exposes 7 out of 9 characters (e.g., `abc...fghi`), making short secrets trivial to reconstruct.
+* **Root Cause:** Fixed slice indexing without length threshold branching.
+* **Resolution Plan:**
+  * If the string length is under 16 characters, mask the credential entirely with a fixed string (`********`).
+  * Preserve head/tail reveals only for long tokens (>=16 chars) where entropy remains protected.
+
+### `OBS-POL-005`: Dynamic Persona Refinement & Long-Term Compaction (Phase 2)
 * **Component:** `src/strand/proxy.py`, `distill.py`, `compactor.py`
-* **Symptom:** The static `persona_prompt` in `config.json` is rigid and risks drifting from the operator's actual tone and cadence over weeks of use.
-* **Refined Policy:**
-  * Transient Bootstrap: Treat the factory `persona_prompt` as an ephemeral umbilical for Day Zero before deferring to dynamically distilled nodes.
-  * Continuous Evolution: Allow conversational critiques to deprecate old edges (`weight: 0.0`, `metadata.deprecated: true`) in favor of new directives, letting inactive traits decay naturally over time.
+* **Status:** Phase 1 complete (bedrock anchor, dynamic graph precedence, critique deprecation with permanence markers).
+* **Open Scope:** Phase 2 multi-episode compaction loop. Periodic synthesis should analyze multi-week conversational patterns, refine the operator profile, and gracefully decay inactive behavioral quirks.
 
 ---
 
 ## 2. Resolved Observations & Regressions
 
+### `PUB-INST-003`: Phase 3 Automated Linux Installer — **Resolved**
+* **Component:** `scripts/install.sh`, `README.md`
+* **Resolution:** Added an idempotent per-user installer: it exits 1 when run as root, verifies Python >= 3.11, `systemd --user` and `pipx` (with `dnf`/`apt`/`pacman` hints), pre-creates the Strand and XDG directories `0700` (avoids systemd `226/NAMESPACE`), runs `pipx install --force [--editable] .`, installs the desktop entry, icon and `strand.service` (ExecStart rewritten to `%h/.local/bin/strand daemon` because a pipx venv is invisible to `/usr/bin/env python3`), enables the service, warms the FastEmbed cache and runs `strand doctor`. No schema change; no new dependencies.
+
+### `PUB-PKG-002`: Desktop Packaging, GUI Decoupling & Docker Cleanup — **Resolved**
+* **Component:** `packaging/`, `src/strand/ui/app.py`
+* **Resolution:** Deleted the orphaned `packaging/docker/Dockerfile` (charter drift and an unauthenticated `0.0.0.0` reference) and scrubbed Docker mentions from `ARCHITECTURE.md`. Added `packaging/desktop/strand.desktop` and `packaging/icons/strand.svg`. `app.ensure_stdio()` makes `Terminal=false` launches safe when stdio is closed, and `main` returns an int exit code after `Bridge.shutdown()` joins all workers. No schema change.
+
+### `PUB-SAN-001`: Phase 1 Repository, Identity & Environment Sanitization Sweep — **Resolved**
+* **Component:** `src/strand/`, `tests/`, `packaging/systemd/strand.service`, docs
+* **Resolution:** Operator-specific names, homelab hostnames, home-directory paths and personal vehicle fixtures were replaced with neutral values (`Alice`, `Bob`, `workstation-01`, `Acme Sedan`, `Cruiser`, `Kestrel`, `W34`, `X60`). `strand.service` now uses `ExecStart=/usr/bin/env python3 -m strand.daemon` with `%h` specifiers only. `host.py` and `onboarding.py` derive identity from `getpass.getuser()`/`$USER`/`platform.node()` and fall back to `Operator`/`workstation`. No schema change; 683 offline tests pass under `-W error`.
+
+### `SEC-PERM-001`: Indiscriminate Parent Directory `chmod 0700` — **Resolved**
+* **Component:** `src/strand/db.py`, `daemon.py`, `config.py` (`DatabaseManager.connect`, `prepare_socket`, `save_config_value`)
+* **Resolution:** Added `perms.py` with `secure_parent_dir()`. Permissions are tightened strictly on directories named `strand` (and not `$HOME`). Unmanaged parents retain existing permissions with a warning emitted, while leaf files and sockets enforce `0600`.
+
+### `SEC-PRIV-003`: Resolver Internal API Default Parameter Boundary — **Resolved**
+* **Component:** `src/strand/resolver.py` (`match_entities`, `gather`, `_gather_with_roots`, `recent_continuity`, `personality_entities`)
+* **Resolution:** Every resolver entry point now defaults to `allow_private=False` (fail-closed); `resolve()` still passes the flag explicitly. Existing tests that exercise private entities already passed `allow_private=True` explicitly, so none needed changes. Added `test_helpers_fail_closed_without_allow_private` in `tests/test_resolver_vector.py`, asserting that omitting the argument hides private entities and their edges. No schema change.
+
 ### `SEC-PRIV-002`: Day-Zero Host Hardware Fingerprinting — **Resolved**
 * **Component:** `src/strand/proxy.py`, `host.py`, `config.py`, `session.py`, `ui/bridge.py`
-* **Symptom (was):** On Day Zero Strand injected the workstation's kernel/OS release, CPU model, RAM and hostname into the payload sent to the upstream model, with no opt-out.
-* **Resolution:** `Config.enable_host_telemetry` (default `False`; `STRAND_ENABLE_HOST_TELEMETRY`, `config.json`, `strand config get/set`, GUI `SETTINGS_KEYS`). Telemetry is allowed only if it is `True` or the session override (`SessionLedger.set_allow_host_telemetry`, driven by the `X-Strand-Host-Telemetry` header) is active. When disallowed, `host.redact_host_context` strips OS, desktop, CPU and RAM; the hostname is kept so `<Operator> --[operates_host]--> <Hostname>` anchoring still works. No schema changes. Tests: `tests/test_proxy.py`, `tests/test_config_logging.py`, `tests/test_onboarding.py`.
+* **Resolution:** `Config.enable_host_telemetry` defaults to `False`. When disabled, `host.redact_host_context` strips OS, CPU, RAM, and desktop specs, retaining only the hostname for `<Operator> --[operates_host]--> <Hostname>` topological anchoring. Outbound prompts include hardware telemetry only if explicitly opted into via settings or the `X-Strand-Host-Telemetry` header.
 
 ### `SEC-CACHE-003`: Shared `/tmp/fastembed_cache` Isolation — **Resolved**
-* **Component:** `src/strand/embed.py` (`EmbeddingManager`, `fastembed_cache_dir`, `ensure_cache_dir`), `cli.py` (`doctor`), `packaging/systemd/strand.service`
-* **Resolution:** `EmbeddingManager` now builds `TextEmbedding(model, cache_dir=...)` with an isolated cache: `$XDG_CACHE_HOME/strand/fastembed` when set (absolute), else `~/.cache/strand/fastembed`; `$FASTEMBED_CACHE_PATH` remains an explicit operator override. Before the model loads, `ensure_cache_dir` creates the directory with `mode=0o700` and re-applies `chmod 0700` (so a pre-existing loose directory is tightened); the parent `.../strand` dir is `0700` via `perms.secure_parent_dir`. `strand doctor` inspects this directory and reports its path whether cached or not. `strand.service` adds `%h/.cache/strand` to `ReadWritePaths`, so weights persist across restarts (independent of `PrivateTmp=true`). No schema changes.
+* **Component:** `src/strand/embed.py` (`EmbeddingManager`), `packaging/systemd/strand.service`
+* **Resolution:** `EmbeddingManager` routes weights to `~/.cache/strand/fastembed` (or `$XDG_CACHE_HOME`) with explicit `0700` POSIX permissions. Added `%h/.cache/strand` to `ReadWritePaths` in `strand.service`.
+
+### `ERG-PATH-004`: Relative Path Sandbox Resolution Under `systemd --user` — **Resolved**
+* **Component:** `src/strand/tools/workspace.py` (`is_safe_path`, `read_file`)
+* **Resolution:** In `is_safe_path()`, candidate relative paths are evaluated across all declared directories in `config.workspace_roots` in addition to `os.getcwd()`, preventing false-positive 403 sandbox rejections when running under `systemd --user` with `$HOME` as the working directory.
 
 ### `BUG-UI-001`: Input Dock Premature Wrap & Row-Height Jitter — **Resolved**
 * **Component:** `src/strand/ui/qml/main.qml` (`inputDock`, `messageInput`, `modelWatermark`)
-* **Resolution:** Collapsed `messageInput.rightPadding` to `14px` when text is present so typing uses the full dock width. Dock width stabilization removes the animation-wrap race condition.
+* **Resolution:** Collapsed `messageInput.rightPadding` to `14px` when text is present. Stabilized dock width to a centered container (`min(parent.width - 96, 760)`) with smooth vertical expansion.
 
 ### `OBS-UI-002`: Transcript Presentation (Unboxed Text vs. Cards) — **Resolved**
 * **Component:** `src/strand/ui/qml/main.qml`
-* **Resolution:** Assistant turns render as structured, recessed cards (`#13171f`, `1px` border, `radius: 12`) matching the conversational rhythm of user bubbles.
+* **Resolution:** Conversational text wraps into adaptive assistant bubbles, while code blocks and tables expand into full technical slate cards (`#0c0f14`), unified under a centralized theme object.
+
+### `OBS-ERG-003`: Stream Throughput Pacing & Grounding Transparency — **Resolved**
+* **Component:** `src/strand/ui/bridge.py` & `main.qml`
+* **Resolution:** Client-side token pacing implemented at ~67 tokens/sec with instant Tab-key flush. Added the `X-Strand-Grounding` ~150 ms header pip pulse to visually signify memory retrieval before stream rendering begins.
 
 ### `OBS-UI-006`: Diagnostics Slide-Out Legibility & Canvas Interference — **Resolved**
 * **Component:** `src/strand/ui/qml/main.qml` (`telemetryDrawer`)
 * **Resolution:** Retitled drawer header to "TELEMETRY", increased background fill opacity to `0.96` (`#0d1117`) to eliminate text bleed-through, and resolved margin collisions.
 
-### `OBS-POL-004` & `OBS-POL-006`: Operator Identity Stance & Day Zero Trapping — **Resolved**
+### `OBS-POL-004` & `OBS-POL-006`: Operator Identity Stance & Day Zero Anchoring — **Resolved**
 * **Component:** `src/strand/extractors.py`, `proxy.py`, `onboarding.py`
-* **Resolution:** Removed procedural regex name heuristics. Turn 1 opens with *"Hi, I'm Strand. What should I call you?"* without reflexively assuming `$USER`; if the operator is coy or indifferent ("whatever", "guess"), Strand may offer a cleaned-up name derived from the account name and ask if it works, so the conversation never stalls. Model B semantically identifies the operator name, tags it as `person` / `user_explicit` / `1.0`, binds the `operates_host` edge, and merges the generic `User` node and its edges into the operator.
-* **Integration note (SEC-PRIV-002):** Day-Zero onboarding prompts can now casually offer the operator an opt-in question (*"Should I check out your machine specs, or keep that strictly on-demand?"* (preceded by "I keep things private by default—I don't review your local computer's details unless you want me to.")). A yes toggles `session.allow_host_telemetry` for the live session and persists `enable_host_telemetry: True`; otherwise only the hostname is shared and the operator anchor is unaffected.
-* **Telemetry gate wired (OBS-POL-004 / OBS-POL-005 / SEC-PRIV-002):** `onboarding_directive(..., turn, telemetry_decision)` keeps Turns 1-3 free of hardware talk (Turn 1 opening line only; Turn 2/3 greeting, "Looks like I'm running locally on <Hostname>", the two-sentence mission and the domain-agnostic "What do you usually find yourself working on, creating, or exploring at this computer?"). On Turn 4/5 it adds the telemetry gate question (`TELEMETRY_GATE_QUESTION`) with graceful opt-in / opt-out handling (`TELEMETRY_DECLINED_ACK`), and stops asking once resolved. Model B distills the answer as `(<Operator>) --[prefers]--> (Host Telemetry Enabled | Host Telemetry On-Demand)` (`archetype: preference`; it never deprecates unrelated directives, traits or person attributes, only the opposite telemetry edge on a reversal). After distillation the proxy reads that edge (`onboarding.telemetry_preference`), calls `SessionLedger.set_allow_host_telemetry(session_id, choice)` so the very next turn carries (or withholds) the specs, and persists `enable_host_telemetry` with `save_config_value` (atomic, `0600`). No schema changes. Tests: `tests/test_onboarding.py`, `tests/test_proxy.py`, `tests/test_extractors.py`.
+* **Resolution:** Removed procedural regex name heuristics. Turn 1 prompts naturally without assuming `$USER`. Model B semantically identifies the operator name, tags it as `person` / `user_explicit` / `1.0`, binds the `operates_host` edge, and merges the generic `User` node and its edges into the operator.
 
 ### `OBS-MEM-006`: False Edge Deprecations on Historical Items — **Resolved**
 * **Component:** `src/strand/extractors.py`, `resolver.py`, `db.py`
-* **Resolution:** Distillation instructions now preserve chronological statements (e.g., prior vehicle ownership) as active `previously_owned` edges instead of marking them as deprecated. Added collection query expansions in `resolver.py` and a `strand revive-vehicles` repair command in `db.py`.
+* **Resolution:** Distillation instructions preserve chronological statements (e.g., prior vehicle ownership) as active `previously_owned` edges instead of marking them as deprecated. User first-person assertions receive `user_explicit` / `1.0` provenance, and archetype collection queries traverse active history edges.

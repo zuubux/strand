@@ -23,13 +23,13 @@ Strand is a headless system daemon that sits between your local frontends (edito
 Requires Python 3.11+ and Linux with systemd (user session).
 
 ```bash
-pip install -e .                   # install the daemon, CLI and GUI
-mkdir -p ~/.config/systemd/user && cp packaging/systemd/strand.service ~/.config/systemd/user/  # one-time: install the unit (edit ExecStart paths)
-systemctl --user start strand      # start the daemon
-strand doctor                      # check DB, sqlite-vec, fastembed, extractor and transport
+./scripts/install.sh               # one step: pipx install, desktop entry, icon, systemd user service, model warm-up, `strand doctor`
+./scripts/install.sh --editable    # same, but an editable pipx install for development
 strand chat                        # interactive terminal chat
 strand-gui                         # native desktop chat window
 ```
+
+The installer needs `pipx` (`dnf install pipx`, `apt install pipx` or `pacman -S python-pipx`), Python 3.11+ and a `systemd --user` session. It refuses to run as root and is safe to re-run.
 
 No systemd? Run it in the foreground with `strand daemon --diag`.
 
