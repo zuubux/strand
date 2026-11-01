@@ -239,7 +239,8 @@ def test_onboarding_has_no_procedural_name_anchor():
     assert not hasattr(onboarding, "anchor_operator_name")
     assert onboarding.OPENING_LINE == "Hi, I'm Strand. What should I call you?"
     text = onboarding.onboarding_directive({"hostname": "workstation-01"})
-    assert onboarding.OPENING_LINE in text and "do not use the Linux account name as a fallback" in text
+    assert onboarding.OPENING_LINE in text and "Do not reflexively default to the local account username ($USER)" in text
+    assert "you may conversationally suggest or offer a cleaned-up name" in text and "'whatever'" in text
 
 
 def test_telemetry_gate_directive_offers_opt_in_on_turn_four():
@@ -248,7 +249,8 @@ def test_telemetry_gate_directive_offers_opt_in_on_turn_four():
     for turn in (4, 5):
         text = onboarding_directive(HOST, first_turn=False, turn=turn)
         assert TELEMETRY_GATE_QUESTION in text
-        assert "Should I check out the hardware specs of the rig, or keep that strictly on-demand?" in text
+        assert "Should I check out your machine specs, or keep that strictly on-demand?" in text
+        assert "I don't review your local computer's details unless you want me to." in text
         assert TELEMETRY_DECLINED_ACK in text and "machine specs are now active" in text
 
 
@@ -259,6 +261,7 @@ def test_telemetry_gate_absent_on_turns_one_to_three_and_hostname_note():
         assert "Telemetry Gate" not in text
         assert "Looks like I'm running locally on workstation-01" in text
         assert "strip sensitive data" in text
+        assert "What do you usually find yourself working on, creating, or exploring at this computer?" in text
 
 
 def test_telemetry_gate_resolved_does_not_reask():

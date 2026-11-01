@@ -268,11 +268,12 @@ def test_day_zero_does_not_trigger_with_user_explicit_person(tmp_path, monkeypat
     assert "[Onboarding Directive" not in system
 
 
-def test_turn_one_directive_forces_name_question_and_forbids_user_fallback(tmp_path, monkeypatch):
+def test_turn_one_directive_forces_name_question_and_softens_user_fallback(tmp_path, monkeypatch):
     (system,) = _onboard_scenario(tmp_path, monkeypatch, [])
     assert "Hi, I'm Strand. What should I call you?" in system
-    assert "NEVER address the operator by their Linux account ($USER) name" in system
-    assert "do not use the Linux account name as a fallback" in system
+    assert "Do not reflexively default to the local account username ($USER)" in system
+    assert "if the operator is coy, deflects, or expresses indifference" in system
+    assert "Ask for their preferred name rather than assuming the Linux account name" in system
     assert "host workstation-01" in system  # specs stay ambient
 
 
