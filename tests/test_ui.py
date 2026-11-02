@@ -20,6 +20,29 @@ def qapp():
     return QGuiApplication.instance() or QGuiApplication([])
 
 
+@pytest.fixture(autouse=True)
+def _drain_bridges(monkeypatch):
+    """Shut down every Bridge a test creates and drain posted events before it is collected.
+
+    Worker threads and queued cross-thread signals must not outlive their Bridge, or a later
+    processEvents() can deliver into a destroyed QObject (intermittent segfault).
+    """
+    bridges = []
+    orig_init = Bridge.__init__
+
+    def tracking_init(self, *a, **k):
+        orig_init(self, *a, **k)
+        bridges.append(self)
+
+    monkeypatch.setattr(Bridge, "__init__", tracking_init)
+    yield
+    for b in bridges:
+        b.shutdown()
+        b._timer.stop()
+    QCoreApplication.processEvents()
+    QCoreApplication.sendPostedEvents(None, 0)
+
+
 def sse(*tokens, done=True):
     out = "".join(
         "data: " + json.dumps({"choices": [{"delta": {"content": t}}]}, ensure_ascii=False) + "\n\n" for t in tokens
@@ -967,15 +990,22 @@ def test_paced_turn_defers_finish_until_drained_and_flush_completes_it(qapp):
     threads = []
     orig = b._run_async
     b._run_async = lambda *a, **k: threads.append(orig(*a, **k)) or threads[-1]
-    b.sendMessage("go")
-    threads[0].join(5)
-    QCoreApplication.processEvents()
-    assert b.busy and ("done", None) not in events  # worker done, UI still draining
-    b.flush_stream()
-    QCoreApplication.processEvents()
-    assert events[-1] == ("done", None) and not b.busy
-    assert "".join(t for k, t in events if k == "chunk") == "".join(f"w{i} " for i in range(30))
-    assert b.history[-1]["content"] == "".join(f"w{i} " for i in range(30))
+    try:
+        b.sendMessage("go")
+        threads[0].join(5)
+        QCoreApplication.processEvents()
+        assert b.busy and ("done", None) not in events  # worker done, UI still draining
+        b.flush_stream()
+        QCoreApplication.processEvents()
+        assert events[-1] == ("done", None) and not b.busy
+        assert "".join(t for k, t in events if k == "chunk") == "".join(f"w{i} " for i in range(30))
+        assert b.history[-1]["content"] == "".join(f"w{i} " for i in range(30))
+    finally:
+        b.shutdown()
+        if b._timer.isActive():
+            b._timer.stop()
+        QCoreApplication.processEvents()
+        QCoreApplication.sendPostedEvents(None, 0)
 
 
 def test_pacing_disabled_is_passthrough(qapp):
