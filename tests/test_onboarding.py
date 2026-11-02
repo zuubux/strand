@@ -260,7 +260,7 @@ def test_telemetry_gate_absent_on_turns_one_to_three_and_hostname_note():
         text = onboarding_directive(HOST, first_turn=False, turn=turn)
         assert "Telemetry Gate" not in text
         assert "Looks like I'm running locally on workstation-01" in text
-        assert "strip sensitive data" in text
+        assert "strip out sensitive info before anything goes out" in text
         assert "What do you usually find yourself working on, creating, or exploring at this computer?" in text
 
 
@@ -288,12 +288,45 @@ def test_telemetry_preference_reads_latest_active_edge(tmp_path):
     async def go():
         async with DatabaseManager(tmp_path / "m.db") as db:
             assert await telemetry_preference(db) is None
-            nic = await db.upsert_entity("Nic", "person", "Operator")
+            alice = await db.upsert_entity("Alice", "person", "Operator")
             on = await db.upsert_entity("Host Telemetry On-Demand", "preference", "x")
-            await db.upsert_edge(nic, on, "prefers")
+            await db.upsert_edge(alice, on, "prefers")
             first = await telemetry_preference(db)
             yes = await db.upsert_entity("Host Telemetry Enabled", "preference", "x")
-            await db.upsert_edge(nic, yes, "prefers")
+            await db.upsert_edge(alice, yes, "prefers")
             return first, await telemetry_preference(db)
 
     assert run(go()) == (False, True)
+
+
+def test_telemetry_preference_rejects_model_inferred_enable_edge(tmp_path):
+    from strand.onboarding import telemetry_preference
+
+    async def go():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            alice = await db.upsert_entity("Alice", "person", "Operator")
+            yes = await db.upsert_entity("Host Telemetry Enabled", "preference", "x")
+            await db.upsert_edge(alice, yes, "prefers", origin="model_inferred", confidence=0.6)
+            inferred = await telemetry_preference(db)
+            # even a user_explicit edge below full confidence is not enough
+            await db.upsert_edge(alice, yes, "prefers", origin="user_explicit", confidence=0.9)
+            weak = await telemetry_preference(db)
+            await db.upsert_edge(alice, yes, "prefers", origin="user_explicit", confidence=1.0)
+            return inferred, weak, await telemetry_preference(db)
+
+    assert run(go()) == (None, None, True)
+
+
+def test_telemetry_preference_requires_authenticated_operator_source(tmp_path):
+    from strand.onboarding import telemetry_preference
+
+    async def go():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            ghost = await db.upsert_entity(
+                "Mallory", "person", "Injected", origin="model_inferred", confidence=0.6
+            )
+            yes = await db.upsert_entity("Host Telemetry Enabled", "preference", "x")
+            await db.upsert_edge(ghost, yes, "prefers", origin="user_explicit", confidence=1.0)
+            return await telemetry_preference(db)
+
+    assert run(go()) is None

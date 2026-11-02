@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 from strand.common import (
     BEDROCK_INVARIANT,
@@ -19,7 +20,7 @@ from strand.common import (
     is_private,
     load_metadata,
 )
-from strand.db import DatabaseManager
+from strand.db import PRIVATE_ENTITY_SQL, DatabaseManager
 from strand.embed import Embedder, EmbeddingUnavailable
 from strand.logging import get_logger
 from strand.session import SessionDelta, SessionLedger
@@ -352,6 +353,73 @@ def format_context_delta(
 _format_delta = format_context_delta
 
 
+@dataclass(frozen=True, slots=True)
+class _Indexed:
+    """One entity row with its match terms precomputed (PERF-RES-001)."""
+
+    row: Any
+    entity: Entity
+    terms: tuple[str, ...]  # casefolded name + aliases for the exact tier
+    tokens: tuple[str, ...]  # usable whole-word tokens for the fallback tier
+
+
+@dataclass(frozen=True, slots=True)
+class _Snapshot:
+    """Immutable entity/alias index valid for one (write_version, data_version) key."""
+
+    key: tuple[int, int] | None
+    entries: tuple[_Indexed, ...]
+    private_ids: frozenset[int]
+    public: tuple[_Indexed, ...]
+
+
+def _index_row(row) -> _Indexed:
+    names = (row["name"], *_aliases(row["metadata"]))
+    terms = tuple(
+        t.strip().casefold()
+        for t in names
+        if not (row["archetype"] == "concept" and len(t.split()) == 1 and is_stop_word(t))
+        and t.strip()
+    )
+    tokens: list[str] = []
+    for term in names:
+        for w in term.split():
+            token = w.casefold().strip(" \t\n.,;:!?\"'()[]{}")
+            if len(token) >= MIN_TOKEN_LENGTH and not is_stop_word(token) and token not in FUNCTION_WORDS:
+                tokens.append(token)
+    return _Indexed(row, _entity_from_row(row), terms, tuple(dict.fromkeys(tokens)))
+
+
+def _build_snapshot(key, rows, private_ids: frozenset[int]) -> _Snapshot:
+    entries = tuple(_index_row(r) for r in rows)
+    public = tuple(e for e in entries if e.entity.id not in private_ids)
+    return _Snapshot(key, entries, private_ids, public)
+
+
+def _lexical_hits(
+    haystack: str, entries: Iterable[_Indexed]
+) -> tuple[list[tuple[int, int, Entity]], list[tuple[int, int, Entity]]]:
+    """Exact (name/alias substring) and token-overlap hits as (first position, id, entity)."""
+    hits: list[tuple[int, int, Entity]] = []
+    token_hits: list[tuple[int, int, Entity]] = []
+    for item in entries:
+        positions = [p for t in item.terms if (p := _first_match(haystack, t)) >= 0]
+        if positions:
+            hits.append((min(positions), item.entity.id, item.entity))
+    exact_ids = {h[1] for h in hits}
+    for item in entries:
+        if item.entity.id in exact_ids:
+            continue
+        positions = [
+            m.start()
+            for token in item.tokens
+            if (m := re.search(rf"\b{re.escape(token)}\b", haystack)) is not None
+        ]
+        if positions:
+            token_hits.append((min(positions), item.entity.id, item.entity))
+    return hits, token_hits
+
+
 class ContextResolver:
     """Resolves a prompt to the graph neighbourhood the LLM has not seen yet this session."""
 
@@ -391,6 +459,48 @@ class ContextResolver:
         self.max_entities = max_entities
         self.embedder = embedder
         self.distance_threshold = distance_threshold
+        self._snapshot: _Snapshot | None = None
+        self.cache_loads = 0  # full entity-table loads (cache misses)
+        self.cache_hits = 0
+
+    async def _cache_key(self) -> tuple[int, int]:
+        """(in-process write_version, SQLite data_version).
+
+        `PRAGMA data_version` changes when *another* connection commits (e.g. `strand mark-private`
+        run from the CLI), so out-of-process privacy changes also invalidate the cache.
+        """
+        async with self.db.conn.execute("PRAGMA data_version") as cur:
+            row = await cur.fetchone()
+        return self.db.write_version, int(row[0])
+
+    async def _query_private_ids(self) -> frozenset[int]:
+        async with self.db.conn.execute(
+            f"SELECT en.id FROM entities AS en WHERE {PRIVATE_ENTITY_SQL.format(t='en')}"
+        ) as cur:
+            return frozenset(r[0] for r in await cur.fetchall())
+
+    async def _entity_snapshot(self) -> _Snapshot:
+        """Entity/alias index, reused until the database write version moves.
+
+        With decay enabled the access columns drive ranking and change on every recall, so the
+        index is rebuilt per request instead of cached.
+        """
+        key = None if self.decay_enabled else await self._cache_key()
+        snap = self._snapshot
+        if key is not None and snap is not None and snap.key == key:
+            self.cache_hits += 1
+            return snap
+        async with self.db.conn.execute(
+            "SELECT id, name, archetype, summary, metadata, origin, confidence, "
+            "access_count, last_accessed_at, created_at FROM entities ORDER BY id"
+        ) as cur:
+            rows = await cur.fetchall()
+        private = await self._query_private_ids()
+        snap = await asyncio.to_thread(_build_snapshot, key, rows, private)
+        self.cache_loads += 1
+        if key is not None:
+            self._snapshot = snap
+        return snap
 
     def _priority(self, item: Entity | Edge, now: datetime) -> float:
         weight = getattr(item, "weight", 1.0)
@@ -415,28 +525,12 @@ class ContextResolver:
         haystack = query.casefold()
         if not haystack.strip():
             return []
-        async with self.db.conn.execute(
-            "SELECT id, name, archetype, summary, metadata, origin, confidence, "
-            "access_count, last_accessed_at, created_at FROM entities ORDER BY id"
-        ) as cur:
-            rows = await cur.fetchall()
-        if not allow_private:
-            rows = [r for r in rows if not is_private(r["archetype"], r["metadata"])]
+        snap = await self._entity_snapshot()
+        entries = snap.entries if allow_private else snap.public
+        rows = [e.row for e in entries]
 
         collection = await self._operator_vehicles(haystack, rows) if _is_collection_query(haystack) else []
-        hits: list[tuple[int, int, Entity]] = []
-        for row in rows:
-            terms = (
-                t.strip().casefold()
-                for t in (row["name"], *_aliases(row["metadata"]))
-                if not (row["archetype"] == "concept" and len(t.split()) == 1 and is_stop_word(t))
-            )
-            positions = [p for t in terms if t and (p := _first_match(haystack, t)) >= 0]
-            if positions:
-                entity = _entity_from_row(row)
-                hits.append((min(positions), entity.id, entity))
-        exact_ids = {entity.id for _, _, entity in hits}
-        token_hits = [h for h in self._token_hits(haystack, rows) if h[2].id not in exact_ids]
+        hits, token_hits = await asyncio.to_thread(_lexical_hits, haystack, entries)
         # Rank: higher confidence first (user facts beat model-inferred noise), then exact
         # before token matches, then first mention in the query, then id.
         ranked = [(0, *h) for h in hits] + [(1, *h) for h in token_hits]
@@ -503,32 +597,12 @@ class ContextResolver:
             hits.append(entity)
         return hits[: self.max_entities - len(taken)]
 
-    @staticmethod
-    def _token_hits(haystack: str, rows: Iterable) -> list[tuple[int, int, Entity]]:
-        """Fallback: whole-word (`\\b`) overlap between query words and name/alias tokens."""
-        hits: list[tuple[int, int, Entity]] = []
-        for row in rows:
-            tokens = {
-                w.casefold()
-                for term in (row["name"], *_aliases(row["metadata"]))
-                for w in term.split()
-            }
-            positions = []
-            for token in tokens:
-                token = token.strip(" \t\n.,;:!?\"'()[]{}")
-                if len(token) < MIN_TOKEN_LENGTH or is_stop_word(token) or token in FUNCTION_WORDS:
-                    continue
-                if (m := re.search(rf"\b{re.escape(token)}\b", haystack)) is not None:
-                    positions.append(m.start())
-            if positions:
-                entity = _entity_from_row(row)
-                hits.append((min(positions), entity.id, entity))
-        return hits
-
     async def _private_ids(self) -> set[int]:
-        async with self.db.conn.execute("SELECT id, archetype, metadata FROM entities") as cur:
-            rows = await cur.fetchall()
-        return {r["id"] for r in rows if is_private(r["archetype"], r["metadata"])}
+        """Private entity ids: the cached set when fresh, else a direct `PRIVATE_ENTITY_SQL` query."""
+        snap = self._snapshot
+        if snap is not None and not self.decay_enabled and snap.key == await self._cache_key():
+            return set(snap.private_ids)
+        return set(await self._query_private_ids())
 
     @staticmethod
     def _edge_from_row(row) -> Edge:
@@ -554,7 +628,7 @@ class ContextResolver:
         return entities, edges
 
     async def _gather_with_roots(
-        self, query: str, allow_private: bool
+        self, query: str, allow_private: bool = False
     ) -> tuple[list[Entity], list[Edge], list[Entity]]:
         roots = await self.match_entities(query, allow_private)
         hidden = set() if allow_private else await self._private_ids()
@@ -582,7 +656,7 @@ class ContextResolver:
         return list(entities.values()), list(edges.values()), roots
 
     async def recent_continuity(
-        self, roots: list[Entity], session_id: str, allow_private: bool
+        self, roots: list[Entity], session_id: str, allow_private: bool = False
     ) -> tuple[list[int], list[tuple[str, str]]]:
         """Novel recent episodes for the matched `roots`: (episode ids, (date, narrative) pairs).
 
@@ -686,6 +760,9 @@ class ContextResolver:
             self.ledger.mark_episodes_seen(session_id, episode_ids)
         if delta.is_empty and not discrepancies and not continuity:
             return ""  # a discrepancy is re-flagged whenever the query repeats it, ledger unchanged
-        return format_context_delta(
+        text = format_context_delta(
             entities, edges, delta, self.persona_prompt, discrepancies, continuity
         )
+        if not delta.is_empty:  # ERG-CTX-005: keep it replayable if the client drops our prompt
+            self.ledger.remember_context(session_id, text, delta.entity_ids, delta.edge_ids)
+        return text

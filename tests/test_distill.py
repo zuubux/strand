@@ -4,6 +4,7 @@ import logging
 
 import httpx
 
+from strand.common import MAX_NARRATIVE_LEN, MAX_SUMMARY_LEN
 from strand.config import Config
 from strand.db import DatabaseManager
 from strand.distill import DistillationEngine, is_substantive_exchange, strip_markdown_structure
@@ -96,7 +97,7 @@ def test_is_substantive_exchange_trivial_vs_substantive():
         "Marcus is SRE Lead",
         "my VIN is WBAHD6322",
         "remember that Atlas ships Friday",
-        "My car is a BMW E34",
+        "My car is a Acme W34",
         "Marcus agreed to lead the database migration scheduled for Tuesday",
     ]:
         assert is_substantive_exchange(q, reply), q
@@ -138,13 +139,13 @@ def test_short_fact_assertion_passes_gate_and_extracts(tmp_path):
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
             episode_id = await DistillationEngine(db).process_exchange(
-                "s", "My car is a BMW E34", "Got it. The BMW E34 is a classic 5 Series."
+                "s", "My car is a Acme W34", "Got it. The Acme W34 is a classic Sedan."
             )
             return episode_id, await _rows(db, "SELECT name FROM entities"), await _rows(db, "SELECT id FROM episodes")
 
     episode_id, entities, episodes = run(scenario())
     assert episode_id is not None and len(episodes) == 1
-    assert any("BMW" in name for (name,) in entities)
+    assert any("Acme" in name for (name,) in entities)
 
 
 def _proxy_scenario(tmp_path, upstream_handler, payload):
@@ -209,14 +210,14 @@ def test_proxy_upstream_error_does_not_distill(tmp_path):
     assert entities == [] and episodes == []
 
 
-BMW_QUERY = "My primary project car is a 1995 BMW 540i with an M60 V8. Remember that."
-BMW_RESPONSE = "Got it. Whenever you ask, I will recall it. Classic choice."
+Acme_QUERY = "My primary project car is a 1995 Acme X540 with an X60 V8. Remember that."
+Acme_RESPONSE = "Got it. Whenever you ask, I will recall it. Classic choice."
 
 
 def test_heuristic_links_car_to_engine_and_filters_noise(tmp_path):
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
-            await DistillationEngine(db).process_exchange("s", BMW_QUERY, BMW_RESPONSE)
+            await DistillationEngine(db).process_exchange("s", Acme_QUERY, Acme_RESPONSE)
             return (
                 await _rows(db, "SELECT name, origin, confidence FROM entities"),
                 await _rows(
@@ -228,15 +229,15 @@ def test_heuristic_links_car_to_engine_and_filters_noise(tmp_path):
 
     entities, edges = run(scenario())
     names = {n for n, _, _ in entities}
-    assert {"BMW 540i", "M60 V8"} <= names
+    assert {"Acme X540", "X60 V8"} <= names
     assert all(o == "user_explicit" and c == 1.0 for _, o, c in entities)
-    assert ("BMW 540i", "M60 V8", "has_engine", 1.0, "user_explicit", 1.0) in edges
+    assert ("Acme X540", "X60 V8", "has_engine", 1.0, "user_explicit", 1.0) in edges
     assert not {n.lower() for n in names} & {"remember", "got", "whenever", "classic", "my"}
     assert len(names) == 2
 
 
-CAR_QUERY = "My primary project car is a 1995 BMW 540i with an M60 V8"
-CAR_RESPONSE = "Great, a 1995 BMW 540i with an M60 V8 is a classic."
+CAR_QUERY = "My primary project car is a 1995 Acme X540 with an X60 V8"
+CAR_RESPONSE = "Great, a 1995 Acme X540 with an X60 V8 is a classic."
 
 
 def test_multiword_entity_gets_constituent_aliases(tmp_path):
@@ -246,32 +247,32 @@ def test_multiword_entity_gets_constituent_aliases(tmp_path):
             return await _rows(db, "SELECT name, metadata FROM entities")
 
     metadata = {name: json.loads(meta) for name, meta in run(scenario())}
-    assert "BMW 540i" in metadata
-    assert {"BMW", "540i"} <= set(metadata["BMW 540i"]["aliases"])
+    assert "Acme X540" in metadata
+    assert {"Acme", "X540"} <= set(metadata["Acme X540"]["aliases"])
 
 def test_single_token_candidate_consolidates_into_existing_multiword_entity(tmp_path):
     async def extractor(query, response):
         return {
-            "entities": [{"name": "BMW", "archetype": "vehicle"}, {"name": "Marcus"}],
-            "edges": [{"source": "Marcus", "target": "BMW", "relation": "drives"}],
+            "entities": [{"name": "Acme", "archetype": "vehicle"}, {"name": "Marcus"}],
+            "edges": [{"source": "Marcus", "target": "Acme", "relation": "drives"}],
         }
 
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
             await DistillationEngine(db).process_exchange("s", CAR_QUERY, CAR_RESPONSE)
-            await db.conn.execute("UPDATE entities SET updated_at = '2000-01-01 00:00:00' WHERE name = 'BMW 540i'")
+            await db.conn.execute("UPDATE entities SET updated_at = '2000-01-01 00:00:00' WHERE name = 'Acme X540'")
             await db.conn.commit()
             await DistillationEngine(db, extractor=extractor).process_exchange("s2", CAR_QUERY, CAR_RESPONSE)
             return (
                 await _rows(db, "SELECT name FROM entities"),
-                await _rows(db, "SELECT updated_at FROM entities WHERE name = 'BMW 540i'"),
+                await _rows(db, "SELECT updated_at FROM entities WHERE name = 'Acme X540'"),
                 await _rows(db, "SELECT e.name FROM edges g JOIN entities e ON e.id = g.target_id WHERE g.relation = 'drives'"),
             )
 
     names, updated, targets = run(scenario())
-    assert "BMW" not in {n for (n,) in names}
+    assert "Acme" not in {n for (n,) in names}
     assert updated != [("2000-01-01 00:00:00",)]
-    assert ("BMW 540i",) in targets
+    assert ("Acme X540",) in targets
 
 
 
@@ -280,8 +281,8 @@ def test_edge_free_inferred_entities_are_never_persisted(tmp_path):
     async def extractor(query, response):
         return {
             "entities": [
-                {"name": "BMW Longlife-01", "archetype": "concept", "origin": "model_inferred"},
-                {"name": "BMW", "archetype": "vehicle", "origin": "model_inferred"},
+                {"name": "Acme Longlife-01", "archetype": "concept", "origin": "model_inferred"},
+                {"name": "Acme", "archetype": "vehicle", "origin": "model_inferred"},
                 {"name": "Ada", "archetype": "person", "origin": "model_inferred"},
                 {"name": "Zed", "archetype": "person", "origin": "user_explicit", "confidence": 1.0},
             ],
@@ -298,7 +299,7 @@ def test_edge_free_inferred_entities_are_never_persisted(tmp_path):
             )
 
     names, _ = run(scenario())
-    assert not names & {"BMW Longlife-01", "BMW"}
+    assert not names & {"Acme Longlife-01", "Acme"}
     assert {"Ada", "Engine", "Zed"} <= names  # connected inferred + user_explicit kept
 
 
@@ -307,12 +308,12 @@ def test_resolver_matches_alias_token_and_returns_engine_edge(tmp_path):
         async with DatabaseManager(tmp_path / "m.db") as db:
             await DistillationEngine(db).process_exchange("s", CAR_QUERY, CAR_RESPONSE)
             resolver = ContextResolver(db)
-            matched = await resolver.match_entities("servicing the BMW this weekend")
-            return [e.name for e in matched], await resolver.resolve("servicing the BMW", "s2")
+            matched = await resolver.match_entities("servicing the Acme this weekend")
+            return [e.name for e in matched], await resolver.resolve("servicing the Acme", "s2")
 
     names, context = run(scenario())
-    assert "BMW 540i" in names
-    assert "BMW 540i -has_engine-> M60 V8" in context
+    assert "Acme X540" in names
+    assert "Acme X540 -has_engine-> X60 V8" in context
 
 
 def test_resolver_token_fallback_without_aliases_and_ignores_short_tokens(tmp_path):
@@ -331,33 +332,33 @@ def test_resolver_token_fallback_without_aliases_and_ignores_short_tokens(tmp_pa
 def test_token_match_outranks_inferred_exact_noise(tmp_path):
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
-            car = await db.upsert_entity("BMW 540i", "vehicle", "")
-            engine = await db.upsert_entity("M60 V8", "system", "")
+            car = await db.upsert_entity("Acme X540", "vehicle", "")
+            engine = await db.upsert_entity("X60 V8", "system", "")
             await db.upsert_edge(car, engine, "has_engine")
-            for noise in ("BMW", "Engine", "Weight", "Capacity", "Look"):
+            for noise in ("Acme", "Engine", "Weight", "Capacity", "Look"):
                 await db.upsert_entity(noise, "concept", "", origin="model_inferred", confidence=0.6)
             resolver = ContextResolver(db, max_entities=5)
-            query = "What engine oil weight and capacity should I look for servicing the BMW?"
+            query = "What engine oil weight and capacity should I look for servicing the Acme?"
             return [e.name for e in await resolver.match_entities(query)], await resolver.resolve(query, "s")
 
     names, context = run(scenario())
-    assert names[0] == "BMW 540i"
-    assert "BMW 540i -has_engine-> M60 V8" in context
+    assert names[0] == "Acme X540"
+    assert "Acme X540 -has_engine-> X60 V8" in context
 
 
 def test_ungrounded_and_filler_model_entities_are_dropped(tmp_path):
     response = (
         "Important Tip: Capacity and Weight matter. Feel free to ask. Note that Classic cars vary. "
-        "The M60 V8 uses Nikasil. Zephyr manages Orion."
+        "The X60 V8 uses Nikasil. Zephyr manages Orion."
     )
 
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
-            await DistillationEngine(db).process_exchange("s", "Tell me about the M60 V8 engine", response)
+            await DistillationEngine(db).process_exchange("s", "Tell me about the X60 V8 engine", response)
             return {r[0] for r in await _rows(db, "SELECT name FROM entities")}
 
     names = run(scenario())
-    assert "M60 V8" in names
+    assert "X60 V8" in names
     assert not names & {"Important Tip", "Capacity", "Weight", "Feel", "Note", "Classic", "Zephyr", "Orion"}
 
 
@@ -372,7 +373,7 @@ def test_grounded_assistant_entity_linked_to_user_topic_is_kept():
 def test_markdown_headings_and_bold_labels_do_not_become_entities(tmp_path):
     response = (
         "### Recommended Spark Plugs\n"
-        "Use NGK plugs in the M60 V8.\n\n"
+        "Use NGK plugs in the X60 V8.\n\n"
         "## Torque Specification\n"
         "**Torque:** 22 ft-lb\n"
         "**Recommended Spark Plugs:**\n"
@@ -381,7 +382,7 @@ def test_markdown_headings_and_bold_labels_do_not_become_entities(tmp_path):
 
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
-            await DistillationEngine(db).process_exchange("s", "What spark plugs and torque spec for the M60 V8?", response)
+            await DistillationEngine(db).process_exchange("s", "What spark plugs and torque spec for the X60 V8?", response)
             return {r[0] for r in await _rows(db, "SELECT name FROM entities")}
 
     names = run(scenario())
@@ -393,7 +394,7 @@ def test_structural_section_terms_are_filler():
 
     for name in ("Torque Specification", "Torque Specifications", "Tips", "Overview", "Instructions", "Recommendations"):
         assert is_filler_name(name), name
-    assert not is_filler_name("Spark Plugs") and not is_filler_name("M60 V8")
+    assert not is_filler_name("Spark Plugs") and not is_filler_name("X60 V8")
     assert strip_markdown_structure("### Torque Specification\nNGK plugs") .strip() == "NGK plugs"
 
 
@@ -523,9 +524,9 @@ def test_critique_deprecates_edge_keeps_nodes_and_is_idempotent(tmp_path):
 
     extraction = {
         "entities": [{"name": "no-diff-summaries", "archetype": "directive", "summary": "Never summarize diffs"}],
-        "edges": [{"source": "Nic", "target": "no-diff-summaries", "relation": "demands"}],
+        "edges": [{"source": "Alice", "target": "no-diff-summaries", "relation": "demands"}],
         "deprecated_edges": [
-            {"source": "Nic", "target": "diff-summaries", "relation": "prefers", "reason": "stopped"}
+            {"source": "Alice", "target": "diff-summaries", "relation": "prefers", "reason": "stopped"}
         ],
     }
 
@@ -534,14 +535,14 @@ def test_critique_deprecates_edge_keeps_nodes_and_is_idempotent(tmp_path):
 
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
-            nic = await db.upsert_entity("Nic", "person", "", origin="user_explicit")
+            alice = await db.upsert_entity("Alice", "person", "", origin="user_explicit")
             old = await db.upsert_entity("diff-summaries", "preference", "Summarize diffs", origin="user_explicit")
-            await db.upsert_edge(nic, old, "prefers")
+            await db.upsert_edge(alice, old, "prefers")
             engine = DistillationEngine(db, extractor=extractor)
             await engine.process_exchange("s", "Stop summarizing diffs from now on", "Understood, I will stop summarizing diffs and show them in full.")
             await engine.process_exchange("s", "Stop summarizing diffs from now on", "Understood, I will stop summarizing diffs and show them in full.")
             async with db.conn.execute(
-                "SELECT weight, metadata FROM edges WHERE source_id = ? AND target_id = ?", (nic, old)
+                "SELECT weight, metadata FROM edges WHERE source_id = ? AND target_id = ?", (alice, old)
             ) as cur:
                 edge = await cur.fetchone()
             async with db.conn.execute(
@@ -559,3 +560,97 @@ def test_critique_deprecates_edge_keeps_nodes_and_is_idempotent(tmp_path):
     assert _json.loads(edge["metadata"])["deprecated"] is True
     assert nodes == [("preference", "user_explicit"), ("directive", "model_inferred")]  # old node survives
     assert fresh == [1.0]
+
+
+_PRIVATE_EXTRACTION = {
+    "entities": [{"name": "no-diff-summaries", "archetype": "directive", "summary": "Never summarize diffs"}],
+    "edges": [{"source": "Alice", "target": "no-diff-summaries", "relation": "demands"}],
+    "deprecated_edges": [
+        {"source": "Alice", "target": "diff-summaries", "relation": "prefers", "reason": "stopped-summaries-reason"}
+    ],
+}
+_PRIVATE_STRINGS = ("Alice", "no-diff-summaries", "diff-summaries", "stopped-summaries-reason", "demands", "prefers")
+
+
+def _distill_private(tmp_path, extraction=_PRIVATE_EXTRACTION):
+    async def extractor(query, response):
+        return extraction
+
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            alice = await db.upsert_entity("Alice", "person", "", origin="user_explicit")
+            old = await db.upsert_entity("diff-summaries", "preference", "Summarize diffs", origin="user_explicit")
+            await db.upsert_edge(alice, old, "prefers")
+            engine = DistillationEngine(db, extractor=extractor)
+            for _ in range(2):  # second pass hits the already-deprecated path
+                await engine.process_exchange(
+                    "s",
+                    "Stop summarizing diffs from now on",
+                    "Understood, I will stop summarizing diffs and show them in full.",
+                )
+
+    asyncio.run(scenario())
+
+
+def test_info_logs_are_operational_summaries_without_graph_data(tmp_path, caplog):
+    with caplog.at_level(logging.INFO, logger="strand"):
+        _distill_private(tmp_path)
+    info_text = "\n".join(r.getMessage() for r in caplog.records if r.name.startswith("strand"))
+    assert "Recorded episode" in info_text and "entities=" in info_text and "deprecated=1" in info_text
+    for secret in _PRIVATE_STRINGS:
+        assert secret not in info_text
+    assert all(r.levelno >= logging.INFO for r in caplog.records)
+
+
+def test_debug_logs_still_carry_extraction_traces(tmp_path, caplog):
+    with caplog.at_level(logging.DEBUG, logger="strand"):
+        _distill_private(tmp_path)
+    text = caplog.text
+    assert "Deprecated edge" in text and "stopped-summaries-reason" in text
+    assert "already deprecated" in text
+    assert any(r.levelno == logging.INFO and "Recorded episode" in r.getMessage() for r in caplog.records)
+    assert all(r.levelno == logging.DEBUG for r in caplog.records if "Deprecated edge" in r.getMessage())
+
+
+def test_forgetting_and_dedup_traces_are_debug_only(tmp_path, caplog):
+    async def extractor(query, response):
+        return {"forgotten_entities": ["SecretProject"], "entities": [], "edges": []}
+
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            await db.upsert_entity("SecretProject", "project", "hidden", origin="user_explicit")
+            await db.upsert_entity("Keep", "project", "kept", origin="user_explicit")
+            await DistillationEngine(db, extractor=extractor).process_exchange(
+                "s", "Forget SecretProject entirely please", "Okay, I have forgotten SecretProject as requested."
+            )
+
+    with caplog.at_level(logging.INFO, logger="strand"):
+        asyncio.run(scenario())
+    assert "SecretProject" not in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="strand"):
+        asyncio.run(scenario())
+    assert "SecretProject" in caplog.text
+
+
+def test_json_block_summary_and_narrative_are_clamped(tmp_path):
+    blob = "x" * 50_000
+
+    async def extractor(query, response):
+        return {
+            "entities": [{"name": "Atlas", "archetype": "project", "summary": blob}],
+            "edges": [{"source": "Marcus", "target": "Atlas", "relation": "manages"}],
+            "summary": blob,
+        }
+
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            await DistillationEngine(db, extractor).process_exchange("s", QUERY, RESPONSE)
+            return (
+                await _rows(db, "SELECT summary FROM entities WHERE name = 'Atlas'"),
+                await _rows(db, "SELECT narrative FROM episodes"),
+            )
+
+    summaries, narratives = run(scenario())
+    assert summaries == [("x" * MAX_SUMMARY_LEN,)]
+    assert narratives and all(len(n) <= MAX_NARRATIVE_LEN for (n,) in narratives)

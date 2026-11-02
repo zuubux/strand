@@ -7,20 +7,58 @@ dependency graph).
 import json
 import re
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 EMBEDDING_DIM = 384
+
+URL_MASK = "********"
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
+
+
+def mask_url(url: str | None) -> str:
+    """Hide embedded URL credentials: `user:pw@host` -> `user:********@host` (SEC-CLI-005).
+
+    A bare token (`token@host`) is fully masked. Never raises; an unparseable URL that
+    contains `@` is reduced to its host-side part behind the mask.
+    """
+    if not url:
+        return ""
+    try:
+        parts = urlsplit(url)
+        userinfo, at, hostport = parts.netloc.rpartition("@")
+        if not at:
+            return url
+        user, colon, _password = userinfo.partition(":")
+        masked = f"{user}:{URL_MASK}" if colon else URL_MASK
+        return urlunsplit(parts._replace(netloc=f"{masked}@{hostport}"))
+    except ValueError:
+        if "@" in url:
+            return f"{URL_MASK}@{url.rpartition('@')[2]}"
+        return url
+
+
+def safe_exc(exc: BaseException) -> str:
+    """Render an exception without leaking URL credentials (SEC-NET-008).
+
+    httpx embeds the full request URL (including `user:pw@`) in several exception strings;
+    every URL found in the text is passed through `mask_url`.
+    """
+    text = _URL_RE.sub(lambda m: mask_url(m.group(0)), str(exc))
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
 
 # Personality Matrix archetypes: interaction rules stored as ordinary entity rows.
 PERSONALITY_ARCHETYPES = frozenset({"trait", "directive", "preference"})
 BEDROCK_INVARIANT = (
-    "You are Strand, a sovereign, local-first cognitive companion running directly on the operator's machine. "
-    "Be authentic, technically rigorous, and direct. Never apologize. Never use conversational filler."
+    "You are Strand, running locally on the operator's machine. "
+    "Be direct, plain-spoken, and technically sharp. Never apologize. Never use corporate filler or polite fluff."
 )
 FACTUAL_ARCHETYPES = frozenset({"person", "project", "system", "vehicle", "concept"})
 VALID_ARCHETYPES = FACTUAL_ARCHETYPES | PERSONALITY_ARCHETYPES
 MIN_EDGE_CONFIDENCE = 0.2  # edges below this are treated as deprecated and never recalled
 MODEL_CONFIDENCE = 0.6  # default confidence for facts the assistant (not the user) asserted
 MAX_SUMMARY_LEN = 300
+MAX_NARRATIVE_LEN = 600  # hard ceiling for episodes.narrative (SEC-MEM-008)
 # Tight L2 cutoff (~cosine similarity 0.90) for merging near-duplicate entities on ingestion.
 DEFAULT_DEDUP_DISTANCE_THRESHOLD = 0.45
 DEFAULT_COMPACTION_THRESHOLD_HOURS = 24.0

@@ -13,7 +13,9 @@ import getpass
 import json
 import os
 import re
+import sqlite3
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -32,8 +34,12 @@ from strand.config import (
     _read_file,
     _validate_half_life,
     default_config_path,
+    engine_updates,
+    is_engine_configured,
     load_config,
+    save_config,
 )
+from strand.db import _ACTIVE, PRIVATE_ENTITY_SQL
 from strand.perms import secure_parent_dir
 from strand.onboarding import ONBOARD_TRIGGER, ONBOARDING_HEADER, ONBOARDING_MODE
 
@@ -43,6 +49,9 @@ CHAT_PATH = "/v1/chat/completions"
 PRIVATE_HEADER = "X-Strand-Allow-Private"
 HISTORY_LIMIT = 100
 EXTRACTOR_TIMEOUT = 1.5
+MODEL_PROBE_TIMEOUT = 3.0
+EXTRACTOR_TAGS_TIMEOUT = 2.0
+NON_CHAT_MODEL_RE = re.compile(r"embed|bge|whisper|tts|dall-e|moderation", re.IGNORECASE)
 # Keys the Settings modal may persist to config.json, with their value kind.
 SETTINGS_KEYS: dict[str, str] = {
     "persona_prompt": "str",
@@ -53,7 +62,6 @@ SETTINGS_KEYS: dict[str, str] = {
     "extractor_model": "str",
     "decay_enabled": "bool",
     "decay_half_life_days": "float",
-    "fail_closed_private": "bool",
     "redact_secrets": "bool",
     "enable_host_telemetry": "bool",
 }
@@ -63,6 +71,8 @@ PACE_TOKENS_PER_SEC = 67.0  # ~65-70 t/s (~270 chars/s): ~1.07 token (~4-5 chars
 PACE_INTERVAL_MS = 16
 CHARS_PER_TOKEN = 4
 GROUNDING_HEADER_NAME = "X-Strand-Grounding"
+GROUNDING_STRIKE_MS = 150  # transient submit-to-first-chunk flash (3-beat conduit, beat 1)
+DISTILL_HOLD_MS = 1800  # Model B weave window shown after a stream completes (beat 3)
 GROUNDING_HOLD_S = 0.15  # grounded turns: the pulse is perceptible before the first token
 GROUNDING_RE = re.compile(r"(\w+)=(\d+)")
 TABLE_LINE_RE = re.compile(r"^[ \t]*\|.*\|[ \t]*$")
@@ -70,10 +80,73 @@ KV_LINE_RE = re.compile(r"^[ \t]*[A-Za-z_][\w.-]*[ \t]*(?::|=)[ \t]+\S")
 PARAGRAPH_SPLIT_RE = re.compile(r"\n[ \t]*\n")
 COMMAND_RE = re.compile(r"^/([A-Za-z]+)(?:[ \t]+(.*))?$", re.DOTALL)
 FENCE_RE = re.compile(r"^[ \t]{0,3}```[ \t]*([\w+.#-]*)[ \t]*$")
+# Markdown images (`![alt](url)`, `![alt][ref]`, `![alt]`): Qt Quick fetches these over the network.
+IMAGE_RE = re.compile(r"!\[([^\]]*)\](?:\((?:[^()]|\([^()]*\))*\)|\[[^\]]*\])?")
 HELP_TEXT = (
     "Commands: /new (fresh session), /private on|off (send X-Strand-Allow-Private), "
     "/model <name> (switch model), /onboard (fresh session, Strand opens the grounding conversation), /help. Ctrl+L new session, Ctrl+D diagnostics, Esc stop/clear."
 )
+
+
+def parse_model_names(payload: Any, ollama: bool = False) -> list[str]:
+    """Chat-capable model ids from an OpenAI `/models` or Ollama `/api/tags` body."""
+    if ollama:
+        items, keys = payload.get("models", []), ("name", "model")
+    else:
+        items, keys = payload.get("data", []), ("id", "name")
+    names: list[str] = []
+    for item in items:
+        name = next((str(item[k]).strip() for k in keys if item.get(k)), "")
+        if name and not NON_CHAT_MODEL_RE.search(name) and name not in names:
+            names.append(name)
+    return names
+
+
+# Lightweight upstream models are recognised by pattern, never by a pinned version string.
+LIGHTWEIGHT_KEYWORDS = ("lite", "flash", "mini", "haiku", "nano", "small")
+_HEAVY_MODEL_WORDS = frozenset({"o1", "o3", "r1", "opus", "reasoning"})
+_LOCAL_LIGHT_WORDS = frozenset({"3b", "7b", "14b", "small", "mini"})
+
+
+def _model_words(model_id: str) -> set[str]:
+    return set(re.split(r"[^a-z0-9]+", model_id.lower()))
+
+
+def _model_sort_key(model_id: str, default_model: str) -> tuple:
+    """Sort key: pinned default, then `lite`, then other lightweight, standard, heavy/reasoning.
+
+    Keywords are matched as whole tokens (so `gemini` is not `mini`); within a tier ids sort
+    reverse-alphabetically, so newer versions come first.
+    """
+    words = _model_words(model_id)
+    if model_id == default_model:
+        tier = 0
+    elif words & _HEAVY_MODEL_WORDS:
+        tier = 4
+    elif "lite" in words:
+        tier = 1
+    elif words & set(LIGHTWEIGHT_KEYWORDS):
+        tier = 2
+    else:
+        tier = 3
+    return (tier, tuple(-ord(c) for c in model_id) + (0,))
+
+
+def pick_lightweight_model(models: list[str]) -> str:
+    """First lightweight model in `models`, preferring `lite`, then `flash`; empty if none match."""
+    for preferred in ("lite", "flash"):
+        for model in models:
+            if preferred in _model_words(model):
+                return model
+    for model in models:
+        if _model_words(model) & set(LIGHTWEIGHT_KEYWORDS):
+            return model
+    return ""
+
+
+def _extractor_sort_key(model_id: str) -> tuple:
+    """Small local models (3b/7b/14b/small/mini) first, then alphabetical."""
+    return (0 if _model_words(model_id) & _LOCAL_LIGHT_WORDS else 1, model_id)
 
 
 def operator_name(env: Mapping[str, str] | None = None) -> str:
@@ -100,6 +173,20 @@ def parse_command(text: str) -> tuple[str, str] | None:
     if not match:
         return None
     return match.group(1).lower(), (match.group(2) or "").strip()
+
+
+def neutralize_images(text: str) -> str:
+    """Replace Markdown image syntax with inert text so Qt Quick never fetches a remote URL.
+
+    `![alt](url)` becomes `[image: alt]` (`[image]` without alt text). The URL is dropped.
+    Regular links (`[label](url)`) are untouched.
+    """
+
+    def repl(match: re.Match[str]) -> str:
+        alt = " ".join(match.group(1).split())
+        return f"[image: {alt}]" if alt else "[image]"
+
+    return IMAGE_RE.sub(repl, text)
 
 
 def split_markdown(text: str) -> list[dict[str, Any]]:
@@ -129,6 +216,9 @@ def split_markdown(text: str) -> list[dict[str, Any]]:
         else:
             buf.append(line)
     flush()
+    for segment in segments:
+        if not segment["code"]:
+            segment["text"] = neutralize_images(segment["text"])
     return segments
 
 
@@ -252,6 +342,9 @@ def parse_sse_line(line: str) -> tuple[str, str]:
     return "skip", ""
 
 
+STANCE_LIMIT = 6  # active stance nodes mirrored in the Settings modal
+
+
 class Bridge(QObject):
     chunkReceived = Signal(str)
     streamFinished = Signal()
@@ -266,6 +359,17 @@ class Bridge(QObject):
     conversationReset = Signal()
     extractorStatusChanged = Signal(bool, str)
     groundingChanged = Signal()
+    configuredChanged = Signal()
+    availableModelsChanged = Signal()
+    availableExtractorModelsChanged = Signal()
+    extractorProbeStatusChanged = Signal()
+    _extractorModelsResult = Signal(int, bool, list)
+    isProbingModelsChanged = Signal()
+    probeStatusChanged = Signal()
+    _probeResult = Signal(bool, list)
+    distillingChanged = Signal()
+    groundingActiveChanged = Signal()
+    activeStanceNodesChanged = Signal()
     _wake = Signal()
 
     def __init__(
@@ -291,9 +395,32 @@ class Bridge(QObject):
         self._timer = QTimer(self)
         self._timer.setInterval(PACE_INTERVAL_MS)
         self._timer.timeout.connect(self._tick)
+        # Conduit states: single-shot timers only; nothing runs while idle (OBS-ERG-003).
+        self._distilling = False
+        self._strike = False
+        self._distill_timer = QTimer(self)
+        self._distill_timer.setSingleShot(True)
+        self._distill_timer.setInterval(DISTILL_HOLD_MS)
+        self._distill_timer.timeout.connect(self._end_distilling)
+        self._strike_timer = QTimer(self)
+        self._strike_timer.setSingleShot(True)
+        self._strike_timer.setInterval(GROUNDING_STRIKE_MS)
+        self._strike_timer.timeout.connect(self._end_strike)
+        self.streamFinished.connect(self._begin_distilling)
         self._wake.connect(self._on_wake)
         self._probe_factory = probe_factory
+        self._available_models: list[str] = []
+        self._probing_models = False
+        self._probe_status = "idle"
+        self._probe_seq = 0
+        self._probeResult.connect(self._on_probe_result)
+        self._available_extractor_models: list[str] = []
+        self._extractor_probe_status = "idle"
+        self._extractor_probe_seq = 0
+        self._extractorModelsResult.connect(self._on_extractor_models_result)
         self._config = config if config is not None else load_config()
+        self._stance_nodes: list[str] = []
+        self._stance_count = 0
         self._model = resolve_model(self._config, explicit=model)
         self._session_id = f"ui-{uuid.uuid4().hex[:12]}"
         self._uds_path, self._base_url = resolve_endpoint(self._config)
@@ -314,6 +441,45 @@ class Bridge(QObject):
         self._prompt_index: int | None = None
         self._turn: dict[str, Any] = {}
         self._workers: dict[threading.Thread, tuple[asyncio.AbstractEventLoop, asyncio.Task[None]]] = {}
+
+    @Property(list, notify=activeStanceNodesChanged)
+    def activeStanceNodes(self) -> list[str]:
+        """Top learned directive / preference / trait names (read-only mirror of memory.db)."""
+        return list(self._stance_nodes)
+
+    @Property(int, notify=activeStanceNodesChanged)
+    def activeStanceCount(self) -> int:
+        """Total active stance nodes in memory (the list above is capped)."""
+        return self._stance_count
+
+    @Slot()
+    def refreshActiveStance(self) -> None:
+        """Re-read active stance nodes from memory.db (read-only connection; never writes)."""
+        nodes, count = self._read_stance()
+        if nodes != self._stance_nodes or count != self._stance_count:
+            self._stance_nodes, self._stance_count = nodes, count
+            self.activeStanceNodesChanged.emit()
+
+    def _read_stance(self) -> tuple[list[str], int]:
+        path = Path(self._config.db_path).expanduser()
+        if not path.is_file():
+            return [], 0
+        sql = (
+            "SELECT t.name, MAX(e.weight) AS w, MAX(e.confidence) AS c FROM edges e "
+            "JOIN entities t ON t.id = e.target_id "
+            "WHERE t.archetype IN ('directive', 'preference', 'trait') "
+            "AND " + _ACTIVE.format(t="e") + " AND NOT " + PRIVATE_ENTITY_SQL.format(t="t") + " "
+            "GROUP BY t.id ORDER BY w DESC, c DESC, t.name ASC"
+        )
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+            try:
+                rows = [str(r[0]).strip() for r in conn.execute(sql).fetchall() if str(r[0]).strip()]
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return [], 0
+        return rows[:STANCE_LIMIT], len(rows)
 
     # -- properties exposed to QML -------------------------------------------------
     @Property(str, notify=statusChanged)
@@ -374,9 +540,77 @@ class Bridge(QObject):
         info.update(self._turn)
         return info
 
+    @Property(list, notify=availableModelsChanged)
+    def availableModels(self) -> list[str]:
+        return list(self._available_models)
+
+    @Property(list, notify=availableExtractorModelsChanged)
+    def availableExtractorModels(self) -> list[str]:
+        return list(self._available_extractor_models)
+
+    @Property(str, notify=extractorProbeStatusChanged)
+    def extractorProbeStatus(self) -> str:
+        return self._extractor_probe_status
+
+    @Slot(result=str)
+    def pickDefaultModel(self) -> str:
+        """Lightweight model (preferring lite/flash) from the last upstream probe, or empty."""
+        return pick_lightweight_model(self._available_models)
+
+    @Property(bool, notify=isProbingModelsChanged)
+    def isProbingModels(self) -> bool:
+        return self._probing_models
+
+    @Property(str, notify=probeStatusChanged)
+    def probeStatus(self) -> str:
+        return self._probe_status
+
+    @Property(bool, notify=configuredChanged)
+    def isConfigured(self) -> bool:
+        """True when an upstream API key is set or the upstream is local Ollama."""
+        return is_engine_configured(self._config)
+
     @Property(bool, notify=busyChanged)
     def busy(self) -> bool:
         return self._busy
+
+    @Property(bool, notify=distillingChanged)
+    def distilling(self) -> bool:
+        """True for ~1.8 s after a stream completes, while Model B weaves the turn into memory."""
+        return self._distilling
+
+    @Property(bool, notify=groundingActiveChanged)
+    def grounding(self) -> bool:
+        """Transient 150 ms strike when a message is submitted, before the first chunk arrives."""
+        return self._strike
+
+    @Slot()
+    def _begin_distilling(self) -> None:
+        self._set_distilling(True)
+        self._distill_timer.start()
+
+    @Slot()
+    def _end_distilling(self) -> None:
+        self._set_distilling(False)
+
+    def _set_distilling(self, value: bool) -> None:
+        if value != self._distilling:
+            self._distilling = value
+            self.distillingChanged.emit()
+
+    def _begin_strike(self) -> None:
+        self._set_strike(True)
+        self._strike_timer.start()
+
+    @Slot()
+    def _end_strike(self) -> None:
+        self._strike_timer.stop()
+        self._set_strike(False)
+
+    def _set_strike(self, value: bool) -> None:
+        if value != self._strike:
+            self._strike = value
+            self.groundingActiveChanged.emit()
 
     @Property(bool, notify=groundingChanged)
     def groundingPulse(self) -> bool:
@@ -412,6 +646,7 @@ class Bridge(QObject):
 
     def _emit_text(self, text: str) -> None:
         self._shown = True
+        self._end_strike()
         self._set_grounding(False)  # first visible token settles the pulse
         self.chunkReceived.emit(text)
 
@@ -740,6 +975,7 @@ class Bridge(QObject):
         self._history.append({"role": "user", "content": text})
         messages = list(self._history)
         generation = self._generation
+        self._begin_strike()
         self._run_async(
             lambda: self._stream(messages, generation, paced=True),
             on_done=self._turn_done,
@@ -765,7 +1001,6 @@ class Bridge(QObject):
             "decay_enabled": cfg.decay_enabled,
             "decay_half_life_days": cfg.decay_half_life_days,
             "upstream_api_key_set": bool(cfg.upstream_api_key),
-            "fail_closed_private": _as_bool(file_values.get("fail_closed_private", True)),
             "redact_secrets": _as_bool(file_values.get("redact_secrets", True)),
             "enable_host_telemetry": cfg.enable_host_telemetry,
         }
@@ -810,6 +1045,147 @@ class Bridge(QObject):
         except (OSError, ValueError, TypeError):
             return False
         return True
+
+    @Slot(str, str, str, str, result=bool)
+    def configureEngine(self, provider: str, apiKey: str, model: str, endpointUrl: str = "") -> bool:
+        """First-run setup: persist an inference engine ("gemini" or "ollama") to config.json.
+
+        Atomic write (dir 0700, file 0600). Returns False, file untouched, on invalid
+        input, an unreachable Ollama or an I/O error.
+        """
+        try:
+            save_config(engine_updates(provider, apiKey, model, endpointUrl))
+            self._config = load_config()
+        except (OSError, ValueError):
+            return False
+        self._reload_daemon()
+        self.setModel(resolve_model(self._config))
+        self.configuredChanged.emit()
+        self.diagnosticsChanged.emit()
+        return True
+
+    def _reload_daemon(self) -> None:
+        """Make the running daemon pick up the freshly written config before onboarding starts.
+
+        The daemon reads config.json once at startup, so a service started before first-run
+        setup would answer the onboarding turn with 401. Restart the systemd user service (only
+        when it is active and the bridge talks to the real transport), then wait for `/health`.
+        """
+        if self._client_factory is not None:
+            return  # injected transport (tests): no real service to restart
+        try:
+            active = subprocess.run(
+                ["systemctl", "--user", "is-active", "--quiet", "strand"], check=False, timeout=10
+            ).returncode == 0
+            if not active:
+                return
+            if subprocess.run(["systemctl", "--user", "restart", "strand"], check=False, timeout=60).returncode != 0:
+                return
+        except (OSError, subprocess.SubprocessError):
+            return
+        self._uds_path, self._base_url = resolve_endpoint(self._config)
+        asyncio.run(self._wait_healthy())
+
+    async def _wait_healthy(self, attempts: int = 40, delay: float = 0.25) -> bool:
+        """Poll `GET /health` (fresh client per probe, so no stale connection) until it answers."""
+        for _ in range(attempts):
+            try:
+                async with self.make_client() as client:
+                    if (await client.get("/health", timeout=2.0)).status_code == 200:
+                        return True
+            except httpx.HTTPError:
+                pass
+            await asyncio.sleep(delay)
+        return False
+
+    @Slot(str, str)
+    @Slot(str, str, str)
+    def probeModels(self, endpointUrl: str, apiKey: str, provider: str = "") -> None:
+        """List chat models at an endpoint off-thread; failures are silent (`probeStatus == "failed"`)."""
+        self._probe_seq += 1
+        seq = self._probe_seq
+        self._probing_models = True
+        self._probe_status = "probing"
+        self.isProbingModelsChanged.emit()
+        self.probeStatusChanged.emit()
+        self._run_async(lambda: self._probe_models(seq, endpointUrl, apiKey, provider))
+
+    async def _probe_models(self, seq: int, endpoint_url: str, api_key: str, provider: str) -> None:
+        models: list[str] | None = None
+        try:
+            base = endpoint_url.strip().rstrip("/")
+            if base.startswith(("http://", "https://")):
+                ollama = provider.strip().lower() == "ollama"
+                target = (base.removesuffix("/v1") + "/api/tags") if ollama else f"{base}/models"
+                headers = {"Authorization": f"Bearer {api_key.strip()}"} if api_key.strip() else {}
+                async with self._make_model_client() as client:
+                    resp = await client.get(target, headers=headers)
+                    resp.raise_for_status()
+                    models = parse_model_names(resp.json(), ollama)
+        except (httpx.HTTPError, ValueError, AttributeError, TypeError):
+            models = None
+        self._probeResult.emit(models is not None, [seq] + (models or []))
+
+    def _make_model_client(self) -> httpx.AsyncClient:
+        if self._probe_factory is not None:
+            return self._probe_factory()
+        return httpx.AsyncClient(timeout=MODEL_PROBE_TIMEOUT)
+
+    @Slot(bool, list)
+    def _on_probe_result(self, ok: bool, payload: list) -> None:
+        if not payload or payload[0] != self._probe_seq:
+            return  # superseded by a newer probe
+        self._available_models = (
+            sorted((str(m) for m in payload[1:]), key=lambda m: _model_sort_key(m, self._model)) if ok else []
+        )
+        self._probing_models = False
+        self._probe_status = "success" if ok else "failed"
+        self.availableModelsChanged.emit()
+        self.isProbingModelsChanged.emit()
+        self.probeStatusChanged.emit()
+
+    @Slot()
+    @Slot(str)
+    def probeExtractorModels(self, url: str = "http://127.0.0.1:11434/v1") -> None:
+        """List local Ollama models off-thread; failure leaves `availableExtractorModels` empty."""
+        self._extractor_probe_seq += 1
+        seq = self._extractor_probe_seq
+        self._extractor_probe_status = "probing"
+        self.extractorProbeStatusChanged.emit()
+        self._run_async(lambda: self._probe_extractor_models(seq, url))
+
+    async def _probe_extractor_models(self, seq: int, url: str) -> None:
+        models: list[str] | None = None
+        try:
+            base = url.strip().rstrip("/")
+            if base.startswith(("http://", "https://")):
+                root = base.removesuffix("/v1")
+                async with self._make_tags_client() as client:
+                    try:
+                        resp = await client.get(f"{root}/api/tags")
+                        resp.raise_for_status()
+                        models = parse_model_names(resp.json(), True)
+                    except (httpx.HTTPError, ValueError, AttributeError, TypeError):
+                        resp = await client.get(f"{base}/models")
+                        resp.raise_for_status()
+                        models = parse_model_names(resp.json(), False)
+        except Exception:  # noqa: BLE001 - an offline or odd endpoint is a status, never an error
+            models = None
+        self._extractorModelsResult.emit(seq, models is not None, models or [])
+
+    def _make_tags_client(self) -> httpx.AsyncClient:
+        if self._probe_factory is not None:
+            return self._probe_factory()
+        return httpx.AsyncClient(timeout=EXTRACTOR_TAGS_TIMEOUT)
+
+    @Slot(int, bool, list)
+    def _on_extractor_models_result(self, seq: int, ok: bool, models: list) -> None:
+        if seq != self._extractor_probe_seq:
+            return  # superseded by a newer probe
+        self._available_extractor_models = sorted((str(m) for m in models), key=_extractor_sort_key) if ok else []
+        self._extractor_probe_status = "success" if ok else "failed"
+        self.availableExtractorModelsChanged.emit()
+        self.extractorProbeStatusChanged.emit()
 
     @Slot(str)
     def testExtractor(self, url: str) -> None:

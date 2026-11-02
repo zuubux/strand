@@ -80,7 +80,7 @@ def test_upsert_two_entities(db_path):
     async def scenario():
         async with DatabaseManager(db_path) as db:
             operator_id = await db.upsert_entity("Operator", "person", "Owner of the garage", {"city": "dev-server"})
-            bmw_id = await db.upsert_entity("1995 BMW 540i", "vehicle", "E34 sedan")
+            bmw_id = await db.upsert_entity("1995 Acme X540", "vehicle", "W34 sedan")
             async with db.conn.execute("SELECT * FROM entities ORDER BY id") as cur:
                 rows = [dict(r) for r in await cur.fetchall()]
             return operator_id, bmw_id, rows
@@ -88,7 +88,7 @@ def test_upsert_two_entities(db_path):
     operator_id, bmw_id, rows = run(scenario())
     assert isinstance(operator_id, int) and isinstance(bmw_id, int)
     assert operator_id != bmw_id
-    assert [r["name"] for r in rows] == ["Operator", "1995 BMW 540i"]
+    assert [r["name"] for r in rows] == ["Operator", "1995 Acme X540"]
     assert rows[0]["archetype"] == "person"
     assert rows[0]["summary"] == "Owner of the garage"
     assert json.loads(rows[0]["metadata"]) == {"city": "dev-server"}
@@ -153,7 +153,7 @@ def test_upsert_edge_nic_owns_bmw(db_path):
     async def scenario():
         async with DatabaseManager(db_path) as db:
             operator_id = await db.upsert_entity("Operator", "person", "Owner")
-            bmw_id = await db.upsert_entity("1995 BMW 540i", "vehicle", "E34 sedan")
+            bmw_id = await db.upsert_entity("1995 Acme X540", "vehicle", "W34 sedan")
             edge_id = await db.upsert_edge(operator_id, bmw_id, "owns", weight=0.9, metadata={"since": 2021})
             again = await db.upsert_edge(operator_id, bmw_id, "owns", weight=0.5)
             async with db.conn.execute("SELECT * FROM edges") as cur:
@@ -177,7 +177,7 @@ def test_upsert_edge_enforces_foreign_keys(db_path):
             with pytest.raises(sqlite3.IntegrityError):
                 await db.upsert_edge(operator_id, 9999, "owns")
             # The failed write must not poison later writes on the shared connection.
-            bmw_id = await db.upsert_entity("1995 BMW 540i", "vehicle", "")
+            bmw_id = await db.upsert_entity("1995 Acme X540", "vehicle", "")
             await db.upsert_edge(operator_id, bmw_id, "owns")
             async with db.conn.execute("SELECT COUNT(*) FROM edges") as cur:
                 return (await cur.fetchone())[0]
@@ -189,7 +189,7 @@ def test_get_entity_subgraph_returns_nic_owns_bmw(db_path):
     async def scenario():
         async with DatabaseManager(db_path) as db:
             operator_id = await db.upsert_entity("Operator", "person", "Owner")
-            bmw_id = await db.upsert_entity("1995 BMW 540i", "vehicle", "E34 sedan")
+            bmw_id = await db.upsert_entity("1995 Acme X540", "vehicle", "W34 sedan")
             await db.upsert_edge(operator_id, bmw_id, "owns", metadata={"since": 2021})
             from_operator = await db.get_entity_subgraph(operator_id)
             from_bmw = await db.get_entity_subgraph(bmw_id)
@@ -203,13 +203,13 @@ def test_get_entity_subgraph_returns_nic_owns_bmw(db_path):
     assert edge["source_archetype"] == "person"
     assert edge["relation"] == "owns"
     assert edge["target_id"] == bmw_id
-    assert edge["target_name"] == "1995 BMW 540i"
+    assert edge["target_name"] == "1995 Acme X540"
     assert edge["target_archetype"] == "vehicle"
-    assert edge["target_summary"] == "E34 sedan"
+    assert edge["target_summary"] == "W34 sedan"
     assert edge["weight"] == 1.0
     assert edge["metadata"] == {"since": 2021}
     assert edge["hop"] == 1
-    # Traversal is bidirectional; orientation (Operator -> owns -> BMW) is preserved.
+    # Traversal is bidirectional; orientation (Operator -> owns -> Acme) is preserved.
     assert from_bmw == from_operator
 
 
@@ -217,9 +217,9 @@ def test_get_entity_subgraph_hops_limit_and_ordering(db_path):
     async def scenario():
         async with DatabaseManager(db_path) as db:
             operator = await db.upsert_entity("Operator", "person", "")
-            bmw = await db.upsert_entity("1995 BMW 540i", "vehicle", "")
+            bmw = await db.upsert_entity("1995 Acme X540", "vehicle", "")
             shop = await db.upsert_entity("Garage", "system", "")
-            part = await db.upsert_entity("M60 Engine", "concept", "")
+            part = await db.upsert_entity("X60 Engine", "concept", "")
             lone = await db.upsert_entity("Unrelated", "concept", "")
             await db.upsert_edge(operator, bmw, "owns", weight=0.4)
             await db.upsert_edge(operator, shop, "works_at", weight=0.9)
@@ -235,7 +235,7 @@ def test_get_entity_subgraph_hops_limit_and_ordering(db_path):
     # 1 hop: every edge touching Operator (including the inbound one), strongest first.
     assert [e["relation"] for e in one_hop] == ["works_at", "owns", "is_serviced_by"]
     assert {e["hop"] for e in one_hop} == {1}
-    # 2 hops adds BMW -> has_part -> M60, listed after all 1-hop edges; no duplicates.
+    # 2 hops adds Acme -> has_part -> X60, listed after all 1-hop edges; no duplicates.
     assert [e["relation"] for e in two_hop] == ["works_at", "owns", "is_serviced_by", "has_part"]
     assert two_hop[-1]["hop"] == 2
     assert len({e["edge_id"] for e in two_hop}) == len(two_hop)
@@ -247,7 +247,7 @@ def test_get_entity_subgraph_degenerate_arguments(db_path):
     async def scenario():
         async with DatabaseManager(db_path) as db:
             operator = await db.upsert_entity("Operator", "person", "")
-            bmw = await db.upsert_entity("1995 BMW 540i", "vehicle", "")
+            bmw = await db.upsert_entity("1995 Acme X540", "vehicle", "")
             await db.upsert_edge(operator, bmw, "owns")
             return (
                 await db.get_entity_subgraph(operator, max_hops=0),
@@ -262,8 +262,8 @@ def test_record_episode(db_path):
     async def scenario():
         async with DatabaseManager(db_path) as db:
             operator_id = await db.upsert_entity("Operator", "person", "")
-            bmw_id = await db.upsert_entity("1995 BMW 540i", "vehicle", "")
-            with_ids = await db.record_episode("session-1", "Operator changed the BMW's oil.", [operator_id, bmw_id])
+            bmw_id = await db.upsert_entity("1995 Acme X540", "vehicle", "")
+            with_ids = await db.record_episode("session-1", "Operator changed the Acme's oil.", [operator_id, bmw_id])
             without_ids = await db.record_episode("session-1", "Nothing extracted.")
             async with db.conn.execute("SELECT * FROM episodes ORDER BY id") as cur:
                 rows = [dict(r) for r in await cur.fetchall()]
@@ -272,7 +272,7 @@ def test_record_episode(db_path):
     operator_id, bmw_id, with_ids, without_ids, rows = run(scenario())
     assert [r["id"] for r in rows] == [with_ids, without_ids]
     assert rows[0]["session_id"] == "session-1"
-    assert rows[0]["narrative"] == "Operator changed the BMW's oil."
+    assert rows[0]["narrative"] == "Operator changed the Acme's oil."
     assert json.loads(rows[0]["extracted_entities"]) == [operator_id, bmw_id]
     assert json.loads(rows[1]["extracted_entities"]) == []
     assert isinstance(rows[0]["timestamp"], float) and rows[0]["timestamp"] > 0
@@ -282,7 +282,7 @@ def test_data_persists_across_connections(db_path):
     async def write():
         async with DatabaseManager(db_path) as db:
             operator = await db.upsert_entity("Operator", "person", "")
-            bmw = await db.upsert_entity("1995 BMW 540i", "vehicle", "")
+            bmw = await db.upsert_entity("1995 Acme X540", "vehicle", "")
             await db.upsert_edge(operator, bmw, "owns")
             return operator
 
@@ -293,7 +293,7 @@ def test_data_persists_across_connections(db_path):
     operator_id = run(write())
     edges = run(read(operator_id))
     assert [(e["source_name"], e["relation"], e["target_name"]) for e in edges] == [
-        ("Operator", "owns", "1995 BMW 540i")
+        ("Operator", "owns", "1995 Acme X540")
     ]
 
 

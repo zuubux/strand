@@ -114,8 +114,43 @@ def test_second_turn_does_not_reinject_and_header_sessions_are_isolated(tmp_path
 
     turn1, turn2, other = run(scenario())
     assert turn1[0]["role"] == "system"
-    assert turn2 == [{"role": "user", "content": "Marcus again"}]
+    # ERG-CTX-005: the client dropped our system prompt, so the same block is replayed (not re-resolved).
+    assert turn2[0] == turn1[0] and turn2[1:] == [{"role": "user", "content": "Marcus again"}]
     assert other[0]["role"] == "system"
+
+
+def test_three_turn_user_assistant_history_keeps_working_memory(tmp_path):
+    """ERG-CTX-005: clients resend only user/assistant turns; memory must stay in the system prompt."""
+
+    async def scenario():
+        async with proxy_client(tmp_path / "m.db", ok_json) as (client, seen):
+            history = [{"role": "user", "content": "Tell me about Marcus"}]
+            for reply, follow_up in (("Staff engineer.", "And Marcus again?"), ("Still him.", "One more on Marcus")):
+                await client.post("/v1/chat/completions", json={"messages": history})
+                history = [*history, {"role": "assistant", "content": reply}, {"role": "user", "content": follow_up}]
+            await client.post("/v1/chat/completions", json={"messages": history})
+            return [body_of(r)["messages"] for r in seen]
+
+    turn1, turn2, turn3 = run(scenario())
+    for messages in (turn1, turn2, turn3):
+        assert messages[0]["role"] == "system"
+        assert "Marcus" in messages[0]["content"] and "Staff engineer" in messages[0]["content"]
+        assert [m["role"] for m in messages[1:] if m["role"] == "system"] == []
+    assert turn3[0]["content"].count("## Strand Memory") == 1
+    assert [m["role"] for m in turn3[1:]] == ["user", "assistant", "user", "assistant", "user"]
+
+
+def test_client_preserved_system_prompt_is_not_duplicated(tmp_path):
+    async def scenario():
+        async with proxy_client(tmp_path / "m.db", ok_json) as (client, seen):
+            user = {"role": "user", "content": "Marcus again"}
+            await client.post("/v1/chat/completions", json={"messages": [user]})
+            echoed = body_of(seen[0])["messages"]
+            await client.post("/v1/chat/completions", json={"messages": [*echoed, user]})
+            return body_of(seen[1])["messages"], echoed
+
+    turn2, echoed = run(scenario())
+    assert turn2 == [*echoed, {"role": "user", "content": "Marcus again"}]
 
 
 def test_streaming_sse_passes_through(tmp_path):
@@ -216,7 +251,7 @@ def test_delta_log_fields_count_personality_and_working_memory():
     delta = (
         "## Strand Memory\n[Persona Stance]\nAnchor prompt\n- Dry Wit: calm\n"
         "[Operational Directives]\n- a: x\n- b: y\n[Interaction Preferences]\n- Nm: z\n"
-        "[Working Memory]\nEntities:\n- BMW (vehicle): E34\nRelations:\n- User -drives-> BMW\n- A -b-> C"
+        "[Working Memory]\nEntities:\n- Acme (vehicle): W34\nRelations:\n- User -drives-> Acme\n- A -b-> C"
     )
     assert _delta_log_fields(delta) == "entities=1 edges=2 traits=2 directives=2 preferences=1"
     plain = "## Strand Memory\nEntities:\n- A (person): x\n- B (person): y\nRelations:\n- A -knows-> B"
@@ -224,7 +259,7 @@ def test_delta_log_fields_count_personality_and_working_memory():
     assert _delta_log_fields("") == "entities=0 edges=0"
 
 
-HOST = {"user": "nic", "hostname": "workstation-01", "os": "Fedora Linux 44"}
+HOST = {"user": "alice", "hostname": "workstation-01", "os": "Fedora Linux 44"}
 
 
 def _systems(seen):
@@ -264,7 +299,7 @@ def test_day_zero_triggers_without_user_explicit_person(tmp_path, monkeypatch):
 
 
 def test_day_zero_does_not_trigger_with_user_explicit_person(tmp_path, monkeypatch):
-    (system,) = _onboard_scenario(tmp_path, monkeypatch, [("Nic", "user_explicit")], text="Tell me about Nic")
+    (system,) = _onboard_scenario(tmp_path, monkeypatch, [("Alice", "user_explicit")], text="Tell me about Alice")
     assert "[Onboarding Directive" not in system
 
 
@@ -282,13 +317,17 @@ def test_later_turn_directive_covers_greeting_hostname_and_mission(tmp_path, mon
 
     text = onboarding_directive(HOST, first_turn=False)
     assert "running locally on workstation-01" in text
-    assert "sovereign working memory and privacy" in text
+    assert "In 1-2 plain sentences, explain what you do" in text
+    assert "you keep memory and context locally on this computer" in text
+    assert "strip out sensitive info before anything goes out" in text
+    assert "mission" not in text.lower()
+    assert "sovereign" not in text.lower()
     assert "What should I call you?" not in text
 
 
 def test_onboard_on_existing_database_triggers_intent_triage(tmp_path, monkeypatch):
     (system,) = _onboard_scenario(
-        tmp_path, monkeypatch, [("Nic", "user_explicit")], headers={"X-Strand-Mode": "onboarding"}
+        tmp_path, monkeypatch, [("Alice", "user_explicit")], headers={"X-Strand-Mode": "onboarding"}
     )
     assert "Intent Triage" in system
     assert "1. Update their name/identity." in system
@@ -308,9 +347,9 @@ def _model_b_operator(request):
                         "content": json.dumps(
                             {
                                 "entities": [
-                                    {"name": "Nic", "archetype": "person", "origin": "user_explicit", "confidence": 1.0}
+                                    {"name": "Alice", "archetype": "person", "origin": "user_explicit", "confidence": 1.0}
                                 ],
-                                "edges": [{"source": "Nic", "target": "workstation-01", "relation": "operates_host"}],
+                                "edges": [{"source": "Alice", "target": "workstation-01", "relation": "operates_host"}],
                             }
                         )
                     }
@@ -332,7 +371,7 @@ def test_model_b_operator_completes_day_zero_and_folds_generic_user(tmp_path, mo
 
     async def scenario():
         def greeting(_: httpx.Request) -> httpx.Response:
-            text = "Nice to meet you, Nic. I run locally on workstation-01 as your sovereign working memory."
+            text = "Nice to meet you, Alice. I run locally on workstation-01 as your sovereign working memory."
             return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": text}}]})
 
         upstream = httpx.AsyncClient(transport=httpx.MockTransport(greeting))
@@ -348,7 +387,7 @@ def test_model_b_operator_completes_day_zero_and_folds_generic_user(tmp_path, mo
             history = [
                 {"role": "user", "content": "hello there"},
                 {"role": "assistant", "content": "Hi, I'm Strand. What should I call you?"},
-                {"role": "user", "content": "Nicholas is fine"},
+                {"role": "user", "content": "Alicia is fine"},
             ]
             before = await count_operators(db)
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://strand") as client:
@@ -367,9 +406,9 @@ def test_model_b_operator_completes_day_zero_and_folds_generic_user(tmp_path, mo
 
     before, after, people, edges = run(scenario())
     assert before == 0 and after > 0
-    assert people == ["Nic"]
-    assert ("Nic", "workstation-01", "operates_host") in edges
-    assert ("Nic", "No apologies", "demands") in edges
+    assert people == ["Alice"]
+    assert ("Alice", "workstation-01", "operates_host") in edges
+    assert ("Alice", "No apologies", "demands") in edges
 
 
 def test_proxy_has_no_procedural_name_interceptors():
@@ -380,7 +419,7 @@ def test_proxy_has_no_procedural_name_interceptors():
 
 
 FULL_HOST = {
-    "user": "nic",
+    "user": "alice",
     "hostname": "workstation-01",
     "os": "Fedora Linux 44",
     "desktop": "KDE",
@@ -463,10 +502,10 @@ def _telemetry_choice_scenario(tmp_path, monkeypatch, target):
     monkeypatch.setattr(proxy_mod, "get_host_context", lambda: dict(FULL_HOST))
     payload = {
         "entities": [
-            {"name": "Nic", "archetype": "person", "summary": "Operator", "origin": "user_explicit"},
+            {"name": "Alice", "archetype": "person", "summary": "Operator", "origin": "user_explicit"},
             {"name": target, "archetype": "preference", "summary": "Hardware telemetry stance"},
         ],
-        "edges": [{"source": "Nic", "target": target, "relation": "prefers"}],
+        "edges": [{"source": "Alice", "target": target, "relation": "prefers"}],
     }
 
     async def scenario():
@@ -485,7 +524,7 @@ def _telemetry_choice_scenario(tmp_path, monkeypatch, target):
             engine = DistillationEngine(db, extractor=LLMExtractor("http://slm.test/v1", "tiny", client=slm))
             app = create_app(Config(upstream_url="http://upstream.test/v1"), ContextResolver(db, ledger), upstream, engine)
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://strand") as client:
-                history = [{"role": "user", "content": "Nic"}]
+                history = [{"role": "user", "content": "Alice"}]
                 for text in ("Yeah, check it out", "anything else?"):
                     history.append({"role": "user", "content": text})
                     await client.post("/v1/chat/completions", json={"messages": list(history), "session_id": "s"})
@@ -519,3 +558,29 @@ def test_no_telemetry_edge_writes_no_config(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     _telemetry_system(tmp_path, monkeypatch)
     assert not (tmp_path / ".config" / "strand" / "config.json").exists()
+
+
+def test_upstream_failure_masks_url_credentials_in_response_and_log(tmp_path, caplog):
+    import logging
+
+    from strand.logging import LOGGER_NAME
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"cannot reach http://user:hunter2@up.test/v1 ({request.url})", request=request)
+
+    async def scenario():
+        async with proxy_client(tmp_path / "m.db", upstream) as (client, _):
+            return await client.post(
+                "/v1/chat/completions", json={"messages": [{"role": "user", "content": "Marcus"}]}
+            )
+
+    parent = logging.getLogger(LOGGER_NAME)
+    parent.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.DEBUG, logger=LOGGER_NAME):
+            response = run(scenario())
+    finally:
+        parent.removeHandler(caplog.handler)
+    assert response.status_code == 502
+    assert "hunter2" not in response.text and "hunter2" not in caplog.text
+    assert "user:********@up.test" in response.json()["error"]["message"]

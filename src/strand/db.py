@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
@@ -14,11 +15,28 @@ from typing import Any
 import aiosqlite
 import sqlite_vec
 
-from .common import DEFAULT_DEDUP_DISTANCE_THRESHOLD, EMBEDDING_DIM, MIN_EDGE_CONFIDENCE, aliases_of, load_metadata
+from .common import (
+    DEFAULT_DEDUP_DISTANCE_THRESHOLD,
+    EMBEDDING_DIM,
+    MAX_NARRATIVE_LEN,
+    MIN_EDGE_CONFIDENCE,
+    aliases_of,
+    is_private,
+    load_metadata,
+)
 from .embed import Embedder, EmbeddingUnavailable
 from .logging import get_logger
 from .perms import secure_parent_dir
 from .schema import run_migrations
+
+FORGOTTEN_PLACEHOLDER = "[forgotten]"
+
+
+def _redact_terms(text: str, terms: Sequence[str]) -> str:
+    """Case-insensitively replace every term (longest first) with `FORGOTTEN_PLACEHOLDER`."""
+    for term in sorted(terms, key=len, reverse=True):
+        text = re.sub(re.escape(term), FORGOTTEN_PLACEHOLDER, text, flags=re.IGNORECASE)
+    return text
 
 logger = get_logger("db")
 
@@ -161,6 +179,9 @@ class DatabaseManager:
         self._conn: aiosqlite.Connection | None = None
         self.vec_enabled = False
         self._write_lock = asyncio.Lock()
+        # Monotonic counter bumped by every transaction that may mutate entities, aliases or
+        # edges (PERF-RES-001); in-process caches key their snapshots on it.
+        self.write_version = 0
 
     @property
     def conn(self) -> aiosqlite.Connection:
@@ -236,8 +257,13 @@ class DatabaseManager:
         await self.close()
 
     @asynccontextmanager
-    async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
-        """Serialize writers on the shared connection; commit on success, roll back on error."""
+    async def transaction(self, graph: bool = True) -> AsyncIterator[aiosqlite.Connection]:
+        """Serialize writers on the shared connection; commit on success, roll back on error.
+
+        `write_version` is bumped once the transaction ends (commit or rollback, so a reader that
+        saw uncommitted rows never keeps them cached). Pass `graph=False` only for writes that
+        cannot change entity names, aliases, archetypes, metadata, summaries or edges.
+        """
         conn = self.conn
         async with self._write_lock:
             try:
@@ -246,6 +272,9 @@ class DatabaseManager:
             except BaseException:
                 await conn.rollback()
                 raise
+            finally:
+                if graph:
+                    self.write_version += 1
 
     async def _auto_embed(self, name: str, summary: str) -> list[float] | None:
         """Embed `name: summary` with the configured embedder; failures never block the write."""
@@ -380,19 +409,63 @@ class DatabaseManager:
         ]
         return matches[0] if len(matches) == 1 else None
 
-    async def drop_entity(self, entity_id: int) -> bool:
-        """Permanently delete an entity with its edges and embedding (one transaction).
+    async def drop_entity(self, entity_id: int, scrub_episodes: bool = True) -> bool:
+        """Permanently delete an entity with its edges, embedding and episodic residue (one transaction).
 
-        Returns False when no such entity exists.
+        SEC-MEM-009: episodes listing the id lose it from `extracted_entities`; an episode that
+        referenced only this entity is deleted, and the entity's name/aliases are redacted from
+        the remaining narratives so compaction cannot resurrect it. Returns False when no such
+        entity exists. `scrub_episodes=False` is for merges (the knowledge survives elsewhere).
         """
         async with self.transaction() as conn:
+            async with conn.execute("SELECT name, metadata FROM entities WHERE id = ?", (entity_id,)) as cur:
+                found = await cur.fetchone()
+            terms: list[str] = []
+            if found is not None:
+                terms = [t.strip() for t in (found[0], *aliases_of(found[1])) if t and t.strip()]
             await conn.execute(
                 "DELETE FROM edges WHERE source_id = ? OR target_id = ?", (entity_id, entity_id)
             )
             if self.vec_enabled:
                 await conn.execute("DELETE FROM entity_embeddings WHERE entity_id = ?", (entity_id,))
             cur = await conn.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
-            return cur.rowcount > 0
+            dropped = cur.rowcount > 0
+            if scrub_episodes:
+                await self._scrub_episodes(conn, entity_id, terms)
+            return dropped
+
+    @staticmethod
+    async def _scrub_episodes(conn: aiosqlite.Connection, entity_id: int, terms: Sequence[str]) -> None:
+        """Remove `entity_id` and its name terms from episodes (no schema change)."""
+        async with conn.execute(
+            "SELECT id, narrative, extracted_entities FROM episodes WHERE EXISTS "
+            "(SELECT 1 FROM json_each(episodes.extracted_entities) WHERE value = ?)",
+            (entity_id,),
+        ) as cur:
+            tagged = await cur.fetchall()
+        for row in tagged:
+            try:
+                ids = [i for i in json.loads(row[2] or "[]") if i != entity_id]
+            except ValueError:
+                ids = []
+            if not ids:
+                await conn.execute("DELETE FROM episodes WHERE id = ?", (row[0],))
+                continue
+            await conn.execute(
+                "UPDATE episodes SET extracted_entities = ?, narrative = ? WHERE id = ?",
+                (json.dumps(ids), _redact_terms(row[1], terms), row[0]),
+            )
+        # Untagged episodes can still name the entity in prose.
+        for term in terms:
+            escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            async with conn.execute(
+                "SELECT id, narrative FROM episodes WHERE narrative LIKE ? ESCAPE '\\'", (f"%{escaped}%",)
+            ) as cur:
+                mentions = await cur.fetchall()
+            for ep_id, narrative in mentions:
+                await conn.execute(
+                    "UPDATE episodes SET narrative = ? WHERE id = ?", (_redact_terms(narrative, terms), ep_id)
+                )
 
     async def drop_entity_by_name(self, name_or_alias: str) -> bool:
         """`drop_entity` for the entity a canonical name or alias resolves to."""
@@ -598,7 +671,7 @@ class DatabaseManager:
                     continue
                 meta = load_metadata(raw)
                 if meta.get("deprecated") is True:
-                    logger.info(
+                    logger.debug(
                         "edge %s -[%s]-> %s already deprecated; nothing to do",
                         source_id, relation, target_id,
                     )
@@ -707,7 +780,7 @@ class DatabaseManager:
         edge_rows = [(int(i),) for i in dict.fromkeys(edge_ids)]
         if not entity_rows and not edge_rows:
             return
-        async with self.transaction() as conn:
+        async with self.transaction(graph=False) as conn:
             for table, rows in (("entities", entity_rows), ("edges", edge_rows)):
                 if rows:
                     await conn.executemany(
@@ -719,8 +792,9 @@ class DatabaseManager:
     async def record_episode(
         self, session_id: str, narrative: str, entity_ids: Sequence[int] | None = None
     ) -> int:
-        """Append an episode (timestamped now) and return its id."""
-        async with self.transaction() as conn:
+        """Append an episode (timestamped now) and return its id; the narrative is clamped to `MAX_NARRATIVE_LEN`."""
+        narrative = narrative[:MAX_NARRATIVE_LEN]
+        async with self.transaction(graph=False) as conn:
             async with conn.execute(
                 """
                 INSERT INTO episodes (timestamp, session_id, narrative, extracted_entities)
@@ -809,10 +883,22 @@ class DatabaseManager:
         rows = [(int(i),) for i in dict.fromkeys(episode_ids)]
         if not rows:
             return
-        async with self.transaction() as conn:
+        async with self.transaction(graph=False) as conn:
             await conn.executemany(
                 "UPDATE episodes SET compacted_at = CURRENT_TIMESTAMP WHERE id = ?", rows
             )
+
+    async def update_entity_metadata(self, entity_id: int, metadata: dict[str, Any]) -> bool:
+        """Replace an entity's metadata JSON (operator action, e.g. `strand mark-private`).
+
+        Returns False when no entity has `entity_id`. Touches no other column.
+        """
+        async with self.transaction() as conn:
+            cur = await conn.execute(
+                "UPDATE entities SET metadata = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (json.dumps(metadata), entity_id),
+            )
+            return cur.rowcount > 0
 
     async def update_entity_summary(
         self, name: str, summary: str, origin: str = "model_inferred", confidence: float = 0.6
@@ -821,10 +907,16 @@ class DatabaseManager:
 
         Same precedence as `upsert_entity` (higher confidence wins; at equal confidence
         user_explicit is never displaced), but the stored origin/confidence are kept.
-        Returns False when no entity matches (case-insensitive) or the assertion loses.
+        Returns False when no entity matches (case-insensitive), the assertion loses, or the
+        entity is private (fail-closed: a private entity's summary is never rewritten here).
         """
         confidence = _check_confidence(confidence)
         async with self.transaction() as conn:
+            async with conn.execute(
+                "SELECT archetype, metadata FROM entities WHERE name = ? COLLATE NOCASE", (name,)
+            ) as cur:
+                if any(is_private(a, m) for a, m in await cur.fetchall()):
+                    return False
             cur = await conn.execute(
                 "UPDATE entities SET summary = :summary, updated_at = CURRENT_TIMESTAMP "
                 "WHERE name = :name COLLATE NOCASE AND (:conf > confidence OR (:conf = confidence "

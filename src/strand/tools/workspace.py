@@ -4,6 +4,7 @@ Dependency-free and JIT: nothing is indexed or cached. Every failure is returned
 `{"error": ...}` dictionary; nothing here raises to the caller.
 """
 
+import fnmatch
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -13,6 +14,23 @@ MAX_READ_BYTES = 8 * 1024
 MAX_READ_LINES = 200
 DEFAULT_READ_LIMIT = 120
 MAX_LIST_ENTRIES = 500
+
+# SEC-PRIV-007: file-name globs (matched case-insensitively) that read_file never serves.
+DENIED_NAME_PATTERNS = (
+    ".env*",
+    "*.pem",
+    "*.key",
+    "*.pkcs12",
+    "*.pfx",
+    "id_rsa*",
+    "id_ed25519*",
+    "id_ecdsa*",
+    "id_dsa*",
+    "*token*",
+    "*credential*",
+    "*secret*",
+)
+DENIED_RELATIVE_SUFFIXES = (".git/config",)
 
 
 def _error(code: str, message: str) -> dict[str, Any]:
@@ -72,6 +90,15 @@ def is_safe_path(target: str | Path, roots: list[Path]) -> tuple[bool, Path | st
     return False, "path is outside the approved workspace roots"
 
 
+def is_denied_file(path: Path | str) -> bool:
+    """True when `path` names a sensitive file (secrets, keys, tokens, `.git/config`)."""
+    posix = str(path).replace("\\", "/").casefold().rstrip("/")
+    name = posix.rsplit("/", 1)[-1]
+    if any(fnmatch.fnmatchcase(name, pattern) for pattern in DENIED_NAME_PATTERNS):
+        return True
+    return any(posix == suffix or posix.endswith("/" + suffix) for suffix in DENIED_RELATIVE_SUFFIXES)
+
+
 def _check(path: Any, roots: list[Path]) -> tuple[Path | None, dict[str, Any] | None]:
     if not isinstance(path, str):
         return None, _error("invalid_arguments", "path must be a string")
@@ -116,6 +143,8 @@ def read_file(
     resolved, err = _check(path, roots)
     if err or resolved is None:
         return err or _error("access_denied", "invalid path")
+    if is_denied_file(path) or is_denied_file(resolved):
+        return _error("Access denied: sensitive file policy", f"Access denied: '{path}' matches sensitive file deny-list")
     if isinstance(offset, bool) or isinstance(limit, bool):
         return _error("invalid_arguments", "offset and limit must be integers")
     try:
@@ -138,8 +167,18 @@ def read_file(
             if b"\x00" in fh.read(1024):
                 return _error("binary_file", f"binary file not readable: {path}")
             fh.seek(0)
-            for lineno, raw in enumerate(fh, start=1):
+            lineno = 0
+            while True:
+                # Bounded read: never buffer more than MAX_READ_BYTES + 1 bytes of one line (ERG-IO-006).
+                raw = fh.readline(MAX_READ_BYTES + 1)
+                if not raw:
+                    break
+                partial = len(raw) > MAX_READ_BYTES and not raw.endswith(b"\n")
+                lineno += 1
                 if lineno < offset:
+                    while partial:  # skip the rest of an over-long line in bounded chunks
+                        chunk = fh.readline(MAX_READ_BYTES)
+                        partial = bool(chunk) and not chunk.endswith(b"\n")
                     continue
                 if len(lines) >= limit:
                     more = True

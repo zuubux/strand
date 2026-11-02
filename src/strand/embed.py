@@ -1,6 +1,7 @@
 """Local dense-embedding substrate (fastembed, 384-dim). The model is loaded lazily."""
 
 import importlib.util
+import logging
 import os
 import threading
 from collections.abc import Callable
@@ -12,6 +13,9 @@ from .logging import get_logger
 from .perms import secure_parent_dir
 
 logger = get_logger("embed")
+
+# Silence the huggingface_hub unauthenticated-request advisory (a logger warning) before any download.
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 UNAVAILABLE_MESSAGE = "fastembed unavailable; falling back to lexical-only matching."

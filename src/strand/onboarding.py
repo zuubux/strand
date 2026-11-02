@@ -13,7 +13,7 @@ OPERATES_HOST = "operates_host"
 
 
 def operator_name(host_info: dict[str, Any]) -> str:
-    name = str(host_info.get("user") or "").strip() or "operator"
+    name = str(host_info.get("user") or "").strip() or "Operator"
     return name[:1].upper() + name[1:]
 
 
@@ -22,7 +22,7 @@ async def seed_operator_anchor(db: DatabaseManager, host_info: dict[str, Any]) -
 
     An existing operator (resolved by name or the `User` alias) is never overwritten.
     """
-    hostname = str(host_info.get("hostname") or "").strip() or "localhost"
+    hostname = str(host_info.get("hostname") or "").strip() or "workstation"
     existing = await db.find_entity(operator_name(host_info)) or await db.find_entity(OPERATOR_ALIAS)
     if existing is not None:
         user_id = existing[0]
@@ -102,7 +102,7 @@ async def reanchor_generic_user(db: DatabaseManager) -> bool:
             "UPDATE OR IGNORE edges SET target_id = ? WHERE target_id = ? AND source_id != ?",
             (operator_id, generic_id, operator_id),
         )
-    await db.drop_entity(generic_id)  # removes any edges that could not be moved
+    await db.drop_entity(generic_id, scrub_episodes=False)  # merge, not a forget; removes any edges that could not be moved
     await db.merge_entity_alias(operator_id, OPERATOR_ALIAS)
     return True
 
@@ -132,18 +132,33 @@ async def telemetry_preference(db: DatabaseManager) -> bool | None:
 
     Reads `(<Operator>) --[prefers]--> (Host Telemetry Enabled | Host Telemetry On-Demand)`:
     True for Enabled, False for On-Demand, None when neither edge is active. No schema change.
+
+    Provenance guard (SEC-PRIV-008): an *Enabled* edge counts only when the edge is
+    `user_explicit` with confidence >= 1.0 and its source is an authenticated operator anchor
+    (a `person` entity that is itself `user_explicit` at confidence >= 1.0). A `model_inferred`
+    edge can never open hardware telemetry; On-Demand (the closed, fail-safe stance) is
+    honoured at any provenance.
     """
     async with db.conn.execute(
-        "SELECT t.name FROM edges e JOIN entities t ON t.id = e.target_id "
+        "SELECT t.name, e.origin, e.confidence, s.origin, s.confidence "
+        "FROM edges e JOIN entities t ON t.id = e.target_id "
         "JOIN entities s ON s.id = e.source_id "
         "WHERE e.relation = ? AND e.weight > 0 AND s.archetype = 'person' "
-        "AND lower(t.name) IN (?, ?) ORDER BY e.updated_at DESC, e.id DESC LIMIT 1",
+        "AND lower(t.name) IN (?, ?) ORDER BY e.updated_at DESC, e.id DESC",
         (TELEMETRY_RELATION, TELEMETRY_ENABLED.lower(), TELEMETRY_ON_DEMAND.lower()),
     ) as cur:
-        row = await cur.fetchone()
-    if row is None:
-        return None
-    return str(row[0]).lower() == TELEMETRY_ENABLED.lower()
+        rows = await cur.fetchall()
+    for name, edge_origin, edge_conf, src_origin, src_conf in rows:
+        if str(name).lower() != TELEMETRY_ENABLED.lower():
+            return False
+        if (
+            edge_origin == "user_explicit"
+            and float(edge_conf) >= 1.0
+            and src_origin == "user_explicit"
+            and float(src_conf) >= 1.0
+        ):
+            return True
+    return None
 
 
 def onboarding_directive(
@@ -156,7 +171,7 @@ def onboarding_directive(
     """Build the directive. `turn` (1-based operator turn count) overrides `first_turn` when given."""
     if turn is not None:
         first_turn = turn <= 1
-    hostname = str(host_info.get("hostname") or "").strip() or "localhost"
+    hostname = str(host_info.get("hostname") or "").strip() or "workstation"
     head = (
         "[Onboarding Directive: Grounding & Resonance]\n"
         "- You are Strand, initializing working memory with your operator on this Linux workstation.\n"
@@ -165,7 +180,7 @@ def onboarding_directive(
         "default to the local account username ($USER) if the operator is willing to provide a preferred "
         "name. However, if the operator is coy, deflects, or expresses indifference ('whatever', 'I don't "
         "care', 'guess'), you may conversationally suggest or offer a cleaned-up name derived from their "
-        "username (e.g., offering 'Nic' for account 'nic' or 'nmansfield') and ask if that works, ensuring "
+        "username (e.g., offering 'Alice' for account 'alice' or 'asmith') and ask if that works, ensuring "
         "the conversation moves forward without stalling.\n"
         "- Demeanor: Warm, unhurried, technically grounded peer with dry wit. Speak as an authentic "
         "counterpart, not an HR survey or chatbot.\n"
@@ -198,9 +213,10 @@ def onboarding_directive(
         step = turn if turn is not None else 2
         body = (
             "- Turn 2/3 Directive: once the operator gives their name, greet them by it, quietly note "
-            f"\"Looks like I'm running locally on {hostname}\", and state your mission in two sentences: "
-            "you are their sovereign working memory and privacy layer on this local machine, holding their "
-            "context close, and you strip sensitive data before anything leaves it. Then gently ask: "
+            f"\"Looks like I'm running locally on {hostname}\". In 1-2 plain sentences, explain what you do: "
+            "you keep memory and context locally on this computer so the operator doesn't have to keep "
+            "re-explaining things to models, and you strip out sensitive info before anything goes out. "
+            "Then gently ask: "
             "\"What do you usually find yourself working on, creating, or exploring at this computer?\"\n"
             "  * Over the next turns, let the conversation naturally explore their primary projects/stack, "
             "tools and preferred communication rules (e.g. terse diffs, direct answers, zero corporate "

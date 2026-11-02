@@ -738,8 +738,9 @@ def test_get_config_defaults_and_file(qapp, home):
     cfg = b.getConfig()
     assert cfg["persona_prompt"] == ""
     assert cfg["upstream_url"] == "https://api.openai.com/v1"
-    assert cfg["decay_enabled"] is False
-    assert cfg["fail_closed_private"] is True
+    assert cfg["decay_enabled"] is True
+    assert "fail_closed_private" not in cfg  # immutable bedrock invariant, not a setting (SEC-UI-009)
+    assert cfg["redact_secrets"] is True
     assert cfg["upstream_api_key_set"] is False
     assert "upstream_api_key" not in cfg  # the secret is never handed to QML
     path = home / ".config" / "strand" / "config.json"
@@ -758,15 +759,17 @@ def test_save_config_atomic_modes_and_merge(qapp, home):
     assert data == {"persona_prompt": "Dry wit.", "decay_enabled": True}
     assert (path.stat().st_mode & 0o777) == 0o600
     assert (path.parent.stat().st_mode & 0o777) == 0o700
-    assert b.saveConfig({"upstream_api_key": "sk-1", "fail_closed_private": False}) is True
+    assert b.saveConfig({"upstream_api_key": "sk-1", "redact_secrets": False}) is True
     assert b.saveConfig({"upstream_api_key": "", "model_default": "m2"}) is True  # blank keeps key
     data = json.loads(path.read_text())
     assert data["upstream_api_key"] == "sk-1"
     assert data["persona_prompt"] == "Dry wit."
-    assert data["fail_closed_private"] is False and data["model_default"] == "m2"
+    assert data["redact_secrets"] is False and data["model_default"] == "m2"
     assert (path.stat().st_mode & 0o777) == 0o600
     assert [p.name for p in path.parent.iterdir()] == ["config.json"]  # no temp leftovers
-    assert b.getConfig()["fail_closed_private"] is False
+    assert b.getConfig()["redact_secrets"] is False
+    assert b.saveConfig({"fail_closed_private": False}) is True  # unknown key: ignored
+    assert "fail_closed_private" not in json.loads(path.read_text())
 
 
 def test_save_config_rejects_bad_input_and_corrupt_file(qapp, home):
@@ -838,7 +841,8 @@ def test_test_extractor_slot_emits_signal_from_worker(qapp):
 def test_qml_settings_modal_open_close(qapp, home):
     from PySide6.QtCore import QMetaObject
 
-    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    # A configured engine: on first run the Welcome Card suppresses the Settings modal.
+    b = make_bridge(lambda r: httpx.Response(200, json={}), config=Config(upstream_api_key="k"))
     engine, win = _load_window(b)
     modal = win.findChild(object, "settingsModal")
     assert modal is not None and modal.property("visible") is False
@@ -1057,7 +1061,7 @@ def test_split_blocks_splits_paragraphs_into_bubbles():
         ("table", "| a | b |\n|---|---|\n| 1 | 2 |"),
         ("prose", "Outro."),
     ]
-    assert operator_name({"STRAND_UI_OPERATOR": " Nic "}) == "Nic"
+    assert operator_name({"STRAND_UI_OPERATOR": " Alice "}) == "Alice"
     assert operator_name({"STRAND_UI_OPERATOR": ""})
 
 
@@ -1072,4 +1076,381 @@ def test_qml_assistant_flow_bubble_hugs_and_tab_flushes(qapp):
     assert win.property("assistantFamily") and win.property("assistantFamily") != win.property("monoFamily")
     QMetaObject.invokeMethod(win, "flushStream", Qt.ConnectionType.DirectConnection)  # idle: no-op
     win.hide()
+    engine.deleteLater()
+
+
+def test_split_blocks_neutralizes_markdown_images():
+    from strand.ui.bridge import neutralize_images, split_blocks
+
+    blocks = split_blocks("Look ![alt](http://evil.com/img.png?t=secret) and ![](https://evil.com/p.png)\n\n![ref][r]")
+    joined = "\n".join(b["text"] for b in blocks)
+    assert "![" not in joined
+    assert "evil.com" not in joined
+    assert "secret" not in joined
+    assert "Look [image: alt] and [image]" in joined
+    assert neutralize_images("![a (x)](http://e.com/a_(1).png) tail") == "[image: a (x)] tail"
+    # Fenced code is shown verbatim: it is never rendered as Markdown.
+    code = split_blocks("```\n![alt](http://evil.com/x.png)\n```")
+    assert code[0]["kind"] == "code"
+
+
+def test_split_blocks_preserves_links_and_formatting():
+    from strand.ui.bridge import split_blocks
+
+    text = "See [click here](https://example.com) for **bold** and `code`.\n\n- one\n- two\n\n```py\nx = 1\n```"
+    blocks = split_blocks(text)
+    assert blocks[0]["text"] == "See [click here](https://example.com) for **bold** and `code`."
+    assert blocks[1]["text"] == "- one\n- two"
+    assert (blocks[2]["kind"], blocks[2]["text"]) == ("code", "x = 1")
+
+
+def test_egress_guard_installs_on_engine(qapp):
+    from PySide6.QtQml import QQmlEngine
+
+    from strand.ui.app import install_egress_guard
+
+    engine = QQmlEngine()
+    factory = install_egress_guard(engine)
+    assert factory is not None
+    assert engine.networkAccessManager() is not None
+    engine.deleteLater()
+
+
+def test_is_configured_and_configure_engine_gemini(qapp, home):
+    import stat
+
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    assert b.isConfigured is False
+    assert b.configureEngine("gemini", "  ", "") is False  # key required, file untouched
+    assert not (home / ".config" / "strand" / "config.json").exists()
+    assert b.configureEngine("gemini", "AIza-test", "") is True
+    path = home / ".config" / "strand" / "config.json"
+    data = json.loads(path.read_text())
+    assert data["upstream_api_key"] == "AIza-test" and data["model_default"] == "gemini-3.6-flash"
+    assert "generativelanguage.googleapis.com" in data["upstream_url"]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert b.isConfigured is True and b.modelName == "gemini-3.6-flash"
+    assert b.configureEngine("bogus", "k", "m") is False
+
+
+def test_configure_engine_ollama(qapp, home, monkeypatch):
+    from strand import config as config_mod
+
+    monkeypatch.setattr(config_mod, "detect_ollama_model", lambda timeout=1.5: "")
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    assert b.configureEngine("ollama", "", "") is False  # nothing local to connect to
+    monkeypatch.setattr(config_mod, "detect_ollama_model", lambda timeout=1.5: "llama3.2:3b")
+    assert b.configureEngine("ollama", "", "") is True
+    assert b.isConfigured is True and b.modelName == "llama3.2:3b"
+    assert json.loads((home / ".config" / "strand" / "config.json").read_text())["upstream_url"] == "http://127.0.0.1:11434/v1"
+
+
+def test_qml_welcome_card_first_run(qapp, home):
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    card = win.findChild(object, "welcomeCard")
+    assert card is not None and card.property("visible") is True
+    assert win.property("welcomeActive") is True
+    engine.deleteLater()
+
+
+def test_qml_welcome_card_provider_selector(qapp, home):
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    box = win.findChild(object, "welcomeProviderBox")
+    assert box is not None and box.property("count") == 6 and box.property("currentIndex") == 0
+    assert win.findChild(object, "welcomeOllama") is None  # old static buttons are gone
+    key = win.findChild(object, "welcomeKeyEdit")
+    assert key.property("visible") is True and key.property("placeholderText") == "API key"
+    model = win.findChild(object, "welcomeModelBox")
+    assert model.property("editable") is True and model.property("editText") == "gemini-3.6-flash"
+    assert win.findChild(object, "welcomeEndpointEdit").property("visible") is False
+    assert win.findChild(object, "welcomeProbeStatus") is not None
+    engine.deleteLater()
+
+
+def test_qml_no_welcome_card_when_configured(qapp, home):
+    b = make_bridge(lambda r: httpx.Response(200, json={}), config=Config(upstream_api_key="k"))
+    engine, win = _load_window(b)
+    assert win.property("welcomeActive") is False
+    assert win.findChild(object, "welcomeCard").property("visible") is False
+    engine.deleteLater()
+
+
+# -- 3-beat conduit: grounding strike / distilling lifecycle -------------------------------
+def test_distilling_set_on_stream_finish_and_clears_after_timeout(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("hi")))
+    seen = []
+    b.distillingChanged.connect(lambda: seen.append(b.distilling))
+    assert b.distilling is False and not b._distill_timer.isActive()
+    b.streamFinished.emit()
+    assert b.distilling is True and b._distill_timer.isActive()
+    assert b._distill_timer.isSingleShot() and b._distill_timer.interval() == 1800
+    b._distill_timer.timeout.emit()
+    assert b.distilling is False and seen == [True, False]
+
+
+def test_distilling_real_timeout_fires(qapp):
+    import time
+
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("hi")))
+    b._distill_timer.setInterval(20)
+    b.streamFinished.emit()
+    assert b.distilling is True
+    deadline = time.monotonic() + 2
+    while b.distilling and time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.005)
+    assert b.distilling is False and not b._distill_timer.isActive()
+
+
+def test_grounding_strike_on_submit_clears_on_first_chunk(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("hi")))
+    seen = []
+    b.groundingActiveChanged.connect(lambda: seen.append(b.grounding))
+    assert b.grounding is False
+    b._begin_strike()
+    assert b.grounding is True and b._strike_timer.interval() == 150
+    b._emit_text("x")
+    assert b.grounding is False and seen == [True, False]
+
+
+def test_send_message_activates_grounding(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("hi")))
+    b.sendMessage("hello")
+    assert b.grounding is True
+    b._end_strike()
+    for t in list(b._workers):
+        t.join(2)
+
+
+def test_conduit_glyph_wired_in_qml(qapp):
+    from PySide6.QtCore import QUrl
+    from PySide6.QtQml import QQmlApplicationEngine
+    from PySide6.QtQuickControls2 import QQuickStyle
+
+    from strand.ui.app import MAIN_QML
+
+    QQuickStyle.setStyle("Basic")
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine = QQmlApplicationEngine()
+    engine.rootContext().setContextProperty("bridge", b)
+    engine.load(QUrl.fromLocalFile(str(MAIN_QML)))
+    win = engine.rootObjects()[0]
+    glyph = win.findChild(object, "brandDot")
+    assert glyph is not None
+    qml = (MAIN_QML.parent / "ConduitGlyph.qml").read_text()
+    assert "layer.enabled: true" in qml and "layer.smooth: true" in qml
+    assert glyph.property("active") is False  # idle: nothing animating
+    assert win.findChild(object, "weaveGlyph").property("visible") is False
+    b.streamFinished.emit()
+    assert glyph.property("ingress") is True
+    b._distill_timer.timeout.emit()
+    assert glyph.property("active") is False
+    engine.deleteLater()
+
+
+def _run_probe(handler, url, key="", provider=""):
+    factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))  # noqa: E731
+    b = Bridge(config=Config(), model="m", probe_factory=factory)
+    statuses = []
+    b.probeStatusChanged.connect(lambda: statuses.append(b.probeStatus))
+    b.probeModels(url, key, provider)
+    assert b.probeStatus == "probing" and b.isProbingModels is True
+    import time
+
+    deadline = time.time() + 5
+    while b.isProbingModels and time.time() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
+    b.shutdown()
+    return b, statuses
+
+
+def test_probe_models_openai_filters_non_chat(qapp):
+    seen = []
+
+    def handler(request):
+        seen.append((str(request.url), request.headers.get("authorization")))
+        ids = ["gpt-4o", "text-embedding-3-small", "whisper-1", "tts-1", "dall-e-3", "bge-m3", "omni-moderation-latest", "gpt-4o-mini"]
+        return httpx.Response(200, json={"data": [{"id": i} for i in ids]})
+
+    b, statuses = _run_probe(handler, "https://h/v1/", "sk-x", "custom")
+    assert seen == [("https://h/v1/models", "Bearer sk-x")]
+    assert b.availableModels == ["gpt-4o-mini", "gpt-4o"]
+    assert b.probeStatus == "success" and b.isProbingModels is False
+    assert statuses == ["probing", "success"]
+
+
+def test_probe_models_sorts_fast_first(qapp):
+    ids = ["gpt-4o", "gemini-3.6-flash", "o1", "gemini-3.5-flash-lite", "gpt-4o-mini"]
+    handler = lambda r: httpx.Response(200, json={"data": [{"id": i} for i in ids]})  # noqa: E731
+    b, _ = _run_probe(handler, "https://h/v1", "", "custom")
+    assert b.availableModels == ["gemini-3.5-flash-lite", "gpt-4o-mini", "gemini-3.6-flash", "gpt-4o", "o1"]
+
+
+def test_model_sort_key_tiers():
+    from strand.ui.bridge import _model_sort_key
+
+    ids = ["claude-opus-4", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-pro", "deepseek-r1:7b", "pinned-x"]
+    assert sorted(ids, key=lambda m: _model_sort_key(m, "pinned-x")) == [
+        "pinned-x", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-pro", "deepseek-r1:7b", "claude-opus-4",
+    ]
+
+
+def test_probe_models_ollama_tags(qapp):
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"models": [{"name": "llama3:8b"}, {"name": "nomic-embed-text"}, {"model": "qwen3"}]})
+
+    b, _ = _run_probe(handler, "http://127.0.0.1:11434", "", "ollama")
+    assert seen == ["http://127.0.0.1:11434/api/tags"]
+    assert b.availableModels == ["qwen3", "llama3:8b"]
+    assert b.probeStatus == "success"
+
+
+def test_probe_models_failures_are_silent(qapp):
+    def timeout(request):
+        raise httpx.ConnectTimeout("slow")
+
+    def refuse(request):
+        raise httpx.ConnectError("no")
+
+    for handler in (timeout, refuse, lambda r: httpx.Response(500), lambda r: httpx.Response(200, text="not json")):
+        b, _ = _run_probe(handler, "http://h/v1")
+        assert b.probeStatus == "failed" and b.availableModels == [] and b.isProbingModels is False
+    b, _ = _run_probe(lambda r: httpx.Response(200, json={}), "not-a-url")
+    assert b.probeStatus == "failed"
+
+
+def test_engine_updates_presets_and_endpoint_override():
+    from strand.config import engine_updates
+
+    assert engine_updates("openrouter", "k", "m")["upstream_url"] == "https://openrouter.ai/api/v1"
+    assert engine_updates("xai", "k", "m")["upstream_url"] == "https://api.x.ai/v1"
+    assert engine_updates("openrouter", "k", "m", "https://proxy/v1")["upstream_url"] == "https://proxy/v1"
+    assert engine_updates("custom", "k", "m", "http://h/v1")["upstream_url"] == "http://h/v1"
+
+
+def _run_extractor_probe(handler, url="http://127.0.0.1:11434/v1"):
+    import time
+
+    factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))  # noqa: E731
+    b = Bridge(config=Config(), model="m", probe_factory=factory)
+    b.probeExtractorModels(url)
+    assert b.extractorProbeStatus == "probing"
+    deadline = time.time() + 5
+    while b.extractorProbeStatus == "probing" and time.time() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
+    b.shutdown()
+    return b
+
+
+def test_probe_extractor_models_parses_tags_and_sorts_small_first(qapp):
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        names = ["mistral-large", "qwen2.5:14b", "llama3.2:3b", "phi3:mini", "gemma2:27b"]
+        return httpx.Response(200, json={"models": [{"name": n} for n in names]})
+
+    b = _run_extractor_probe(handler, "http://127.0.0.1:11434/v1/")
+    assert seen == ["http://127.0.0.1:11434/api/tags"]
+    assert b.availableExtractorModels == ["llama3.2:3b", "phi3:mini", "qwen2.5:14b", "gemma2:27b", "mistral-large"]
+    assert b.extractorProbeStatus == "success"
+
+
+def test_probe_extractor_models_offline_is_silent(qapp):
+    def refuse(request):
+        raise httpx.ConnectError("no")
+
+    def timeout(request):
+        raise httpx.ConnectTimeout("slow")
+
+    for handler in (refuse, timeout, lambda r: httpx.Response(500), lambda r: httpx.Response(200, text="nope")):
+        b = _run_extractor_probe(handler)
+        assert b.extractorProbeStatus == "failed" and b.availableExtractorModels == []
+    b = _run_extractor_probe(lambda r: httpx.Response(200, json={}), "not-a-url")
+    assert b.extractorProbeStatus == "failed" and b.availableExtractorModels == []
+
+
+def test_probe_extractor_models_falls_back_to_openai_models(qapp):
+    def handler(request):
+        if request.url.path == "/api/tags":
+            return httpx.Response(404)
+        return httpx.Response(200, json={"data": [{"id": "big"}, {"id": "tiny-3b"}]})
+
+    b = _run_extractor_probe(handler, "http://h:1/v1")
+    assert b.availableExtractorModels == ["tiny-3b", "big"]
+
+
+def test_pattern_based_lightweight_selection():
+    from strand.ui.bridge import _model_sort_key, pick_lightweight_model
+
+    ids = ["big-pro", "vendor-9-flash", "vendor-9-flash-lite", "x-nano", "claude-haiku-z", "opus-q"]
+    assert pick_lightweight_model(ids) == "vendor-9-flash-lite"
+    assert pick_lightweight_model(["big-pro", "vendor-flash", "x-nano"]) == "vendor-flash"
+    assert pick_lightweight_model(["big-pro", "x-NANO"]) == "x-NANO"
+    assert pick_lightweight_model(["big-pro", "gemini-pro"]) == ""
+    assert pick_lightweight_model([]) == ""
+    assert sorted(ids, key=lambda m: _model_sort_key(m, ""))[0] == "vendor-9-flash-lite"
+    assert sorted(ids, key=lambda m: _model_sort_key(m, ""))[-1] == "opus-q"
+
+
+def test_pick_default_model_uses_last_probe(qapp):
+    ids = ["gpt-4o", "some-flash", "some-flash-lite"]
+    b, _ = _run_probe(lambda r: httpx.Response(200, json={"data": [{"id": i} for i in ids]}), "https://h/v1", "", "custom")
+    assert b.pickDefaultModel() == "some-flash-lite"
+    b, _ = _run_probe(lambda r: httpx.Response(500), "https://h/v1")
+    assert b.pickDefaultModel() == ""
+
+
+def _seed_stance(db_file, rows):
+    import sqlite3
+
+    from strand.schema import SCHEMA_SQL
+
+    conn = sqlite3.connect(db_file)
+    conn.executescript(SCHEMA_SQL)
+    op = conn.execute("INSERT INTO entities (name, archetype) VALUES ('Operator', 'person')").lastrowid
+    for name, archetype, weight in rows:
+        tid = conn.execute("INSERT INTO entities (name, archetype) VALUES (?, ?)", (name, archetype)).lastrowid
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, weight) VALUES (?, ?, 'prefers', ?)",
+            (op, tid, weight),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_active_stance_reads_memory_and_settings_card_is_read_only(qapp, home):
+    from PySide6.QtCore import QMetaObject
+
+    db_file = home / "memory.db"
+    b = make_bridge(lambda r: httpx.Response(200, json={}), config=Config(db_path=str(db_file), upstream_api_key="k"))
+    assert b.activeStanceNodes == []  # no database yet
+    engine, win = _load_window(b)
+    assert win.findChild(object, "personaEdit") is None
+    assert win.findChild(object, "saveStance") is None
+    QMetaObject.invokeMethod(win, "openSettings")
+    assert win.findChild(object, "stancePlaceholder").property("visible") is True
+    assert win.findChild(object, "stanceFooter").property("text") == "0 Active Directives in Memory"
+    _seed_stance(
+        db_file,
+        [
+            ("Concise diffs", "directive", 1.0),
+            ("Dry wit", "trait", 0.8),
+            ("Tabs", "preference", 0.5),
+            ("Retired rule", "directive", 0.0),  # deprecated: excluded
+            ("BMW", "vehicle", 1.0),  # not a stance archetype
+        ],
+    )
+    QMetaObject.invokeMethod(win, "openSettings")
+    assert b.activeStanceNodes == ["Concise diffs", "Dry wit", "Tabs"]
+    assert win.findChild(object, "stancePlaceholder").property("visible") is False
+    assert win.findChild(object, "stanceFooter").property("text") == "3 Active Directives in Memory"
     engine.deleteLater()

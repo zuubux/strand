@@ -231,9 +231,25 @@ ApplicationWindow {
     readonly property var diag: bridge ? bridge.diagnostics : null
     property bool drawerOpen: false
     property bool settingsOpen: false
+    // First run: no engine configured and nothing said yet -> Welcome Card replaces chat chrome.
+    property bool welcomeDismissed: false
+    readonly property bool welcomeActive: !welcomeDismissed && bridge ? (!bridge.isConfigured && transcript.count === 0) : false
+    readonly property var welcomePresets: [
+        { label: "Google Gemini (AI Studio)", provider: "gemini", url: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-3.6-flash", custom: false },
+        { label: "Local Ollama (127.0.0.1:11434)", provider: "ollama", url: "http://127.0.0.1:11434/v1", model: "qwen2.5:14b", custom: false },
+        { label: "OpenRouter", provider: "openrouter", url: "https://openrouter.ai/api/v1", model: "anthropic/claude-3.7-sonnet", custom: false },
+        { label: "xAI (Grok)", provider: "xai", url: "https://api.x.ai/v1", model: "grok-2", custom: false },
+        { label: "OpenAI Direct", provider: "custom", url: "https://api.openai.com/v1", model: "gpt-4o-mini", custom: false },
+        { label: "Custom (OpenAI-compatible)", provider: "custom", url: "", model: "", custom: true }
+    ]
+    property int welcomeIndex: 0
+    readonly property var welcomePreset: welcomePresets[welcomeIndex]
+    property string welcomeModel: welcomePresets[0].model
+    property var welcomeModels: []
+    property bool welcomeProbed: false
+    property string welcomeError: ""
     property string extractorMessage: ""
     property bool extractorOk: false
-    property string stanceMessage: ""
     property string routingMessage: ""
     // True while Up/Down is stepping through previously sent prompts.
     property bool browsingHistory: false
@@ -318,21 +334,106 @@ ApplicationWindow {
 
     // Esc: stop the running stream; else dismiss the telemetry drawer; else clear the input.
     function openSettings() {
+        if (welcomeActive)
+            return
         var c = bridge.getConfig()
-        personaEdit.text = c.persona_prompt
         upstreamUrlEdit.text = c.upstream_url
         modelEdit.text = c.model_default
         apiKeyEdit.text = ""
         apiKeyEdit.placeholderText = c.upstream_api_key_set ? "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022  (anchored to disk 0600)" : "Enter upstream API key..."
         extractorUrlEdit.text = c.extractor_url
-        extractorModelEdit.text = c.extractor_model
-        failClosedBox.checked = c.fail_closed_private
+        extractorModelBox.editText = c.extractor_model
         redactBox.checked = c.redact_secrets
         decayHorizon = !c.decay_enabled ? "permanent" : (c.decay_half_life_days <= 7.5 ? "sprint" : "balanced")
         extractorMessage = ""
-        stanceMessage = ""
+        bridge.refreshActiveStance()
         routingMessage = ""
         settingsOpen = true
+        bridge.probeExtractorModels(root.extractorProbeUrl())
+    }
+
+    // Extractor endpoint to probe: the typed URL, else the placeholder default (local Ollama).
+    function extractorProbeUrl() {
+        var url = (extractorUrlEdit.text && extractorUrlEdit.text.trim().length > 0) ? extractorUrlEdit.text.trim() : "http://127.0.0.1:11434/v1"
+        return url
+    }
+
+    function welcomeEndpoint() {
+        return welcomePreset.custom ? welcomeEndpointEdit.text.trim() : welcomePreset.url
+    }
+
+    // Provider change: reset discovered models, apply the preset default; Ollama probes immediately.
+    function selectWelcomeProvider(index) {
+        welcomeProbeTimer.stop()
+        welcomeIndex = index
+        welcomeProbed = false
+        welcomeModels = []
+        welcomeModel = welcomePreset.model
+        welcomeModelBox.editText = welcomeModel
+        welcomeError = ""
+        if (welcomePreset.provider === "ollama") {
+            welcomeProbed = true
+            bridge.probeModels("http://127.0.0.1:11434/v1", "", "ollama")
+        }
+    }
+
+    // Debounced (400 ms) probe: a pasted key of >= 20 chars (and a URL for Custom) triggers discovery.
+    function scheduleWelcomeProbe() {
+        welcomeProbeTimer.restart()
+    }
+
+    function probeWelcomeModels() {
+        var key = welcomeKeyEdit.text.trim()
+        var url = welcomeEndpoint()
+        if (welcomePreset.provider === "ollama" || key.length < 20 || url.length === 0)
+            return
+        welcomeProbed = true
+        bridge.probeModels(url, key, welcomePreset.provider)
+    }
+
+    function applyWelcomeModels() {
+        if (!welcomeProbed)
+            return  // stale result from a previous provider
+        var list = bridge.availableModels
+        welcomeModels = list
+        if (list.length > 0 && list.indexOf(welcomeModel) < 0) {
+            if (welcomePreset.provider === "ollama") {
+                welcomeModel = list[0]
+            } else if (welcomeModel === welcomePreset.model) {
+                // Untouched preset default missing upstream: take the first lightweight (lite/flash) match.
+                var light = bridge.pickDefaultModel()
+                if (light.length > 0)
+                    welcomeModel = light
+            }
+        }
+        var i = list.indexOf(welcomeModel)
+        if (i >= 0)
+            welcomeModelBox.currentIndex = i
+        welcomeModelBox.editText = welcomeModel
+    }
+
+    // Welcome Card: persist the chosen engine, fade the card out, then start Day Zero onboarding.
+    function connectEngine() {
+        welcomeError = ""
+        var local = welcomePreset.provider === "ollama"
+        var model = (welcomeModelBox.editText || welcomeModel).trim()
+        var ok = bridge.configureEngine(welcomePreset.provider, local ? "" : welcomeKeyEdit.text, model, welcomeEndpoint())
+        if (!ok) {
+            welcomeError = local ? "No local Ollama model found at http://127.0.0.1:11434."
+                : welcomePreset.custom ? "Enter a valid endpoint URL, API key and model name."
+                : "Enter a valid API key and model name."
+            return false
+        }
+        welcomeKeyEdit.text = ""
+        welcomeDismissed = true
+        beginOnboarding()
+        return true
+    }
+
+    function beginOnboarding() {
+        var feedback = bridge.runCommand("/onboard")
+        if (feedback.length > 0 && bridge.busy)
+            transcript.append({ role: "assistant", body: "", pending: true, trail: "" })
     }
 
     function closeSettings() {
@@ -587,33 +688,12 @@ ApplicationWindow {
                 anchors.leftMargin: 16
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 9
-                Item {
-                    width: 10
-                    height: 10
+                ConduitGlyph {
+                    id: brandDot
+                    objectName: "brandDot"
+                    width: 24
+                    height: 24
                     anchors.verticalCenter: parent.verticalCenter
-                    Rectangle {
-                        id: brandDot
-                        objectName: "brandDot"
-                        anchors.centerIn: parent
-                        width: 6
-                        height: 6
-                        radius: 3
-                        readonly property bool busy: bridge ? bridge.busy : false
-                        // Grounding pulse: memory retrieved, first token not yet shown.
-                        readonly property bool grounding: bridge ? bridge.groundingPulse : false
-                        color: grounding ? theme.cyanSoft : theme.cyan
-                        Behavior on color { ColorAnimation { duration: 320 } }
-                        opacity: 0.85
-                        layer.enabled: true
-                        NumberAnimation { id: settle; target: brandDot; property: "opacity"; to: 0.85; duration: 320; easing.type: Easing.OutSine }
-                        SequentialAnimation {
-                            running: brandDot.busy
-                            loops: Animation.Infinite
-                            onRunningChanged: if (!running) settle.start(); else settle.stop()
-                            NumberAnimation { target: brandDot; property: "opacity"; to: brandDot.grounding ? 0.25 : 0.35; duration: brandDot.grounding ? 520 : 700; easing.type: Easing.InOutSine }
-                            NumberAnimation { target: brandDot; property: "opacity"; to: 0.9; duration: brandDot.grounding ? 520 : 700; easing.type: Easing.InOutSine }
-                        }
-                    }
                 }
                 Label {
                     anchors.verticalCenter: parent.verticalCenter
@@ -637,8 +717,8 @@ ApplicationWindow {
                 Label {
                     id: lockGlyph
                     anchors.centerIn: parent
-                    text: lockButton.active ? "\uD83D\uDD12\uFE0E" : "\uD83D\uDD13\uFE0E"
-                    color: lockButton.active ? theme.amber : Qt.rgba(1, 1, 1, 0.25)
+                    text: lockButton.active ? "\uD83D\uDD13\uFE0E" : "\uD83D\uDD12\uFE0E"
+                    color: lockButton.active ? theme.amber : Qt.rgba(1, 1, 1, 0.28)
                     font.pixelSize: 13
                 }
                 MouseArea {
@@ -649,7 +729,9 @@ ApplicationWindow {
                     onClicked: if (bridge) bridge.runCommand(bridge.privateMode ? "/private off" : "/private on")
                 }
                 ToolTip.visible: lockMouse.containsMouse
-                ToolTip.text: "Toggle Private Egress"
+                ToolTip.text: lockButton.active
+                    ? "\u26A0\uFE0F Private items unlocked (Click to keep local)"
+                    : "Private items protected (Click to include in prompt)"
             }
         }
 
@@ -673,7 +755,7 @@ ApplicationWindow {
 
             Label {
                 anchors.centerIn: parent
-                visible: transcript.count === 0
+                visible: transcript.count === 0 && !root.welcomeActive && !welcomeCard.visible
                 text: "Ask Strand anything"
                 color: root.dim
                 font.pixelSize: 15
@@ -769,7 +851,7 @@ ApplicationWindow {
                         font.pixelSize: root.bodyPixelSize
                         text: (bubble.isThinking ? "\u2026" : row.body)
                     }
-                    readonly property real naturalWidth: Math.ceil(textMetrics.advanceWidth) + 2 * hPad + 2
+                    readonly property real naturalWidth: (isThinking ? 24 : Math.ceil(textMetrics.advanceWidth)) + 2 * hPad + 2
                     x: row.isUser ? row.width - width - edge : edge
                     y: row.bodyTop
                     // Notes use the full column; user cards and the assistant thinking pill shrink to fit;
@@ -812,15 +894,12 @@ ApplicationWindow {
                             font.pixelSize: root.bodyPixelSize
                         }
 
-                        // Assistant replies: markdown narrative blocks and fenced technical cards.
-                        Repeater {
-                            model: !bridge || !bubble.isThinking ? [] : bridge.segments("…")
-                            delegate: Loader {
-                                required property var modelData
-                                width: content.width
-                                sourceComponent: modelData.code ? codeBlock : textBlock
-                                property var segment: modelData
-                            }
+                        // Live thinking placeholder while awaiting the first token.
+                        ConduitGlyph {
+                            objectName: "thinkingGlyph"
+                            visible: bubble.isThinking
+                            width: visible ? 24 : 0
+                            height: visible ? 24 : 0
                         }
                     }
                 }
@@ -945,7 +1024,16 @@ ApplicationWindow {
                             }
                         }
                     }
-                    ScrollBar.vertical: ScrollBar { }
+                    // Only exists once the text outgrows the 180px dock ceiling; never on hover
+                    // over a single-line/empty input.
+                    ScrollBar.vertical: ScrollBar {
+                        policy: inputFlick.contentHeight > 180 ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+                        visible: inputFlick.contentHeight > 180
+                    }
+                    ScrollBar.horizontal: ScrollBar {
+                        policy: ScrollBar.AlwaysOff
+                        visible: false
+                    }
                 }
 
                 Label {
@@ -985,9 +1073,20 @@ ApplicationWindow {
                     Behavior on color { ColorAnimation { duration: 120 } }
                     Label {
                         anchors.centerIn: parent
+                        visible: !weaveGlyph.visible
                         text: "\u223F"
                         color: root.drawerOpen ? root.accent : root.dim
                         font.pixelSize: 14
+                    }
+                    // Mirrors the conduit state (busy / Model B weaving) with a subtle pulse.
+                    ConduitGlyph {
+                        id: weaveGlyph
+                        objectName: "weaveGlyph"
+                        anchors.centerIn: parent
+                        width: 18
+                        height: 18
+                        visible: bridge ? (bridge.busy || bridge.distilling) : false
+                        opacity: 0.8
                     }
                     MouseArea {
                         id: telemetryButtonMouse
@@ -1049,15 +1148,21 @@ ApplicationWindow {
         width: 280
         height: Math.round(parent.height * 0.7)
         y: Math.round((parent.height - height) / 2)
-        x: open ? parent.width - width - 12 : parent.width
-        visible: x < parent.width
+        // Slide progress (0 closed, 1 open) is the only animated value, so window resizes
+        // reflow x instantly; closed rests 80 px beyond the edge to hide any layout lag.
+        property real progress: root.drawerOpen ? 1 : 0
+        x: (parent.width + 80) + progress * ((parent.width - width - 12) - (parent.width + 80))
+        opacity: progress
+        visible: opacity > 0 && (root.drawerOpen || drawerSlideAnimation.running)
         clip: true
         radius: 16
         // Near-opaque #0d1117 surface (0.96) so transcript text never ghosts through.
         color: Qt.rgba(0.051, 0.067, 0.090, 0.96)
         border.color: Qt.rgba(1, 1, 1, 0.08)
         border.width: 1
-        Behavior on x { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+        Behavior on progress {
+            NumberAnimation { id: drawerSlideAnimation; duration: 140; easing.type: Easing.OutCubic }
+        }
 
         // Swallow stray clicks on the sheet so they never reach the dismiss scrim.
         MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons }
@@ -1184,6 +1289,164 @@ ApplicationWindow {
         }
     }
 
+    // First-run Welcome Card: centered over the chat view until an engine is connected.
+    Rectangle {
+        id: welcomeCard
+        objectName: "welcomeCard"
+        z: 90
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 64, 460)
+        height: welcomeColumn.implicitHeight + 48
+        radius: 16
+        color: Qt.rgba(root.panel.r, root.panel.g, root.panel.b, 0.97)
+        border.color: Qt.rgba(1, 1, 1, 0.10)
+        border.width: 1
+        opacity: root.welcomeActive ? 1 : 0
+        visible: opacity > 0
+        Behavior on opacity { NumberAnimation { duration: 320; easing.type: Easing.OutCubic } }
+
+        ColumnLayout {
+            id: welcomeColumn
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 24
+            spacing: 12
+
+            Label {
+                text: "Welcome to Strand"
+                color: root.textColor
+                font.pixelSize: 22
+                font.weight: Font.DemiBold
+                Layout.alignment: Qt.AlignHCenter
+            }
+            Label {
+                text: "Connect an inference engine to begin our onboarding conversation."
+                color: root.dim
+                font.pixelSize: 13
+                wrapMode: Text.WordWrap
+                horizontalAlignment: Text.AlignHCenter
+                Layout.fillWidth: true
+            }
+
+            ComboBox {
+                id: welcomeProviderBox
+                objectName: "welcomeProviderBox"
+                Layout.fillWidth: true
+                model: root.welcomePresets
+                textRole: "label"
+                currentIndex: 0
+                font.pixelSize: 13
+                onActivated: root.selectWelcomeProvider(currentIndex)
+            }
+
+            TextField {
+                id: welcomeEndpointEdit
+                objectName: "welcomeEndpointEdit"
+                visible: root.welcomePreset.custom === true
+                Layout.fillWidth: true
+                placeholderText: "Endpoint URL (e.g. http://127.0.0.1:8000/v1)"
+                color: root.textColor
+                selectionColor: root.accent
+                font.family: root.monoFamily
+                font.pixelSize: 12
+                leftPadding: 10
+                rightPadding: 10
+                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
+                onTextChanged: root.scheduleWelcomeProbe()
+                onAccepted: root.connectEngine()
+            }
+
+            TextField {
+                id: welcomeKeyEdit
+                objectName: "welcomeKeyEdit"
+                visible: root.welcomePreset.provider !== "ollama"
+                Layout.fillWidth: true
+                echoMode: TextInput.Password
+                placeholderText: "API key"
+                color: root.textColor
+                selectionColor: root.accent
+                font.family: root.monoFamily
+                font.pixelSize: 12
+                leftPadding: 10
+                rightPadding: 10
+                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
+                onTextChanged: root.scheduleWelcomeProbe()
+                onAccepted: root.connectEngine()
+            }
+
+            ComboBox {
+                id: welcomeModelBox
+                objectName: "welcomeModelBox"
+                Layout.fillWidth: true
+                editable: true
+                model: root.welcomeModels
+                font.family: root.monoFamily
+                font.pixelSize: 12
+                onActivated: root.welcomeModel = currentText
+                onEditTextChanged: if (activeFocus) root.welcomeModel = editText
+                Component.onCompleted: editText = root.welcomeModel
+            }
+
+            Label {
+                objectName: "welcomeProbeStatus"
+                visible: text.length > 0
+                text: !root.welcomeProbed ? ""
+                    : bridge.isProbingModels ? "Probing available models..."
+                    : bridge.probeStatus === "success" ? "\u2713 Found " + bridge.availableModels.length + " models"
+                    : bridge.probeStatus === "failed" ? "Could not auto-detect models (enter manually)"
+                    : ""
+                color: root.dim
+                font.pixelSize: 11
+                Layout.fillWidth: true
+            }
+
+            Timer {
+                id: welcomeProbeTimer
+                interval: 400
+                repeat: false
+                onTriggered: root.probeWelcomeModels()
+            }
+            Connections {
+                target: bridge
+                function onAvailableModelsChanged() { root.applyWelcomeModels() }
+            }
+
+            Label {
+                objectName: "welcomeError"
+                visible: root.welcomeError.length > 0
+                text: root.welcomeError
+                color: theme.warn
+                font.pixelSize: 12
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+            }
+
+            Rectangle {
+                id: connectButton
+                objectName: "welcomeConnect"
+                Layout.fillWidth: true
+                Layout.preferredHeight: 40
+                radius: 8
+                color: connectMouse.containsMouse ? Qt.lighter(theme.accent, 1.1) : theme.accent
+                Behavior on color { ColorAnimation { duration: 120 } }
+                Label {
+                    anchors.centerIn: parent
+                    text: "Connect & Begin"
+                    color: "#0b0e12"
+                    font.pixelSize: 14
+                    font.weight: Font.DemiBold
+                }
+                MouseArea {
+                    id: connectMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    onClicked: root.connectEngine()
+                }
+            }
+        }
+    }
+
     // Settings modal: dim backdrop (click to dismiss) beneath a centered card stack.
     MouseArea {
         id: settingsBackdrop
@@ -1200,7 +1463,7 @@ ApplicationWindow {
         id: settingsModal
         objectName: "settingsModal"
         z: 110
-        visible: root.settingsOpen
+        visible: root.settingsOpen && !root.welcomeActive
         width: Math.min(parent.width - 64, 960)
         height: Math.min(parent.height - 48, 640)
         anchors.centerIn: parent
@@ -1257,7 +1520,7 @@ ApplicationWindow {
                     Layout.fillHeight: true
                     spacing: 12
 
-                    // Panel A: bedrock persona stance
+                    // Panel A: read-only active stance mirror
                     Rectangle {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
@@ -1269,7 +1532,8 @@ ApplicationWindow {
                             anchors.margins: 14
                             spacing: 6
                             Label {
-                                text: "PERSONA ANCHOR"
+                                objectName: "stanceTitle"
+                                text: "ACTIVE STANCE"
                                 color: root.textColor
                                 font.family: root.uiFamily
                                 font.pixelSize: 12
@@ -1278,50 +1542,57 @@ ApplicationWindow {
                             }
                             Label {
                                 Layout.fillWidth: true
-                                text: "The core identity injected on Turn 1 to override corporate boilerplate."
+                                text: "Learned interaction style and behavioral guardrails."
                                 wrapMode: Text.WordWrap
                                 color: root.dim
                                 opacity: 0.8
                                 font.family: root.uiFamily
                                 font.pixelSize: 11
                             }
-                            ScrollView {
+                            Column {
+                                id: stanceList
+                                objectName: "stanceList"
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
-                                Layout.minimumHeight: 90
-                                TextArea {
-                                    id: personaEdit
-                                    objectName: "personaEdit"
-                                    color: root.textColor
-                                    selectionColor: root.accent
-                                    font.family: root.monoFamily
-                                    font.pixelSize: 12
-                                    wrapMode: TextEdit.Wrap
-                                    leftPadding: 10
-                                    rightPadding: 10
-                                    topPadding: 8
-                                    bottomPadding: 8
-                                    placeholderText: "Core stance injected ahead of the personality matrix"
-                                    background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
+                                Layout.topMargin: 6
+                                spacing: 6
+                                visible: bridge.activeStanceNodes.length > 0
+                                Repeater {
+                                    model: bridge.activeStanceNodes
+                                    delegate: Label {
+                                        width: stanceList.width
+                                        text: "\u2022 " + modelData
+                                        wrapMode: Text.WordWrap
+                                        color: Qt.rgba(0.82, 0.85, 0.9, 0.85)
+                                        lineHeight: 1.25
+                                        font.family: root.uiFamily
+                                        font.pixelSize: 12
+                                    }
                                 }
                             }
-                            RowLayout {
+                            Label {
+                                id: stancePlaceholder
+                                objectName: "stancePlaceholder"
                                 Layout.fillWidth: true
-                                spacing: 12
-                                Label {
-                                    id: stanceStatus
-                                    objectName: "stanceStatus"
-                                    Layout.fillWidth: true
-                                    horizontalAlignment: Text.AlignRight
-                                    text: root.stanceMessage
-                                    color: root.stanceMessage === "Warp anchored" ? root.diffAdded : root.diffRemoved
-                                    font.pixelSize: 11
-                                }
-                                SleekButton {
-                                    objectName: "saveStance"
-                                    text: "Save Stance"
-                                    onClicked: root.stanceMessage = root.persist({ persona_prompt: personaEdit.text }) ? "Warp anchored" : "Save failed"
-                                }
+                                Layout.fillHeight: true
+                                Layout.topMargin: 6
+                                visible: bridge.activeStanceNodes.length === 0
+                                text: "Adapting to your workflow. Standing directives and stylistic preferences will appear here as Strand learns your habits."
+                                wrapMode: Text.WordWrap
+                                color: root.dim
+                                font.family: root.uiFamily
+                                font.pixelSize: 12
+                                font.italic: true
+                                lineHeight: 1.25
+                            }
+                            Label {
+                                objectName: "stanceFooter"
+                                Layout.fillWidth: true
+                                horizontalAlignment: Text.AlignRight
+                                text: bridge.activeStanceCount + " Active Directives in Memory"
+                                color: root.dim
+                                font.family: root.uiFamily
+                                font.pixelSize: 11
                             }
                         }
                     }
@@ -1349,18 +1620,6 @@ ApplicationWindow {
                                 font.letterSpacing: 1.0
                             }
                             CompactCheckBox {
-                                id: failClosedBox
-                                objectName: "failClosedBox"
-                                text: "Sovereign Fiber Isolation"
-                                onToggled: root.persist({ fail_closed_private: checked })
-                            }
-                            ConsequenceLabel {
-                                active: failClosedBox.checked
-                                warnUnchecked: true
-                                checkedText: "Quarantine private strands locally. Never sent to external LLMs unless unlocked via /private."
-                                uncheckedText: "Warning: Private strands will be transmitted to external LLMs whenever relevant."
-                            }
-                            CompactCheckBox {
                                 id: redactBox
                                 objectName: "redactBox"
                                 text: "Thread Secret Redaction"
@@ -1369,8 +1628,8 @@ ApplicationWindow {
                             ConsequenceLabel {
                                 active: redactBox.checked
                                 warnUnchecked: true
-                                checkedText: "Scrub high-entropy API keys, tokens, and certs before storing or sending to external models."
-                                uncheckedText: "Warning: Raw credentials and tokens will be saved to disk and may leak to external LLMs."
+                                checkedText: "Scrub API keys, passwords, and tokens before sending prompts."
+                                uncheckedText: "Warning: Credentials and tokens are stored raw and may reach external models."
                             }
                             Label {
                                 Layout.topMargin: 8
@@ -1612,19 +1871,52 @@ ApplicationWindow {
                                 font.pixelSize: 11
                                 font.letterSpacing: 0.5
                             }
-                            TextField {
-                                id: extractorModelEdit
-                                objectName: "extractorModelEdit"
+                            ComboBox {
+                                id: extractorModelBox
+                                objectName: "extractorModelBox"
                                 Layout.fillWidth: true
-                                placeholderText: "e.g. qwen2.5:3b or llama3.2:3b"
-                                color: root.textColor
-                                selectionColor: root.accent
+                                editable: true
+                                model: bridge.availableExtractorModels
                                 font.family: root.monoFamily
                                 font.pixelSize: 12
-                                leftPadding: 10
-                                rightPadding: 10
-                                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
-                                onEditingFinished: root.persist({ extractor_model: text })
+                                // Free typing stays possible for custom endpoints or when offline.
+                                onActivated: root.persist({ extractor_model: currentText })
+                                onAccepted: root.persist({ extractor_model: editText })
+                                onActiveFocusChanged: if (!activeFocus && settingsOpen) root.persist({ extractor_model: editText })
+                                function applyDetected() {
+                                    var list = bridge.availableExtractorModels
+                                    if (list.length === 0)
+                                        return
+                                    var configured = bridge.getConfig().extractor_model
+                                    var i = configured ? list.indexOf(configured) : -1
+                                    if (i >= 0) {
+                                        currentIndex = i
+                                    } else if (!configured || configured.length === 0) {
+                                        currentIndex = 0
+                                    }
+                                    if (i >= 0 || !configured || configured.length === 0)
+                                        editText = list[currentIndex]
+                                    else
+                                        editText = configured
+                                }
+                                Connections {
+                                    target: bridge
+                                    function onAvailableExtractorModelsChanged() {
+                                        extractorModelBox.applyDetected()
+                                    }
+                                }
+                            }
+                            Label {
+                                objectName: "extractorModelsStatus"
+                                visible: text.length > 0
+                                text: bridge.extractorProbeStatus === "success" && bridge.availableExtractorModels.length > 0
+                                    ? "\u2713 Detected " + bridge.availableExtractorModels.length + " local models"
+                                    : bridge.extractorProbeStatus === "failed" || (bridge.extractorProbeStatus === "success" && bridge.availableExtractorModels.length === 0)
+                                    ? "Ollama offline (start with 'ollama serve')"
+                                    : ""
+                                color: bridge.availableExtractorModels.length > 0 ? root.diffAdded : root.dim
+                                font.pixelSize: 11
+                                Layout.fillWidth: true
                             }
                             RowLayout {
                                 Layout.fillWidth: true
@@ -1641,10 +1933,11 @@ ApplicationWindow {
                                     objectName: "testConnection"
                                     text: "Test Connection"
                                     onClicked: {
-                                        root.persist({ extractor_url: extractorUrlEdit.text, extractor_model: extractorModelEdit.text })
+                                        root.persist({ extractor_url: extractorUrlEdit.text, extractor_model: extractorModelBox.editText })
                                         root.extractorOk = false
                                         root.extractorMessage = "Testing\u2026"
-                                        bridge.testExtractor(extractorUrlEdit.text)
+                                        var targetUrl = (extractorUrlEdit.text && extractorUrlEdit.text.trim().length > 0) ? extractorUrlEdit.text.trim() : "http://127.0.0.1:11434/v1"
+                                        bridge.testExtractor(targetUrl)
                                     }
                                 }
                             }

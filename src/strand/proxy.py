@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
-from .common import strip_think
+from .common import safe_exc, strip_think
 from .config import Config, save_config_value
 from .distill import DistillationEngine
 from .host import get_host_context, redact_host_context
@@ -64,6 +64,15 @@ def _last_user_query(messages: list[Any]) -> str:
         if isinstance(message, dict) and message.get("role") == "user":
             return _text_of(message.get("content"))
     return ""
+
+
+def _system_text(messages: list[Any]) -> str:
+    """Concatenated text of every system/developer message the client sent."""
+    return "\n".join(
+        _text_of(m.get("content"))
+        for m in messages
+        if isinstance(m, dict) and m.get("role") in _CONTEXT_ROLES
+    )
 
 
 def _inject_delta(messages: list[Any], delta: str) -> list[Any]:
@@ -331,7 +340,9 @@ async def _buffer_until_decided(upstream: httpx.Response) -> tuple[bytes, httpx.
     return b"".join(head), None
 
 
-async def _run_tool_call(call: dict[str, Any], roots: list[Path]) -> dict[str, Any]:
+async def _run_tool_call(
+    call: dict[str, Any], roots: list[Path], redact: bool = True
+) -> dict[str, Any]:
     """Execute one tool call locally; the result is an ephemeral `role: tool` message."""
     function = call["function"]
     try:
@@ -339,7 +350,10 @@ async def _run_tool_call(call: dict[str, Any], roots: list[Path]) -> dict[str, A
     except ValueError:
         arguments = None  # dispatch_tool_call reports invalid_arguments
     result = await asyncio.to_thread(dispatch_tool_call, function["name"], arguments, roots)
-    return {"role": "tool", "tool_call_id": call["id"], "content": json.dumps(result)}
+    content = json.dumps(result)
+    if redact:  # SEC-PRIV-007: scrub secrets from tool output before it goes upstream
+        content = sanitize_text(content)
+    return {"role": "tool", "tool_call_id": call["id"], "content": content}
 
 
 def _error(status: int, message: str, kind: str) -> JSONResponse:
@@ -475,7 +489,7 @@ def create_app(
             logger.info("Executing %d local tool call(s) round=%d", len(calls), round_no + 1)
             convo.append({**extras, "role": "assistant", "content": text or None, "tool_calls": calls})
             for call in calls:
-                convo.append(await _run_tool_call(call, roots))
+                convo.append(await _run_tool_call(call, roots, config.redact_secrets))
         content_type = upstream.headers.get("content-type")
         return httpx.Response(
             upstream.status_code, headers={"content-type": content_type} if content_type else None, content=body
@@ -520,7 +534,8 @@ def create_app(
         # Sanitize the whole query before cutting the preview: truncating first could leave a
         # partial secret too short for the redaction patterns to match.
         preview = sanitize_text(query)[:_QUERY_LOG_CHARS]
-        logger.info("Incoming query session=%r chars=%d: %r", session_id, len(query), preview)
+        logger.info("Incoming query length=%d session=%r", len(query), session_id)
+        logger.debug("Incoming query preview session=%r: %r", session_id, preview)
         resolution_failed = False
         try:
             delta = await resolver.resolve(query, session_id, allow_private) if query else ""
@@ -531,6 +546,13 @@ def create_app(
             resolver.ledger.reset(session_id)
             delta = ""
         grounding = _delta_log_fields(delta) if delta else "entities=0 edges=0"
+        if not resolution_failed:
+            # ERG-CTX-005: clients resend only user/assistant history, so replay earlier blocks
+            # the ledger marked seen but the client's system prompt no longer carries.
+            replay = resolver.ledger.replay_context(session_id, _system_text(messages), exclude=delta)
+            if replay:
+                delta = "\n\n".join([*replay, delta] if delta else replay)
+                logger.info("Replayed %d context block(s) session=%r", len(replay), session_id)
         logger.info("Resolved delta session=%r %s", session_id, grounding)
         mode = request.headers.get("x-strand-mode", "").strip().lower()
         try:
@@ -587,9 +609,9 @@ def create_app(
             else:
                 upstream = await post_upstream(payload, headers)
         except httpx.HTTPError as exc:
-            logger.error("Upstream request failed session=%r: %r; session reset", session_id, exc)
+            logger.error("Upstream request failed session=%r: %s; session reset", session_id, safe_exc(exc))
             resolver.ledger.reset(session_id)
-            return _error(502, f"Upstream request failed: {exc!r}", "upstream_error")
+            return _error(502, f"Upstream request failed: {safe_exc(exc)}", "upstream_error")
 
         content_type = upstream.headers.get("content-type")
         if streaming and upstream.status_code < 400:
@@ -598,9 +620,9 @@ def create_app(
             try:
                 body = await upstream.aread()
             except httpx.HTTPError as exc:
-                logger.error("Upstream read failed session=%r: %r; session reset", session_id, exc)
+                logger.error("Upstream read failed session=%r: %s; session reset", session_id, safe_exc(exc))
                 resolver.ledger.reset(session_id)
-                return _error(502, f"Upstream read failed: {exc!r}", "upstream_error")
+                return _error(502, f"Upstream read failed: {safe_exc(exc)}", "upstream_error")
             finally:
                 await upstream.aclose()
             logger.info("Upstream status=%d session=%r", upstream.status_code, session_id)
@@ -630,9 +652,9 @@ def create_app(
                 await asyncio.shield(upstream.aclose())
                 raise
             except httpx.HTTPError as exc:
-                logger.error("Upstream stream interrupted session=%r: %r; session reset", session_id, exc)
+                logger.error("Upstream stream interrupted session=%r: %s; session reset", session_id, safe_exc(exc))
                 resolver.ledger.reset(session_id)
-                error = {"error": {"message": f"Upstream stream interrupted: {exc!r}", "type": "upstream_error"}}
+                error = {"error": {"message": f"Upstream stream interrupted: {safe_exc(exc)}", "type": "upstream_error"}}
                 yield f"data: {json.dumps(error)}\n\n".encode()
             finally:
                 await asyncio.shield(upstream.aclose())

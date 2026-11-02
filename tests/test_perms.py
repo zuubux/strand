@@ -112,3 +112,40 @@ def test_unmanaged_parent_missing_dir_created_0700_not_retightened(tmp_path):
     os.chmod(existing, 0o775)
     save_config_value("log_level", "debug", existing / "config.json")
     assert mode_of(existing) == 0o775
+
+
+
+def _init_logging(path):
+    from strand.logging import setup_logging, shutdown_logging
+
+    try:
+        setup_logging("INFO", path, debug=False)
+    finally:
+        shutdown_logging()
+
+
+def test_logging_in_home_leaves_home_mode_and_file_is_0600(fake_home):
+    path = fake_home / "strand.log"
+    _init_logging(path)
+    assert mode_of(fake_home) == 0o755
+    assert mode_of(path) == 0o600
+
+
+def test_logging_in_unmanaged_dir_leaves_parent_mode(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o775)
+    path = shared / "strand.log"
+    _init_logging(path)
+    assert mode_of(shared) == 0o775
+    assert mode_of(path) == 0o600
+
+
+def test_logging_in_managed_dir_is_tightened_to_0700(fake_home):
+    managed = fake_home / ".local" / "share" / "strand"
+    managed.mkdir(parents=True)
+    os.chmod(managed, 0o755)
+    path = managed / "strand.log"
+    _init_logging(path)
+    assert mode_of(managed) == 0o700
+    assert mode_of(path) == 0o600

@@ -131,3 +131,34 @@ def test_build_app_passes_distance_threshold(tmp_path):
     finally:
         daemon.ContextResolver = original
     assert captured["distance_threshold"] == 0.42
+
+
+def test_helpers_fail_closed_without_allow_private(tmp_path):
+    """SEC-PRIV-003: omitting `allow_private` must never surface private entities."""
+
+    async def go():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            car, owner, secret = await seed(db)
+            await db.upsert_edge(owner, secret, "guards")
+            resolver = ContextResolver(db)
+            query = "Marcus and Vault"
+            default_match = [e.name for e in await resolver.match_entities(query)]
+            open_match = [e.name for e in await resolver.match_entities(query, allow_private=True)]
+            entities, edges = await resolver.gather(query)
+            open_entities, _ = await resolver.gather(query, allow_private=True)
+            roots = await resolver.match_entities(query, allow_private=True)
+            private_ids = {secret}
+            default_roots = (await resolver._gather_with_roots(query))[2]
+            personality = await resolver.personality_entities()
+            return (
+                default_match, open_match, entities, edges, open_entities, default_roots, personality,
+                roots, private_ids,
+            )
+
+    default_match, open_match, entities, edges, open_entities, default_roots, personality, roots, ids = run(go())
+    assert "Vault" not in default_match and "Vault" in open_match
+    assert "Vault" not in [e.name for e in entities] and "Vault" in [e.name for e in open_entities]
+    assert all(e.id not in ids for e in entities)
+    assert all(edge.source_id not in ids and edge.target_id not in ids for edge in edges)
+    assert all(e.name != "Vault" for e in default_roots)
+    assert all(e.name != "Vault" for e in personality)

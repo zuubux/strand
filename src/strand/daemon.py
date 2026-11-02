@@ -9,6 +9,8 @@ import os
 import socket
 import stat
 import sys
+import threading
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -53,6 +55,38 @@ def build_app(config: Config):
         ledger=resolver.ledger,
     )
     return create_app(config, resolver, distill_engine=engine)
+
+
+def notify_ready() -> None:
+    """Tell systemd (Type=notify) the daemon is ready. No-op without $NOTIFY_SOCKET."""
+    sock_path = os.getenv("NOTIFY_SOCKET")
+    if not sock_path:
+        return
+    if sock_path.startswith("@"):
+        sock_path = "\0" + sock_path[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.sendto(b"READY=1", sock_path)
+    except Exception:
+        pass
+
+
+def _notify_when_tcp_ready(host: str, port: int, timeout: float = 60.0) -> None:
+    """TCP mode has no uvicorn hook: poll the port in a daemon thread, then notify."""
+    if not os.getenv("NOTIFY_SOCKET"):
+        return
+
+    def poll() -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection((host, port), timeout=0.5):
+                    notify_ready()
+                    return
+            except OSError:
+                time.sleep(0.1)
+
+    threading.Thread(target=poll, name="strand-notify", daemon=True).start()
 
 
 def _socket_is_live(path: str) -> bool:
@@ -114,6 +148,8 @@ async def _secure_socket(server: uvicorn.Server, socket_path: str) -> None:
             return
         await asyncio.sleep(0.01)
     os.chmod(socket_path, 0o600)
+    # Lifespan startup (SQLite connect + migrations) completed and the socket is listening.
+    notify_ready()
 
 
 async def _serve_uds(app, socket_path: str) -> None:
@@ -162,6 +198,33 @@ def warn_if_exposed(config: Config, log=None) -> bool:
     return True
 
 
+INSECURE_ENV = "STRAND_INSECURE_ALLOW_UNAUTHENTICATED"
+
+
+def insecure_override_enabled(flag: bool = False, env=None) -> bool:
+    """True when the operator explicitly allows open TCP (CLI flag or env var 1/true/yes)."""
+    if flag:
+        return True
+    value = (os.environ if env is None else env).get(INSECURE_ENV, "")
+    return value.strip().lower() in {"1", "true", "yes"}
+
+
+def enforce_bind_policy(config: Config, allow_insecure: bool = False, log=None) -> None:
+    """Fail closed (SEC-NET-006): refuse unauthenticated TCP beyond loopback unless overridden.
+
+    With the override the loud SECURITY warning is still logged and boot proceeds.
+    """
+    if config.is_socket_mode() or config.api_key or _is_loopback_host(config.host):
+        return
+    if not allow_insecure:
+        raise RuntimeError(
+            f"Refusing to bind unauthenticated TCP on non-loopback interface {config.host}:{config.port}. "
+            f"Set STRAND_API_KEY, bind to 127.0.0.1, or (isolated networks only) pass "
+            f"--insecure-allow-unauthenticated or set {INSECURE_ENV}=1."
+        )
+    warn_if_exposed(config, log)
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="python -m strand.daemon", description="Run the Strand daemon.")
     parser.add_argument(
@@ -170,6 +233,12 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         dest="diag",
         action="store_true",
         help="diagnostic mode: verbose colored logs on stderr/stdout (default: quiet, log file only)",
+    )
+    parser.add_argument(
+        "--insecure-allow-unauthenticated",
+        dest="insecure",
+        action="store_true",
+        help=f"allow TCP on a non-loopback host without an api_key (same as {INSECURE_ENV}=1); unsafe",
     )
     return parser.parse_args(argv)
 
@@ -215,6 +284,12 @@ def _run(args: argparse.Namespace) -> None:
     else:
         setup_logging(config.log_level, debug=False)
     log = get_logger("daemon")
+    if not config.is_socket_mode():
+        try:
+            enforce_bind_policy(config, insecure_override_enabled(args.insecure), log)
+        except RuntimeError as exc:
+            log.error("SECURITY: %s", exc)
+            raise SystemExit(f"strand: {exc}") from exc
     app = build_app(config)
     if config.is_socket_mode():
         socket_path = config.effective_socket_path()
@@ -230,8 +305,8 @@ def _run(args: argparse.Namespace) -> None:
             # _serve_uds's finally block has already unlinked the socket.
             pass
     else:
-        warn_if_exposed(config, log)
         log.info("Starting Strand on %s:%d", config.host, config.port)
+        _notify_when_tcp_ready(config.host, config.port)
         uvicorn.run(app, host=config.host, port=config.port)
 
 

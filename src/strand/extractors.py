@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from .common import extract_json, strip_think
+from .common import extract_json, safe_exc, strip_think
 from .distill import USER_CONFIDENCE, USER_ORIGIN, Extraction
 from .host import get_host_context
 from .logging import get_logger
@@ -36,9 +36,9 @@ SYSTEM_PROMPT = (
     "Strict boundary for deprecated_edges: emit an edge there only when the user explicitly states that "
     "a fact or preference was WRONG, cancelled or should be forgotten, or that a current relationship "
     "has ended. Biographical history is never a deprecation: past possessions, previous employment and "
-    "earlier life facts (e.g. 'I used to own an E34', 'My previous car was a Forester') must be emitted "
+    "earlier life facts (e.g. 'I used to own an W34', 'My previous car was a Cruiser') must be emitted "
     "as an ACTIVE edge (previously_owned or owned) at normal weight, e.g. (User) --[previously_owned]--> "
-    "(E34), and NEVER placed in deprecated_edges. "
+    "(W34), and NEVER placed in deprecated_edges. "
     "Optionally add forgotten_entities: [entity_name, ...]. Use it only when the user explicitly "
     "commands the system to forget, delete, scrub or erase an entity, concept or record "
     "(e.g. 'Forget my old address', 'Delete the entity for Project Titan', 'Forget X'); list the "
@@ -72,8 +72,8 @@ SYSTEM_PROMPT = (
     "entities such as \"User's Preference\", \"User's Concern\" or \"User Settings\"; no two-hop "
     "chains like (User) --[has]--> (User's Preference) --[includes]--> (AWD). "
     "Operator identity: when the exchange identifies or confirms the operator's preferred conversational "
-    "name (for example an answer to 'What should I call you?' such as 'Nic', 'Just Nic', 'Nic works', "
-    "'Nicholas is fine', or a statement like 'Call me Nic' or 'I'm Nic'), emit an entity with name set to "
+    "name (for example an answer to 'What should I call you?' such as 'Alice', 'Just Alice', 'Alice works', "
+    "'Alicia is fine', or a statement like 'Call me Alice' or 'I'm Alice'), emit an entity with name set to "
     'the declared name, archetype "person", origin "user_explicit" and confidence 1.0, and emit the edge '
     '(<Declared Name>) --[operates_host]--> (<Hostname>) using the hostname given in the Host line. '
     "Use the declared name instead of User as the source of the operator's other edges. "
@@ -285,5 +285,5 @@ class LLMExtractor:
             content = reply.json()["choices"][0]["message"]["content"]
             return parse_extraction(content if isinstance(content, str) else "")
         except Exception as exc:
-            logger.warning("local extractor failed: %s", exc)
+            logger.warning("local extractor failed: %s", safe_exc(exc))
             return parse_extraction("")

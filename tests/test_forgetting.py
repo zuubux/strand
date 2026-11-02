@@ -77,7 +77,7 @@ def test_forget_by_exact_name_cascades_edges_and_vectors(tmp_path, caplog):
             marcus = await db.upsert_entity("Marcus", "person", "", embedding=unit(2))
             await db.upsert_edge(marcus, titan, "leads")
             engine = DistillationEngine(db, _extractor(forgotten_entities=["project titan"]))
-            with caplog.at_level(logging.INFO):
+            with caplog.at_level(logging.DEBUG):
                 await engine.process_exchange("s", QUERY, REPLY)
             similar = await db.find_similar_entities(unit(1), limit=3, distance_threshold=0.1)
             return await _names(db), await _count(db, "edges"), await _count(db, "entity_embeddings"), similar
@@ -181,3 +181,27 @@ def test_db_drop_entity_by_name_and_ambiguous_alias(tmp_path):
 
     assert run(scenario()) == (False, True, ["A"])
 
+
+
+def test_drop_entity_scrubs_episode_residue(tmp_path):
+    """SEC-MEM-009: ids and name mentions vanish from episodes so compaction cannot resurrect them."""
+
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            titan = await db.upsert_entity("Titan", "project", "Secret", metadata={"aliases": ["Proj T"]})
+            marcus = await db.upsert_entity("Marcus", "person", "Engineer")
+            only = await db.record_episode("s", "Discussed Titan launch", [titan])
+            shared = await db.record_episode("s", "Marcus pitched titan and proj t plans", [marcus, titan])
+            prose = await db.record_episode("s", "Later TITAN came up again", [])
+            keep = await db.record_episode("s", "Marcus fixed a bug", [marcus])
+            assert await db.drop_entity(titan)
+            async with db.conn.execute("SELECT id, narrative, extracted_entities FROM episodes ORDER BY id") as cur:
+                rows = {r[0]: (r[1], json.loads(r[2])) for r in await cur.fetchall()}
+            return rows, only, shared, prose, keep, marcus, titan
+
+    rows, only, shared, prose, keep, marcus, titan = run(scenario())
+    assert only not in rows
+    assert rows[shared] == ("Marcus pitched [forgotten] and [forgotten] plans", [marcus])
+    assert rows[prose] == ("Later [forgotten] came up again", [])
+    assert rows[keep] == ("Marcus fixed a bug", [marcus])
+    assert all(titan not in ids for _, ids in rows.values())

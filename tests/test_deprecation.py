@@ -28,12 +28,12 @@ def test_deprecate_edge_zeroes_weight_and_confidence_and_keeps_row(tmp_path):
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
             a = await db.upsert_entity("Operator", "person", "")
-            b = await db.upsert_entity("Subaru", "vehicle", "")
+            b = await db.upsert_entity("Kestrel", "vehicle", "")
             await db.upsert_edge(a, b, "owns")
-            first = await db.deprecate_edge("Operator", "Subaru", "owns", reason="sold")
+            first = await db.deprecate_edge("Operator", "Kestrel", "owns", reason="sold")
             row = await _edge(db, a, b, "owns")
-            second = await db.deprecate_edge("Operator", "Subaru", "owns")
-            missing = await db.deprecate_edge("Operator", "Subaru", "drives")
+            second = await db.deprecate_edge("Operator", "Kestrel", "owns")
+            missing = await db.deprecate_edge("Operator", "Kestrel", "drives")
             unknown = await db.deprecate_edge("Operator", "Nobody", "owns")
             return first, row, second, missing, unknown
 
@@ -49,11 +49,11 @@ def test_deprecate_edge_resolves_canonical_aliases_and_ids(tmp_path):
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
             a = await db.upsert_entity("Operator", "person", "")
-            b = await db.upsert_entity("BMW 540i", "vehicle", "", {"aliases": ["Beemer"]})
+            b = await db.upsert_entity("Acme X540", "vehicle", "", {"aliases": ["Roadie"]})
             c = await db.upsert_entity("Postgres", "system", "")
             await db.upsert_edge(a, b, "drives")
             await db.upsert_edge(a, c, "uses")
-            by_alias = await db.deprecate_edge("operator", "beemer", "Drives")
+            by_alias = await db.deprecate_edge("operator", "roadie", "Drives")
             by_id = await db.deprecate_edge(a, c, "uses")
             return by_alias, by_id, await _edge(db, a, b, "drives"), await _edge(db, a, c, "uses")
 
@@ -104,7 +104,7 @@ def test_distill_processes_deprecated_edges_with_alias_mapping(tmp_path, caplog)
             "entities": [],
             "edges": [],
             "deprecated_edges": [
-                {"source": "Operator", "target": "Beemer", "relation": "drives", "reason": "I sold it"},
+                {"source": "Operator", "target": "Roadie", "relation": "drives", "reason": "I sold it"},
                 {"source": "Operator", "target": "Ghost", "relation": "owns"},
                 {"source": "", "target": "x", "relation": "owns"},
             ],
@@ -114,11 +114,11 @@ def test_distill_processes_deprecated_edges_with_alias_mapping(tmp_path, caplog)
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
             a = await db.upsert_entity("Operator", "person", "")
-            b = await db.upsert_entity("BMW 540i", "vehicle", "", {"aliases": ["Beemer"]})
+            b = await db.upsert_entity("Acme X540", "vehicle", "", {"aliases": ["Roadie"]})
             await db.upsert_edge(a, b, "drives")
-            with caplog.at_level(logging.INFO):
+            with caplog.at_level(logging.DEBUG):
                 episode = await DistillationEngine(db, extractor).process_exchange(
-                    "s", "I sold my Beemer last week", "Sorry to hear that, noted."
+                    "s", "I sold my Roadie last week", "Sorry to hear that, noted."
                 )
             return episode, await _edge(db, a, b, "drives")
 
@@ -132,9 +132,9 @@ def test_reasserting_a_deprecated_edge_revives_it(tmp_path):
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
             a = await db.upsert_entity("Operator", "person", "")
-            b = await db.upsert_entity("Subaru", "vehicle", "")
+            b = await db.upsert_entity("Kestrel", "vehicle", "")
             await db.upsert_edge(a, b, "owns")
-            await db.deprecate_edge("Operator", "Subaru", "owns")
+            await db.deprecate_edge("Operator", "Kestrel", "owns")
             await db.upsert_edge(a, b, "owns")
             return await _edge(db, a, b, "owns")
 
@@ -165,8 +165,8 @@ def test_extractor_schema_and_parsing_include_deprecated_edges():
 
 
 def test_heuristic_extract_detects_negation_and_defaults_to_empty():
-    sold = heuristic_extract("I sold my Subaru yesterday.", "Noted, that is a big change.")
-    assert sold["deprecated_edges"][0]["target"] == "Subaru"
+    sold = heuristic_extract("I sold my Kestrel yesterday.", "Noted, that is a big change.")
+    assert sold["deprecated_edges"][0]["target"] == "Kestrel"
     assert sold["deprecated_edges"][0]["relation"] == "owns"
     stopped = heuristic_extract("I no longer use Postgres at all.", "Understood, thanks for sharing.")
     assert [(e["target"], e["relation"]) for e in stopped["deprecated_edges"]] == [("Postgres", "uses")]
@@ -177,9 +177,9 @@ def test_deprecate_edge_is_idempotent_and_logs_cleanly(tmp_path, caplog):
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
             a = await db.upsert_entity("Operator", "person", "")
-            b = await db.upsert_entity("Subaru", "vehicle", "")
+            b = await db.upsert_entity("Kestrel", "vehicle", "")
             await db.upsert_edge(a, b, "owns")
-            return [await db.deprecate_edge("Operator", "Subaru", "owns", reason="sold") for _ in range(3)]
+            return [await db.deprecate_edge("Operator", "Kestrel", "owns", reason="sold") for _ in range(3)]
 
     with caplog.at_level(logging.INFO):
         assert run(scenario()) == [True, False, False]
@@ -198,11 +198,11 @@ def test_cli_prune_decayed_removes_deprecated_edges_and_honors_dry_run(tmp_path,
     async def seed():
         async with DatabaseManager(path) as db:
             a = await db.upsert_entity("Operator", "person", "")
-            b = await db.upsert_entity("Subaru", "vehicle", "", origin="model_inferred", confidence=0.6)
+            b = await db.upsert_entity("Kestrel", "vehicle", "", origin="model_inferred", confidence=0.6)
             c = await db.upsert_entity("Atlas", "project", "")
             await db.upsert_edge(a, b, "owns")
             await db.upsert_edge(a, c, "leads")
-            await db.deprecate_edge("Operator", "Subaru", "owns", reason="sold")
+            await db.deprecate_edge("Operator", "Kestrel", "owns", reason="sold")
 
     async def counts():
         async with DatabaseManager(path) as db:

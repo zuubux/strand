@@ -449,6 +449,8 @@ class DistillationEngine:
         overwrites a stored higher-confidence one.
         """
         ranks = ranks if ranks is not None else {}
+        if isinstance(summary, str):
+            summary = summary.strip()[:MAX_SUMMARY_LEN]  # SEC-MEM-008: no raw blobs in entities.summary
         if name in ids and not (archetype or summary) and confidence <= ranks.get(name, 0.0):
             return ids[name]
         parent_id = await self._consolidate(name)
@@ -465,7 +467,7 @@ class DistillationEngine:
         )
         if dup_id is not None:
             await self.db.merge_entity_alias(dup_id, name, summary_text, origin, confidence)
-            logger.info("Merged candidate %r into existing entity id=%d as alias", name, dup_id)
+            logger.debug("Merged candidate %r into existing entity id=%d as alias", name, dup_id)
             ids[name] = dup_id
             return dup_id
         existing = await self._existing(name)
@@ -492,7 +494,7 @@ class DistillationEngine:
 
         A single-word candidate with no entity of its own is a reference when it equals (case-
         insensitively) a stored alias or a constituent token of exactly one multi-word entity
-        ("BMW" -> "BMW 540i"). The referent's `updated_at` is bumped instead of creating an
+        ("Acme" -> "Acme X540"). The referent's `updated_at` is bumped instead of creating an
         orphan node. Ambiguous matches (several referents) are not consolidated.
         """
         folded = name.strip().casefold()
@@ -512,7 +514,7 @@ class DistillationEngine:
             return None
         async with self.db.transaction() as conn:
             await conn.execute("UPDATE entities SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (matches[0],))
-        logger.info("Consolidated candidate %r into existing entity id=%d", name, matches[0])
+        logger.debug("Consolidated candidate %r into existing entity id=%d", name, matches[0])
         return matches[0]
 
     async def _metadata_with_aliases(self, name: str) -> dict[str, Any] | None:
@@ -557,7 +559,7 @@ class DistillationEngine:
             blocked.add(name.casefold())
             found = await self.db.find_entity(name)
             if found is None:
-                logger.info("User-directed forgetting: no entity matches %r; ignored", name)
+                logger.debug("User-directed forgetting: no entity matches %r; ignored", name)
                 continue
             entity_id, canonical = found
             async with self.db.conn.execute("SELECT metadata FROM entities WHERE id = ?", (entity_id,)) as cur:
@@ -568,7 +570,7 @@ class DistillationEngine:
                 dropped += 1
                 if self.ledger is not None:
                     self.ledger.evict_entity(entity_id)
-                logger.info("User-directed forgetting: dropped entity '%s' (id=%d)", canonical, entity_id)
+                logger.debug("User-directed forgetting: dropped entity '%s' (id=%d)", canonical, entity_id)
         return dropped, blocked
 
     async def process_exchange(self, session_id: str, query: str, response: str) -> int | None:
@@ -621,7 +623,7 @@ class DistillationEngine:
             ids: dict[str, int] = {}
             ranks: dict[str, float] = {}
             candidates = [e for e in extraction.get("entities") or [] if isinstance(e, dict)]
-            # Multi-word names first so single-token mentions ("BMW") consolidate into them.
+            # Multi-word names first so single-token mentions ("Acme") consolidate into them.
             candidates.sort(key=lambda e: len(str(e.get("name", "")).split()) < 2)
             connected = self._connected_names(extraction)
             for entity in candidates:
@@ -630,7 +632,7 @@ class DistillationEngine:
                 if name and not is_secret_token(name) and is_valid_entity_name(name, archetype if archetype in VALID_ARCHETYPES else DEFAULT_ARCHETYPE):
                     origin, confidence = self._provenance(entity)
                     if origin != USER_ORIGIN and name not in connected:
-                        logger.info("Dropped edge-free inferred entity %r", name)
+                        logger.debug("Dropped edge-free inferred entity %r", name)
                         continue
                     await self._upsert(
                         ids, name, entity.get("archetype"), entity.get("summary"), origin, confidence, ranks
@@ -666,7 +668,7 @@ class DistillationEngine:
                 # Canonical mapping: names merged/consolidated this turn, else db alias resolution.
                 if await self.db.deprecate_edge(ids.get(source, source), ids.get(target, target), relation, reason):
                     deprecated_count += 1
-                    logger.info("Deprecated edge %r -[%s]-> %r reason=%r", source, relation, target, reason)
+                    logger.debug("Deprecated edge %r -[%s]-> %r reason=%r", source, relation, target, reason)
 
             narrative = sanitize_text(str(extraction.get("summary") or "").strip()) or _narrative(query, response)
             episode_id = await self.db.record_episode(session_id, narrative, sorted(set(ids.values())))

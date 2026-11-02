@@ -221,7 +221,11 @@ def doctor_env(tmp_path, monkeypatch):
         pings.append(url)
         return False
 
+    async def fake_probe(config):
+        return True, "strand.sock"
+
     monkeypatch.setattr(cli, "_ping", fake_ping)
+    monkeypatch.setattr(cli, "_probe_daemon", fake_probe)
     return tmp_path, pings
 
 

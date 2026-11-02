@@ -382,6 +382,7 @@ def test_main_warns_before_serving_tcp_exposed(monkeypatch, tmp_path, logs):
     for key in ("XDG_RUNTIME_DIR", "STRAND_API_KEY", "STRAND_SOCKET_PATH", "STRAND_PORT"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("STRAND_HOST", "0.0.0.0")
+    monkeypatch.setenv("STRAND_INSECURE_ALLOW_UNAUTHENTICATED", "1")
     monkeypatch.setenv("STRAND_LOG_PATH", str(tmp_path / "strand.log"))
     served = []
     monkeypatch.setattr(daemon, "build_app", lambda config: object())
@@ -396,26 +397,113 @@ def test_main_warns_before_serving_tcp_exposed(monkeypatch, tmp_path, logs):
     assert "non-loopback" in logs.text
 
 
+# ---- SEC-NET-006: fail-closed guard on unauthenticated non-loopback TCP -----------------
+
+
+def _run_main(monkeypatch, tmp_path, host=None, argv=None, env=None, socket_mode=False):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for key in ("XDG_RUNTIME_DIR", "STRAND_API_KEY", "STRAND_SOCKET_PATH", "STRAND_PORT", "STRAND_HOST",
+                "STRAND_INSECURE_ALLOW_UNAUTHENTICATED"):
+        monkeypatch.delenv(key, raising=False)
+    if host:
+        monkeypatch.setenv("STRAND_HOST", host)
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("STRAND_LOG_PATH", str(tmp_path / "strand.log"))
+    served, built = [], []
+    monkeypatch.setattr(daemon, "build_app", lambda config: built.append(config) or object())
+    monkeypatch.setattr(daemon.uvicorn, "run", lambda app, **kw: served.append(kw))
+    monkeypatch.setattr(daemon, "prepare_socket", lambda path: None)
+    monkeypatch.setattr(daemon, "_serve_uds", lambda app, path: asyncio.sleep(0))
+    try:
+        daemon.main(argv)
+    finally:
+        from strand.logging import shutdown_logging
+
+        shutdown_logging()
+    return served, built
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.100"])
+def test_nonloopback_tcp_without_key_refuses(monkeypatch, tmp_path, logs, host):
+    served, built = [], []
+    with pytest.raises(SystemExit) as exc:
+        served, built = _run_main(monkeypatch, tmp_path, host=host)
+    assert "Refusing to bind unauthenticated TCP on non-loopback interface" in str(exc.value)
+    assert "SECURITY" in logs.text
+    assert served == [] and built == []
+
+
+def test_enforce_bind_policy_raises_runtime_error(monkeypatch):
+    for key in ("XDG_RUNTIME_DIR", "STRAND_SOCKET_PATH"):
+        monkeypatch.delenv(key, raising=False)
+    with pytest.raises(RuntimeError, match="Refusing to bind unauthenticated TCP on non-loopback interface"):
+        daemon.enforce_bind_policy(Config(host="0.0.0.0", port=8088))
+
+
+def test_nonloopback_tcp_with_key_starts(monkeypatch, tmp_path, logs):
+    served, _ = _run_main(monkeypatch, tmp_path, host="0.0.0.0", env={"STRAND_API_KEY": "secret"})
+    assert served == [{"host": "0.0.0.0", "port": 8088}]
+    assert "non-loopback" not in logs.text
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES"])
+def test_nonloopback_tcp_env_override_warns_and_starts(monkeypatch, tmp_path, logs, value):
+    served, _ = _run_main(
+        monkeypatch, tmp_path, host="0.0.0.0", env={"STRAND_INSECURE_ALLOW_UNAUTHENTICATED": value}
+    )
+    assert served == [{"host": "0.0.0.0", "port": 8088}]
+    assert "SECURITY" in logs.text and "non-loopback" in logs.text
+
+
+def test_nonloopback_tcp_cli_flag_override_starts(monkeypatch, tmp_path, logs):
+    served, _ = _run_main(monkeypatch, tmp_path, host="192.168.1.100", argv=["--insecure-allow-unauthenticated"])
+    assert served == [{"host": "192.168.1.100", "port": 8088}]
+    assert "SECURITY" in logs.text
+
+
+@pytest.mark.parametrize("value", ["0", "", "no", "false"])
+def test_env_override_falsey_values_do_not_enable(value):
+    assert daemon.insecure_override_enabled(env={"STRAND_INSECURE_ALLOW_UNAUTHENTICATED": value}) is False
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+def test_loopback_tcp_without_key_starts(monkeypatch, tmp_path, logs, host):
+    served, _ = _run_main(monkeypatch, tmp_path, host=host, env={"STRAND_SOCKET_PATH": ""})
+    assert served == [{"host": host, "port": 8088}]
+    assert "SECURITY" not in logs.text
+
+
+def test_uds_mode_without_key_starts(monkeypatch, tmp_path, logs):
+    sock = str(tmp_path / "strand" / "strand.sock")
+    served, built = _run_main(
+        monkeypatch, tmp_path, host="0.0.0.0", env={"STRAND_SOCKET_PATH": sock}
+    )
+    assert served == [] and len(built) == 1
+    assert "SECURITY" not in logs.text
+
 
 # ---- C3: the query preview in logs is sanitized -----------------------------------------
 
 SECRET = "sk-" + "A1b2C3d4E5" * 3
 
 
-def _logged_query_lines(tmp_path, query, logs):
+def _logged_query_lines(tmp_path, query, logs, prefix="Incoming query preview"):
     async def scenario():
         async with proxy_client(tmp_path / "m.db", ok_json) as (client, _):
             await client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": query}]})
 
     run(scenario())
-    return [r.getMessage() for r in logs.records if r.getMessage().startswith("Incoming query")]
+    return [r.getMessage() for r in logs.records if r.getMessage().startswith(prefix)]
 
 
 def test_query_preview_redacts_secrets(tmp_path, logs):
     (line,) = _logged_query_lines(tmp_path, f"my key is {SECRET} please remember it", logs)
     assert SECRET not in line and "sk-A1b2" not in line
     assert "[REDACTED_SECRET]" in line
-    assert f"chars={len(f'my key is {SECRET} please remember it')}" in line  # length is still reported
+    query = f"my key is {SECRET} please remember it"
+    (info,) = [r.getMessage() for r in logs.records if r.getMessage().startswith("Incoming query length=")]
+    assert f"length={len(query)}" in info and "REDACTED" not in info  # INFO carries metrics only
 
 
 def test_query_preview_cannot_leak_a_secret_prefix_cut_by_truncation(tmp_path, logs):
@@ -429,7 +517,8 @@ def test_query_preview_cannot_leak_a_secret_prefix_cut_by_truncation(tmp_path, l
 def test_query_preview_is_bounded(tmp_path, logs):
     (line,) = _logged_query_lines(tmp_path, "word " * 500, logs)
     assert len(line) < 200
-    assert "chars=2500" in line
+    (info,) = [r.getMessage() for r in logs.records if r.getMessage().startswith("Incoming query length=")]
+    assert "length=2500" in info and "word word" not in info
 
 
 # ---- C4: orphan vectors are swept on connect --------------------------------------------

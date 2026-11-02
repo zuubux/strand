@@ -151,3 +151,75 @@ def test_daemon_quiet_by_default_and_diag_flag(monkeypatch, tmp_path):
     finally:
         shutdown_logging()
     assert "Starting Strand" in (tmp_path / "c.log").read_text()
+
+
+def test_notify_ready_absent_socket_is_noop(monkeypatch):
+    monkeypatch.delenv("NOTIFY_SOCKET", raising=False)
+    daemon.notify_ready()
+
+
+def test_notify_ready_sends_ready_datagram(tmp_path, monkeypatch):
+    import socket as _socket
+
+    path = tmp_path / "notify.sock"
+    with _socket.socket(_socket.AF_UNIX, _socket.SOCK_DGRAM) as rx:
+        rx.bind(str(path))
+        rx.settimeout(2)
+        monkeypatch.setenv("NOTIFY_SOCKET", str(path))
+        daemon.notify_ready()
+        assert rx.recv(64) == b"READY=1"
+
+
+def test_notify_ready_abstract_prefix_and_errors_swallowed(monkeypatch):
+    seen = []
+
+    class FakeSock:
+        def __init__(self, *a):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def sendto(self, data, addr):
+            seen.append((data, addr))
+            raise OSError("boom")
+
+    monkeypatch.setattr(daemon.socket, "socket", FakeSock)
+    monkeypatch.setenv("NOTIFY_SOCKET", "@abstract")
+    daemon.notify_ready()
+    assert seen == [(b"READY=1", "\0abstract")]
+
+
+def test_serve_uds_notifies_ready(tmp_path, monkeypatch):
+    from fastapi import FastAPI
+
+    sock = tmp_path / "d" / "n.sock"
+    daemon.prepare_socket(str(sock))
+    calls = []
+    monkeypatch.setattr(daemon, "notify_ready", lambda: calls.append(1))
+
+    async def run():
+        import uvicorn
+
+        holder = {}
+        real = uvicorn.Server
+
+        class Spy(real):
+            def __init__(self, cfg):
+                super().__init__(cfg)
+                holder["s"] = self
+
+        monkeypatch.setattr(daemon.uvicorn, "Server", Spy)
+        task = asyncio.create_task(daemon._serve_uds(FastAPI(), str(sock)))
+        for _ in range(500):
+            if calls:
+                break
+            await asyncio.sleep(0.01)
+        holder["s"].should_exit = True
+        await task
+
+    asyncio.run(run())
+    assert calls == [1]

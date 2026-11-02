@@ -156,7 +156,7 @@ def test_system_prompt_forbids_intermediate_containers():
     assert "Never create generic intermediate container" in SYSTEM_PROMPT
 
 
-def _operator_payload(name="Nic", host="workstation-01"):
+def _operator_payload(name="Alice", host="workstation-01"):
     return {
         "entities": [{"name": name, "archetype": "person", "summary": "Operator", "origin": "user_explicit", "confidence": 1.0}],
         "edges": [{"source": name, "target": host, "relation": "operates_host"}],
@@ -173,13 +173,13 @@ def test_extractor_keeps_model_b_operator_as_user_explicit(monkeypatch):
         seen["body"] = json.loads(request.content)
         return reply(json.dumps(_operator_payload()))
 
-    result = run(extractor_for(handler)("Nic works", RESPONSE))
+    result = run(extractor_for(handler)("Alice works", RESPONSE))
     assert "Host: workstation-01" in seen["body"]["messages"][1]["content"]
     (person,) = [e for e in result["entities"] if e["archetype"] == "person"]
-    assert person["name"] == "Nic"
+    assert person["name"] == "Alice"
     assert person["origin"] == "user_explicit" and person["confidence"] == 1.0
     (edge,) = result["edges"]
-    assert (edge["source"], edge["target"], edge["relation"]) == ("Nic", "workstation-01", "operates_host")
+    assert (edge["source"], edge["target"], edge["relation"]) == ("Alice", "workstation-01", "operates_host")
     assert edge["origin"] == "user_explicit"
 
 
@@ -207,7 +207,7 @@ def test_system_prompt_delegates_name_semantics_to_model_b():
     from strand.extractors import SYSTEM_PROMPT
 
     assert "What should I call you?" in SYSTEM_PROMPT
-    for variant in ("'Nic'", "'Just Nic'", "'Nic works'", "'Nicholas is fine'"):
+    for variant in ("'Alice'", "'Just Alice'", "'Alice works'", "'Alicia is fine'"):
         assert variant in SYSTEM_PROMPT, variant
     assert 'archetype "person", origin "user_explicit" and confidence 1.0' in SYSTEM_PROMPT
     assert "(<Declared Name>) --[operates_host]--> (<Hostname>)" in SYSTEM_PROMPT
@@ -237,11 +237,11 @@ def test_model_b_operator_persists_and_reanchors_generic_user(tmp_path, monkeypa
             ) as cur:
                 return people, {tuple(r) for r in await cur.fetchall()}
 
-    for n, answer in enumerate(("Nic", "Just Nic", "Nic works", "Nicholas is fine")):
+    for n, answer in enumerate(("Alice", "Just Alice", "Alice works", "Alicia is fine")):
         people, edges = run(go(answer, n))
-        assert people == [("Nic", "user_explicit", 1.0)], answer
-        assert ("Nic", "workstation-01", "operates_host") in edges, answer
-        assert ("Nic", "No apologies", "demands") in edges, answer
+        assert people == [("Alice", "user_explicit", 1.0)], answer
+        assert ("Alice", "workstation-01", "operates_host") in edges, answer
+        assert ("Alice", "No apologies", "demands") in edges, answer
 
 
 def test_question_answer_with_no_operator_payload_leaves_day_zero_open(tmp_path):
@@ -274,12 +274,12 @@ def test_reanchor_is_noop_without_declared_operator(tmp_path):
 def test_model_b_operator_without_host_edge_still_counts_as_operator(tmp_path):
     from strand.onboarding import count_operators
 
-    payload = {"entities": [{"name": "Nic", "archetype": "person", "origin": "user_explicit"}], "edges": []}
+    payload = {"entities": [{"name": "Alice", "archetype": "person", "origin": "user_explicit"}], "edges": []}
 
     async def go():
         async with DatabaseManager(tmp_path / "m.db") as db:
             extractor = extractor_for(lambda r: reply(json.dumps(payload)))
-            await DistillationEngine(db, extractor=extractor).process_exchange("s", "Nic works for me", RESPONSE)
+            await DistillationEngine(db, extractor=extractor).process_exchange("s", "Alice works for me", RESPONSE)
             return await count_operators(db)
 
     assert run(go()) == 1
@@ -292,9 +292,9 @@ def _critique_extractor(seen):
     """Offline Model B stand-in obeying the prompt contract: only permanence markers deprecate."""
     permanent = {
         "entities": [{"name": "no-diff-summaries", "archetype": "directive", "summary": "Never summarize diffs"}],
-        "edges": [{"source": "Nic", "target": "no-diff-summaries", "relation": "demands"}],
+        "edges": [{"source": "Alice", "target": "no-diff-summaries", "relation": "demands"}],
         "deprecated_edges": [
-            {"source": "Nic", "target": "diff-summaries", "relation": "prefers", "reason": "stopped"}
+            {"source": "Alice", "target": "diff-summaries", "relation": "prefers", "reason": "stopped"}
         ],
     }
 
@@ -341,17 +341,17 @@ def test_transient_phrase_does_not_deprecate_but_permanent_phrase_does():
 def test_prompt_separates_biography_from_deprecation():
     from strand.extractors import SYSTEM_PROMPT
 
-    for token in ("WRONG, cancelled or should be forgotten", "I used to own an E34", "previously_owned", "NEVER placed in deprecated_edges"):
+    for token in ("WRONG, cancelled or should be forgotten", "I used to own an W34", "previously_owned", "NEVER placed in deprecated_edges"):
         assert token in SYSTEM_PROMPT, token
 
 
 def test_used_to_own_emits_active_user_explicit_edge_not_deprecation():
     payload = {
         "entities": [
-            {"name": "Nic", "archetype": "person", "origin": "user_explicit", "summary": "Operator"},
-            {"name": "E34", "archetype": "vehicle", "summary": "BMW 5 Series"},
+            {"name": "Alice", "archetype": "person", "origin": "user_explicit", "summary": "Operator"},
+            {"name": "W34", "archetype": "vehicle", "summary": "Acme Sedan"},
         ],
-        "edges": [{"source": "Nic", "target": "E34", "relation": "previously_owned"}],
+        "edges": [{"source": "Alice", "target": "W34", "relation": "previously_owned"}],
         "deprecated_edges": [],
     }
     seen = []
@@ -360,7 +360,7 @@ def test_used_to_own_emits_active_user_explicit_edge_not_deprecation():
         seen.append(json.loads(request.content)["messages"][1]["content"])
         return reply(json.dumps(payload))
 
-    result = run(extractor_for(handler)("I used to own an E34.", "Nice, a classic BMW 5 Series."))
+    result = run(extractor_for(handler)("I used to own an W34.", "Nice, a classic Acme Sedan."))
     assert result["deprecated_edges"] == []
     edge = result["edges"][0]
     assert (edge["relation"], edge["origin"], edge["confidence"]) == ("previously_owned", "user_explicit", 1.0)
@@ -370,8 +370,8 @@ def test_used_to_own_emits_active_user_explicit_edge_not_deprecation():
 def test_historical_edge_persists_active_through_engine(tmp_path):
     content = json.dumps(
         {
-            "entities": [{"name": "Forester", "archetype": "vehicle", "summary": "Subaru"}],
-            "edges": [{"source": "User", "target": "Forester", "relation": "previously_owned"}],
+            "entities": [{"name": "Cruiser", "archetype": "vehicle", "summary": "Kestrel"}],
+            "edges": [{"source": "User", "target": "Cruiser", "relation": "previously_owned"}],
         }
     )
 
@@ -379,7 +379,7 @@ def test_historical_edge_persists_active_through_engine(tmp_path):
         async with DatabaseManager(tmp_path / "m.db") as db:
             await db.upsert_entity("User", "person", "The operator")
             engine = DistillationEngine(db, extractor=lambda q, r: parse_extraction(content))
-            await engine.process_exchange("s", "My previous car was a Forester, sold years ago.", "Noted, a Subaru Forester.")
+            await engine.process_exchange("s", "My previous car was a Cruiser, sold years ago.", "Noted, a Kestrel Cruiser.")
             return [dict(r) for r in await db.get_entity_subgraph(1, active_only=True)]
 
     rows = run(scenario())
@@ -406,17 +406,17 @@ def test_system_prompt_documents_host_telemetry_preference_without_collision():
 def test_model_b_telemetry_preference_distills_beside_other_preferences(tmp_path):
     payload = {
         "entities": [
-            {"name": "Nic", "archetype": "person", "summary": "Operator", "origin": "user_explicit"},
+            {"name": "Alice", "archetype": "person", "summary": "Operator", "origin": "user_explicit"},
             {"name": "Host Telemetry Enabled", "archetype": "preference", "summary": "Specs allowed"},
         ],
-        "edges": [{"source": "Nic", "target": "Host Telemetry Enabled", "relation": "prefers"}],
+        "edges": [{"source": "Alice", "target": "Host Telemetry Enabled", "relation": "prefers"}],
     }
 
     async def go():
         async with DatabaseManager(tmp_path / "m.db") as db:
-            nic = await db.upsert_entity("Nic", "person", "Operator", origin="user_explicit")
+            alice = await db.upsert_entity("Alice", "person", "Operator", origin="user_explicit")
             terse = await db.upsert_entity("Terse diffs", "preference", "unified diffs")
-            await db.upsert_edge(nic, terse, "prefers")
+            await db.upsert_edge(alice, terse, "prefers")
             extractor = extractor_for(lambda r: reply(json.dumps(payload)))
             await DistillationEngine(db, extractor=extractor).process_exchange("s", "Yeah, check it out", RESPONSE)
             async with db.conn.execute(
@@ -426,3 +426,24 @@ def test_model_b_telemetry_preference_distills_beside_other_preferences(tmp_path
                 return [tuple(r) for r in await cur.fetchall()]
 
     assert run(go()) == [("Host Telemetry Enabled", 1.0), ("Terse diffs", 1.0)]
+
+
+def test_failing_extractor_logs_masked_url(caplog):
+    import logging
+
+    from strand.logging import LOGGER_NAME
+
+    def boom(request):
+        raise httpx.ConnectError(f"cannot reach {request.url}", request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(boom))
+    extractor = LLMExtractor("http://user:hunter2@slm.test/v1", "tiny", client=client)
+    parent = logging.getLogger(LOGGER_NAME)
+    parent.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
+            run(extractor(QUERY, RESPONSE))
+    finally:
+        parent.removeHandler(caplog.handler)
+    assert "hunter2" not in caplog.text
+    assert "user:********@slm.test" in caplog.text

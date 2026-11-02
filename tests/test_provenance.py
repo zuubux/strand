@@ -38,7 +38,7 @@ def test_defaults_on_fresh_entity_and_edge(tmp_path):
 def test_user_explicit_entity_not_downgraded_or_overwritten(tmp_path):
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
-            eid = await db.upsert_entity("Car", "vehicle", "BMW 540i", {"k": 1})
+            eid = await db.upsert_entity("Car", "vehicle", "Acme X540", {"k": 1})
             again = await db.upsert_entity(
                 "Car", "concept", "Toyota", {"k": 2}, origin="model_inferred", confidence=0.6
             )
@@ -47,7 +47,7 @@ def test_user_explicit_entity_not_downgraded_or_overwritten(tmp_path):
 
     eid, again, row = run(scenario())
     assert eid == again
-    assert row == ("vehicle", "BMW 540i", '{"k": 1}', "user_explicit", 1.0)
+    assert row == ("vehicle", "Acme X540", '{"k": 1}', "user_explicit", 1.0)
 
 
 def test_higher_confidence_takes_precedence_and_equal_user_is_kept(tmp_path):

@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from .common import (
     DEFAULT_COMPACTION_THRESHOLD_HOURS,
     DEFAULT_CONTINUITY_HORIZON_DAYS,
@@ -27,6 +29,12 @@ DEFAULT_LOG_LEVEL = "INFO"
 DEFAULT_DISTANCE_THRESHOLD = 1.0
 DEFAULT_DECAY_HALF_LIFE_DAYS = 30.0
 DEFAULT_WORKSPACE_ROOTS = ("~/Projects",)
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+XAI_BASE_URL = "https://api.x.ai/v1"
+OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+OLLAMA_URLS = (OLLAMA_BASE_URL, "http://localhost:11434")
 
 # config.json key -> environment variable
 ENV_VARS = {
@@ -120,8 +128,8 @@ class Config:
     distance_threshold: float = DEFAULT_DISTANCE_THRESHOLD
     # Max L2 distance for merging a candidate entity into an existing one at ingestion.
     dedup_distance_threshold: float = DEFAULT_DEDUP_DISTANCE_THRESHOLD
-    # Temporal access decay: facts fade by 2^(-days_since_access / half_life); off by default.
-    decay_enabled: bool = False
+    # Temporal access decay: facts fade by 2^(-days_since_access / half_life); on by default (Balanced, 30d).
+    decay_enabled: bool = True
     decay_half_life_days: float = DEFAULT_DECAY_HALF_LIFE_DAYS
     # A session is compactable once its newest uncompacted episode is this many hours old.
     compaction_threshold_hours: float = DEFAULT_COMPACTION_THRESHOLD_HOURS
@@ -137,6 +145,8 @@ class Config:
     tools_enabled: bool = True
     # SEC-PRIV-002: ambient hardware specs (OS, CPU, RAM) may leave the machine only when True.
     enable_host_telemetry: bool = False
+    # SEC-PRIV-007: scrub secrets from tool output before it is sent upstream (config.json key).
+    redact_secrets: bool = True
     # True when host or port came from the environment or config.json (forces TCP).
     tcp_explicit: bool = field(default=False, compare=False)
 
@@ -206,7 +216,7 @@ class Config:
             decay_enabled=_as_bool(
                 env[ENV_VARS["decay_enabled"]]
                 if env.get(ENV_VARS["decay_enabled"]) not in (None, "")
-                else file_values.get("decay_enabled", False)
+                else file_values.get("decay_enabled", True)
             ),
             decay_half_life_days=float(pick("decay_half_life_days", DEFAULT_DECAY_HALF_LIFE_DAYS)),
             compaction_threshold_hours=float(
@@ -223,6 +233,7 @@ class Config:
             workspace_roots=_as_roots(pick("workspace_roots", list(DEFAULT_WORKSPACE_ROOTS))),
             tools_enabled=_as_bool(pick("tools_enabled", True)),
             enable_host_telemetry=_as_bool(pick("enable_host_telemetry", False)),
+            redact_secrets=_as_bool(file_values.get("redact_secrets", True)),
             tcp_explicit=bool(pick("host", "") or pick("port", "")),
         )
 
@@ -286,9 +297,14 @@ def save_config_value(key: str, value: Any, config_path: Path | None = None) -> 
         value = str(value).upper()
     elif key == "model_default":
         value = str(value).strip()
+    save_config({key: value}, config_path)
+
+
+def save_config(updates: Mapping[str, Any], config_path: Path | None = None) -> None:
+    """Merge `updates` into config.json (atomic write, file 0600, parent dir 0700)."""
     path = config_path if config_path is not None else default_config_path()
     data = _read_file(path, strict=True)
-    data[key] = value
+    data.update(updates)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     secure_parent_dir(path.parent)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config-", suffix=".tmp")
@@ -301,3 +317,59 @@ def save_config_value(key: str, value: Any, config_path: Path | None = None) -> 
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def detect_ollama_model(timeout: float = 1.5) -> str:
+    """Name of the first model served by local Ollama, or "" when unreachable or empty."""
+    try:
+        resp = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=timeout)
+        resp.raise_for_status()
+        for item in resp.json().get("models", []):
+            name = str(item.get("name") or item.get("model") or "").strip()
+            if name:
+                return name
+    except (httpx.HTTPError, ValueError, AttributeError):
+        pass
+    return ""
+
+
+def engine_updates(provider: str, api_key: str = "", model: str = "", endpoint_url: str = "") -> dict[str, str]:
+    """config.json values for a provider: "gemini", "openrouter", "xai", "ollama" or "custom".
+
+    A non-empty `endpoint_url` overrides the preset upstream URL (required for "custom").
+
+    Raises ValueError for an unknown provider or missing required input.
+    """
+    provider = provider.strip().lower()
+    api_key, model, url = api_key.strip(), model.strip(), endpoint_url.strip()
+    if provider == "gemini":
+        if not api_key:
+            raise ValueError("a Gemini API key is required")
+        return {
+            "upstream_url": url or GEMINI_BASE_URL,
+            "upstream_api_key": api_key,
+            "model_default": model or DEFAULT_GEMINI_MODEL,
+        }
+    if provider in ("openrouter", "xai"):
+        if not api_key or not model:
+            raise ValueError("an API key and a model are required")
+        preset = OPENROUTER_BASE_URL if provider == "openrouter" else XAI_BASE_URL
+        return {"upstream_url": url or preset, "upstream_api_key": api_key, "model_default": model}
+    if provider == "ollama":
+        model = model or detect_ollama_model()
+        if not model:
+            raise ValueError(f"no Ollama model found at {OLLAMA_BASE_URL}")
+        # A stale cloud key must never be sent to the local engine.
+        return {"upstream_url": f"{OLLAMA_BASE_URL}/v1", "upstream_api_key": "", "model_default": model}
+    if provider == "custom":
+        if not url or not model:
+            raise ValueError("a base URL and a model are required")
+        return {"upstream_url": url, "upstream_api_key": api_key, "model_default": model}
+    raise ValueError(f"unknown provider {provider!r}")
+
+
+def is_engine_configured(config: "Config") -> bool:
+    """True when an upstream API key is set or the upstream is local Ollama."""
+    if config.upstream_api_key:
+        return True
+    return config.upstream_url.rstrip("/").removesuffix("/v1") in OLLAMA_URLS

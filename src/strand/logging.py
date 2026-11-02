@@ -96,7 +96,9 @@ def setup_logging(
 
     log_path = Path(path).expanduser() if path is not None else default_log_path()
     log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _chmod_quiet(log_path.parent, 0o700)
+    from . import perms  # local import: perms depends on this module (SEC-PERM-002)
+
+    perms.secure_parent_dir(log_path.parent)
     handlers: list[logging.Handler] = [
         _SecureRotatingFileHandler(log_path, maxBytes=MAX_BYTES, backupCount=BACKUP_COUNT, encoding="utf-8")
     ]

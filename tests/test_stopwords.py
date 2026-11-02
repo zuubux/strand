@@ -9,7 +9,7 @@ from strand.stopwords import is_valid_entity_name
 
 
 @pytest.mark.parametrize(
-    "name", ["Marcus", "Atlas", "BMW E34", "Database Migration", "Please Review", "SQLite", "AI", "Python"]
+    "name", ["Marcus", "Atlas", "Acme W34", "Database Migration", "Please Review", "SQLite", "AI", "Python"]
 )
 def test_valid_names(name):
     assert is_valid_entity_name(name)

@@ -13,16 +13,16 @@ PROC_MEMINFO = "/proc/meminfo"
 
 def _user() -> str:
     try:
-        return getpass.getuser() or "operator"
+        return getpass.getuser() or "Operator"
     except Exception:  # noqa: BLE001 - getuser raises OSError/KeyError without a passwd entry
-        return os.environ.get("USER") or "operator"
+        return os.environ.get("USER") or "Operator"
 
 
 def _hostname() -> str:
     try:
-        return platform.node() or socket.gethostname() or "localhost"
+        return platform.node() or socket.gethostname() or "workstation"
     except OSError:
-        return "localhost"
+        return "workstation"
 
 
 def _os_release() -> str:

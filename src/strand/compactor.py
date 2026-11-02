@@ -17,6 +17,7 @@ from .common import (
     PERSONALITY_ARCHETYPES,
     extract_json,
     is_private,
+    safe_exc,
 )
 from .db import DatabaseManager
 from .extractors import DEFAULT_EXTRACTOR_URL
@@ -186,7 +187,7 @@ class SessionCompactor:
             reply.raise_for_status()
             content = reply.json()["choices"][0]["message"]["content"]
         except Exception as exc:
-            logger.warning("compaction SLM unavailable: %s", exc)
+            logger.warning("compaction SLM unavailable: %s", safe_exc(exc))
             return None
         text = content if isinstance(content, str) else ""
         if extract_json(text) is None:
@@ -223,6 +224,13 @@ class SessionCompactor:
             if row is not None:
                 return int(row[0]), row[1]
         return await self.db.find_entity(OPERATOR_ALIAS)
+
+    async def _is_private_name(self, name: str) -> bool:
+        """True when any entity named `name` (case-insensitive) is private (SEC-MEM-010)."""
+        async with self.db.conn.execute(
+            "SELECT archetype, metadata FROM entities WHERE name = ? COLLATE NOCASE", (name,)
+        ) as cur:
+            return any(is_private(a, m) for a, m in await cur.fetchall())
 
     async def _apply_aliases(self, aliases: list[dict[str, str]]) -> None:
         for item in aliases:
@@ -275,7 +283,7 @@ class SessionCompactor:
                 origin=COMPACTION_ORIGIN,
                 confidence=SLM_CONFIDENCE,
             )
-        if focus:
+        if focus and not await self._is_private_name(operator_name):
             # Provenance precedence in the DB keeps user_explicit summaries intact.
             await self.db.update_entity_summary(
                 operator_name, sanitize_text(focus)[:MAX_SUMMARY_LEN], COMPACTION_ORIGIN, SLM_CONFIDENCE
@@ -308,6 +316,8 @@ class SessionCompactor:
                 return result
             updated = 0
             for item in parsed["entity_summaries"]:
+                if await self._is_private_name(item["name"]):
+                    continue
                 summary = sanitize_text(item["summary"])[:MAX_SUMMARY_LEN]
                 if await self.db.update_entity_summary(item["name"], summary, COMPACTION_ORIGIN, confidence):
                     updated += 1

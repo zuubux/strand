@@ -17,6 +17,19 @@ HEIGHT_KEY = "window/height"
 MIN_WIDTH = 480
 MIN_HEIGHT = 500
 SAVE_DELAY_MS = 300
+LOCAL_SCHEMES = ("file", "qrc", "data")
+
+
+def fallback_icon_path() -> str:
+    """First existing strand.svg: repo `packaging/icons` (source/editable) or the user hicolor dir."""
+    candidates = (
+        Path(__file__).resolve().parents[3] / "packaging" / "icons" / "strand.svg",
+        Path.home() / ".local" / "share" / "icons" / "hicolor" / "scalable" / "apps" / "strand.svg",
+    )
+    for path in candidates:
+        if path.is_file():
+            return str(path)
+    return str(candidates[0])
 
 
 def make_settings():
@@ -90,9 +103,49 @@ def _rect(x: int, y: int, width: int, height: int):
     return QRect(x, y, width, height)
 
 
+def install_egress_guard(engine) -> object:
+    """Make the QML engine's network access manager refuse every non-local request (SEC-NET-007).
+
+    Defense in depth behind `bridge.neutralize_images`: only `file`, `qrc` and `data` URLs load.
+    Returns the factory; the caller must keep it alive as long as the engine.
+    """
+    from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
+    from PySide6.QtQml import QQmlNetworkAccessManagerFactory
+
+    class _LocalOnlyManager(QNetworkAccessManager):
+        def createRequest(self, op, request, outgoing_data=None):  # noqa: N802 - Qt override
+            if request.url().scheme().lower() not in LOCAL_SCHEMES:
+                request = QNetworkRequest(request)
+                request.setUrl("strand-blocked:")
+            return super().createRequest(op, request, outgoing_data)
+
+    class _Factory(QQmlNetworkAccessManagerFactory):
+        def create(self, parent):
+            return _LocalOnlyManager(parent)
+
+    factory = _Factory()
+    engine.setNetworkAccessManagerFactory(factory)
+    return factory
+
+
+def ensure_stdio() -> None:
+    """Give detached launches (`Terminal=false`) usable stdout/stderr.
+
+    Desktop launchers may start the process with closed standard streams, leaving
+    `sys.stdout`/`sys.stderr` as None; any later print or Qt message would then raise or
+    block. Missing streams become a devnull sink; live streams are left untouched.
+    """
+    import os
+
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))  # noqa: SIM115
+
+
 def main(argv: list[str] | None = None) -> int:
+    ensure_stdio()
     from PySide6.QtCore import QTimer, QUrl
-    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtGui import QGuiApplication, QIcon
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
 
@@ -102,10 +155,12 @@ def main(argv: list[str] | None = None) -> int:
     QQuickStyle.setStyle("Basic")  # fully custom-styled controls; no native-style overrides
     app = QGuiApplication(args)
     app.setApplicationName("Strand")
-    app.setDesktopFileName("strand")
+    app.setDesktopFileName("strand")  # Wayland app_id -> strand.desktop and its icon
+    app.setWindowIcon(QIcon.fromTheme("strand", QIcon(fallback_icon_path())))
     app.setQuitOnLastWindowClosed(True)  # closing the window ends app.exec()
     bridge = Bridge()
     engine = QQmlApplicationEngine()
+    egress_guard = install_egress_guard(engine)  # noqa: F841 - kept alive with the engine
     engine.rootContext().setContextProperty("bridge", bridge)
     engine.load(QUrl.fromLocalFile(str(MAIN_QML)))
     if not engine.rootObjects():
@@ -137,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     code = app.exec()
     bridge.shutdown()  # idempotent; guarantees no worker thread outlives exec()
     engine.deleteLater()
-    return code
+    return int(code)
 
 
 if __name__ == "__main__":

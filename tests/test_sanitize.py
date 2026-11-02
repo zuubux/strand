@@ -39,6 +39,6 @@ def test_is_secret_token_flags_marker_and_entropy():
     assert is_secret_token("x9Kq2LmZ7vR4tB8nW3yH6cD1")
 
 
-@pytest.mark.parametrize("name", ["Marcus", "Atlas", "BMW E34", "Database Migration", "", "Internationalization"])
+@pytest.mark.parametrize("name", ["Marcus", "Atlas", "Acme W34", "Database Migration", "", "Internationalization"])
 def test_is_secret_token_accepts_normal_names(name):
     assert not is_secret_token(name)

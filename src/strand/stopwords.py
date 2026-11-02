@@ -74,7 +74,7 @@ def is_valid_entity_name(name: str, archetype: str = "concept") -> bool:
     - Empty or punctuation-only names are rejected.
     - Single stop-words are rejected for the "concept" archetype (case-insensitive).
     - Single-word names shorter than 3 characters are rejected unless whitelisted.
-    - Multi-word names (e.g. "BMW E34", "Database Migration") are always accepted.
+    - Multi-word names (e.g. "Acme W34", "Database Migration") are always accepted.
     - Personality archetypes (trait, directive, preference) accept any descriptive or
       hyphenated rule identifier (e.g. "no-apologies", "Never apologize"); only names
       without a word character are rejected.

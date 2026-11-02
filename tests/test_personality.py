@@ -146,7 +146,7 @@ async def _seed(db):
     trait = await db.upsert_entity("Dry Wit", "trait", "Sovereign systems peer, dry wit, calm")
     rule = await db.upsert_entity("no-apologies", "directive", "Never apologize or use filler")
     pref = await db.upsert_entity("Torque in Nm", "preference", "Torque specs in Nm")
-    car = await db.upsert_entity("BMW 540i", "vehicle", "E34 sedan")
+    car = await db.upsert_entity("Acme X540", "vehicle", "W34 sedan")
     await db.upsert_edge(user, trait, "enforces")
     await db.upsert_edge(user, rule, "demands")
     await db.upsert_edge(user, pref, "prefers")
@@ -158,8 +158,8 @@ def test_hierarchical_formatting_and_session_dedup(tmp_path):
         async with DatabaseManager(tmp_path / "m.db") as db:
             await _seed(db)
             resolver = ContextResolver(db)
-            turn1 = await resolver.resolve("Tell me about my BMW 540i", "s1")
-            turn2 = await resolver.resolve("Tell me about my BMW 540i", "s1")
+            turn1 = await resolver.resolve("Tell me about my Acme X540", "s1")
+            turn2 = await resolver.resolve("Tell me about my Acme X540", "s1")
             turn3 = await resolver.resolve("Anything else?", "s1")
             other = await resolver.resolve("Anything else?", "s2")
             return turn1, turn2, turn3, other
@@ -172,8 +172,8 @@ def test_hierarchical_formatting_and_session_dedup(tmp_path):
     assert "[Operational Directives]\n- no-apologies: Never apologize or use filler" in turn1
     assert "[Interaction Preferences]\n- Torque in Nm: Torque specs in Nm" in turn1
     working = turn1.split("[Working Memory]")[1]
-    assert "- BMW 540i (vehicle): E34 sedan" in working
-    assert "- User -drives-> BMW 540i" in working
+    assert "- Acme X540 (vehicle): W34 sedan" in working
+    assert "- User -drives-> Acme X540" in working
     assert "Dry Wit" not in working and "demands" not in turn1
     # Turn 2+: the personality delta is empty, and so is everything else (SessionLedger dedup).
     assert turn2 == "" and turn3 == ""

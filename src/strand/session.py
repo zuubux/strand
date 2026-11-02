@@ -11,6 +11,18 @@ DEFAULT_MAX_SESSIONS = 1000
 MAX_SESSION_ID_LEN = 128
 
 
+MAX_REPLAY_CHARS = 12000  # cap on stored context blocks per session (oldest dropped first)
+
+
+@dataclass(frozen=True, slots=True)
+class ContextBlock:
+    """One injected context delta, kept so it can be replayed when the client drops it."""
+
+    text: str
+    entity_ids: frozenset[int]
+    edge_ids: frozenset[int]
+
+
 @dataclass(slots=True)
 class SessionState:
     seen_entity_ids: set[int] = field(default_factory=set)
@@ -19,6 +31,8 @@ class SessionState:
     last_active: float = 0.0
     # SEC-PRIV-002: in-memory opt-in to ambient hardware telemetry; dies with the session.
     allow_host_telemetry: bool = False
+    # ERG-CTX-005: injected blocks, replayed when the client does not echo them back.
+    context_blocks: list[ContextBlock] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +143,38 @@ class SessionLedger:
         """Record episode ids as injected into `session_id`."""
         self._touch(session_id).seen_episode_ids.update(episode_ids)
 
+    def remember_context(
+        self,
+        session_id: str,
+        text: str,
+        entity_ids: Iterable[int],
+        edge_ids: Iterable[int],
+    ) -> None:
+        """Store an injected block (ERG-CTX-005) so later turns can replay it.
+
+        Past `MAX_REPLAY_CHARS` the oldest blocks are dropped and their ids are un-seen, so the
+        facts they carried are re-injected fresh the next time they are recalled.
+        """
+        state = self._touch(session_id)
+        state.context_blocks.append(ContextBlock(text, frozenset(entity_ids), frozenset(edge_ids)))
+        while len(state.context_blocks) > 1 and sum(len(b.text) for b in state.context_blocks) > MAX_REPLAY_CHARS:
+            self._unsee(state, state.context_blocks.pop(0))
+
+    def replay_context(self, session_id: str, present_text: str, exclude: str = "") -> list[str]:
+        """Stored blocks that are not already in `present_text` (the client's system prompt).
+
+        `exclude` is the block being injected this turn. Oldest first; unknown session -> [].
+        """
+        state = self._sessions.get(session_id)
+        if state is None:
+            return []
+        return [b.text for b in state.context_blocks if b.text != exclude and b.text not in present_text]
+
+    @staticmethod
+    def _unsee(state: SessionState, block: ContextBlock) -> None:
+        state.seen_entity_ids -= block.entity_ids
+        state.seen_edge_ids -= block.edge_ids
+
     def filter_new(
         self, session_id: str, entity_ids: Iterable[int], edge_ids: Iterable[int]
     ) -> SessionDelta:
@@ -165,8 +211,15 @@ class SessionLedger:
         """Remove `entity_id` from every session's seen set. Returns how many sessions held it."""
         count = 0
         for state in self._sessions.values():
-            if entity_id in state.seen_entity_ids:
-                state.seen_entity_ids.discard(entity_id)
+            held = entity_id in state.seen_entity_ids
+            state.seen_entity_ids.discard(entity_id)
+            # The block text still names the entity: drop it and un-see its companions.
+            dropped = [b for b in state.context_blocks if entity_id in b.entity_ids]
+            if dropped:
+                state.context_blocks = [b for b in state.context_blocks if entity_id not in b.entity_ids]
+                for block in dropped:
+                    self._unsee(state, block)
+            if held or dropped:
                 count += 1
         return count
 

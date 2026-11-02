@@ -62,8 +62,30 @@ def test_save_config_value_creates_dirs_and_merges(home):
 
 def test_mask_secret():
     assert mask_secret("sk-1234567890abcd") == "sk-...abcd"
-    assert mask_secret("short") == "****"
+    assert mask_secret("short") == "********"
     assert mask_secret("") == ""
+
+
+@pytest.mark.parametrize("length", [1, 8, 9, 12, 15])
+def test_mask_secret_short_fully_masked(length):
+    secret = "abcdefghijklmnop"[:length]
+    masked = mask_secret(secret)
+    assert masked == "********"
+    assert "..." not in masked
+    assert secret[:3] not in masked and secret[-4:] not in masked
+
+
+@pytest.mark.parametrize("length", [16, 17, 32])
+def test_mask_secret_long_keeps_head_tail(length):
+    secret = ("abcdefghijklmnopqrstuvwxyz012345")[:length]
+    assert mask_secret(secret) == f"{secret[:3]}...{secret[-4:]}"
+
+
+def test_mask_secret_empty_and_whitespace():
+    assert mask_secret("") == ""
+    assert mask_secret(None) == ""
+    assert mask_secret("   ") == "********"
+    assert mask_secret(" " * 15) == "********"
 
 
 def test_cli_config_set_get_show(home, capsys):
@@ -192,3 +214,105 @@ def test_cli_config_get_set_enable_host_telemetry(home, capsys):
     assert load_config().enable_host_telemetry is True
     assert main(["config", "get", "enable_host_telemetry"]) == 0
     assert capsys.readouterr().out.strip() == "True"
+
+
+def test_mask_url_masks_credentials():
+    from strand.cli import mask_url
+
+    assert mask_url("https://user:password123@api.internal") == "https://user:********@api.internal"
+    assert mask_url("http://admin:token123@127.0.0.1:11434/v1?x=1") == "http://admin:********@127.0.0.1:11434/v1?x=1"
+    assert mask_url("http://:secret@host:80/v1") == "http://:********@host:80/v1"
+    assert mask_url("https://tok3n@host/v1") == "https://********@host/v1"
+    assert mask_url("http://u:p@[::1]:8080/v1") == "http://u:********@[::1]:8080/v1"
+    assert "secret" not in mask_url("http://u:secret@[::1/v1")
+
+
+def test_mask_url_leaves_plain_urls_intact():
+    from strand.cli import mask_url
+
+    for url in ("https://api.openai.com/v1", "http://127.0.0.1:11434/v1", "not a url"):
+        assert mask_url(url) == url
+    assert mask_url("") == ""
+    assert mask_url(None) == ""
+
+
+def test_cli_config_show_masks_url_credentials_but_get_is_raw(home, capsys):
+    up = "https://user:secretpass@proxy.internal/v1"
+    ex = "http://admin:token123@127.0.0.1:11434"
+    assert main(["config", "set", "upstream_url", up]) == 0
+    assert main(["config", "set", "extractor_url", ex]) == 0
+    capsys.readouterr()
+    assert main(["config", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "upstream_url: https://user:********@proxy.internal/v1" in out
+    assert "extractor_url: http://admin:********@127.0.0.1:11434" in out
+    assert "secretpass" not in out and "token123" not in out
+    assert main(["config", "get", "upstream_url"]) == 0
+    assert capsys.readouterr().out.strip() == up
+    assert main(["config", "get", "extractor_url"]) == 0
+    assert capsys.readouterr().out.strip() == ex
+
+
+def test_info_log_file_omits_graph_traces_but_debug_keeps_them(home, monkeypatch):
+    def write(level, name):
+        log_path = home / "logs" / name
+        monkeypatch.setenv("STRAND_LOG_PATH", str(log_path))
+        try:
+            logger = setup_logging(level, debug=False)
+            distill_log = get_logger("distill")
+            distill_log.debug("Deprecated edge %r -[%s]-> %r", "Zed", "owns", "Quux")
+            distill_log.info("Recorded episode id=%s session=%r entities=%d edges=%d deprecated=%d", 1, "s", 2, 1, 0)
+            for handler in logger.handlers:
+                handler.flush()
+        finally:
+            shutdown_logging()
+        return log_path.read_text()
+
+    info_text = write("INFO", "info.log")
+    assert "Recorded episode" in info_text and "entities=2 edges=1 deprecated=0" in info_text
+    assert "Zed" not in info_text and "Quux" not in info_text
+    debug_text = write("DEBUG", "debug.log")
+    assert "Zed" in debug_text and "Recorded episode" in debug_text
+
+
+def test_incoming_query_preview_only_at_debug_level(home, monkeypatch):
+    import asyncio
+
+    import httpx
+
+    from strand.db import DatabaseManager
+    from strand.proxy import create_app
+    from strand.resolver import ContextResolver
+    from strand.session import SessionLedger
+
+    def ok(request):
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]})
+
+    async def one_request():
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(ok))
+        async with DatabaseManager(home / "m.db") as db:
+            app = create_app(
+                Config(upstream_url="http://upstream.test/v1", upstream_api_key="sk-test"),
+                ContextResolver(db, SessionLedger()),
+                upstream,
+            )
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as client:
+                await client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": SECRET_QUERY}]})
+
+    def write(level, name):
+        log_path = home / "logs" / name
+        monkeypatch.setenv("STRAND_LOG_PATH", str(log_path))
+        try:
+            logger = setup_logging(level, debug=False)
+            asyncio.run(one_request())
+            for handler in logger.handlers:
+                handler.flush()
+        finally:
+            shutdown_logging()
+        return log_path.read_text()
+
+    SECRET_QUERY = "my grandmother's pancake recipe"
+    info_text = write("INFO", "info.log")
+    assert "Incoming query length=%d" % len(SECRET_QUERY) in info_text
+    assert "pancake" not in info_text
+    assert "pancake" in write("DEBUG", "debug.log")

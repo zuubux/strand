@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import stat
+import subprocess
 import sys
 import uuid
 from collections import deque
@@ -18,8 +19,18 @@ import sqlite_vec
 
 import httpx
 
+from .common import load_metadata, mask_url
 from .compactor import SessionCompactor
-from .config import ENV_VARS, load_config, save_config_value
+from .config import (
+    DEFAULT_GEMINI_MODEL,
+    ENV_VARS,
+    OLLAMA_BASE_URL,
+    engine_updates,
+    default_config_path,
+    load_config,
+    save_config,
+    save_config_value,
+)
 from .db import DatabaseManager, embedding_text
 from .embed import (
     DEFAULT_MODEL,
@@ -96,9 +107,13 @@ async def cmd_inspect(db: DatabaseManager, args: argparse.Namespace) -> int:
     if entity is None:
         print(f"error: entity not found: {args.entity}", file=sys.stderr)
         return 1
-    metadata = json.loads(entity["metadata"] or "{}")
-    if not isinstance(metadata, dict):
-        metadata = {"value": metadata}
+    raw_metadata = entity["metadata"]
+    metadata = load_metadata(raw_metadata)
+    corrupted = False
+    try:
+        corrupted = not isinstance(json.loads(raw_metadata or "{}"), dict)
+    except (TypeError, ValueError):
+        corrupted = True
     aliases = metadata.get("aliases", [])
     if isinstance(aliases, str):
         aliases = [aliases]
@@ -109,7 +124,7 @@ async def cmd_inspect(db: DatabaseManager, args: argparse.Namespace) -> int:
     print(f"  aliases:    {', '.join(map(str, aliases)) if aliases else '-'}")
     print(f"  created:    {entity['created_at']}")
     print(f"  updated:    {entity['updated_at']}")
-    print(f"  metadata:   {json.dumps(metadata, sort_keys=True)}")
+    print(f"  metadata:   {'{corrupted}' if corrupted else json.dumps(metadata, sort_keys=True)}")
     print(f"  summary:    {entity['summary'] or '-'}")
 
     edge_sql = (
@@ -146,6 +161,26 @@ async def _delete_entities(db: DatabaseManager, ids: Sequence[int]) -> tuple[int
             cur = await conn.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
             entities += cur.rowcount
     return entities, edges
+
+
+async def cmd_mark_private(db: DatabaseManager, target: str) -> int:
+    """Classify an existing entity (by id, name or alias) as private (SEC-PRIV-009)."""
+    entity = await _resolve(db, target)
+    if entity is None:
+        found = await db.find_entity(target)
+        entity = await _resolve(db, str(found[0])) if found is not None else None
+    if entity is None:
+        print(f"error: entity not found: {target}", file=sys.stderr)
+        return 1
+    metadata = load_metadata(entity["metadata"])
+    metadata["private"] = True
+    await db.update_entity_metadata(entity["id"], metadata)
+    print(f"Marked entity '{entity['name']}' (id={entity['id']}) as private.")
+    return 0
+
+
+async def _cmd_mark_private(db: DatabaseManager, args: argparse.Namespace) -> int:
+    return await cmd_mark_private(db, args.entity)
 
 
 async def cmd_drop(db: DatabaseManager, args: argparse.Namespace) -> int:
@@ -243,6 +278,22 @@ async def _ping(url: str) -> bool:
         return False
 
 
+async def _probe_daemon(config) -> tuple[bool, str]:
+    """GET /health on the daemon's socket (or TCP port) with a 0.5s timeout."""
+    kind, target = config.get_bind_target()
+    try:
+        if kind == "uds":
+            transport = httpx.AsyncHTTPTransport(uds=str(target))
+            label, base = os.path.basename(str(target)), "http://strand"
+        else:
+            transport, label, base = None, f"{target}:{config.port}", f"http://{target}:{config.port}"
+        async with httpx.AsyncClient(transport=transport, timeout=PING_TIMEOUT) as client:
+            resp = await client.get(base + "/health")
+        return resp.status_code == 200, label
+    except Exception:
+        return False, ""
+
+
 def _check(ok: bool | None) -> str:
     return "[ok]  " if ok else ("[warn]" if ok is None else "[fail]")
 
@@ -268,9 +319,10 @@ async def cmd_doctor(db: DatabaseManager, args: argparse.Namespace) -> int:
         print(f"{_check(None)} fastembed: not installed; {UNAVAILABLE_MESSAGE}")
         print(f"{_check(None)} model cache: n/a")
 
+    print(f"{_check(True)} upstream: {mask_url(config.upstream_url)}")
     base = (config.extractor_url or DEFAULT_EXTRACTOR_URL).rstrip("/")
     reachable = await _ping(base + "/models")
-    label = f"extractor SLM: {base}"
+    label = f"extractor SLM: {mask_url(base)}"
     if config.extractor_model:
         label += f" (model {config.extractor_model})"
     if reachable:
@@ -283,19 +335,34 @@ async def cmd_doctor(db: DatabaseManager, args: argparse.Namespace) -> int:
     kind, target = config.get_bind_target()
     transport = f"uds {target}" if kind == "uds" else f"tcp {target}:{config.port}"
     print(f"{_check(True)} transport: {transport}")
-    return 0
+
+    alive, label = await _probe_daemon(config)
+    if alive:
+        print(f"{_check(True)} daemon: active (listening on {label})")
+        return 0
+    print(
+        f"{_check(False)} daemon: unreachable (run 'systemctl --user status strand' "
+        "or 'journalctl --user -u strand -n 20')"
+    )
+    return 1
 
 
 SECRET_KEYS = ("upstream_api_key", "api_key")
 
 
+MASK_MIN_REVEAL_LEN = 16
+
+
 def mask_secret(value: str) -> str:
-    """Mask an API key as `sk-...abcd`; short secrets are fully hidden."""
+    """Mask an API key as `sk-...abcd`; secrets under 16 chars are fully hidden (SEC-CONF-008)."""
     if not value:
         return ""
-    if len(value) <= 8:
-        return "****"
+    if len(value) < MASK_MIN_REVEAL_LEN:
+        return "********"
     return f"{value[:3]}...{value[-4:]}"
+
+
+URL_KEYS = ("upstream_url", "extractor_url")
 
 
 def cmd_config(args: argparse.Namespace) -> int:
@@ -321,8 +388,73 @@ def cmd_config(args: argparse.Namespace) -> int:
         return 0
     for secret in SECRET_KEYS:
         values[secret] = mask_secret(values[secret])
+    for key in URL_KEYS:
+        values[key] = mask_url(values[key])
     for key, value in values.items():
         print(f"{key}: {value}")
+    return 0
+
+
+SETUP_MENU = (
+    "Select an inference engine:\n"
+    "  1) Google Gemini (Cloud) [default]\n"
+    f"  2) Local Ollama ({OLLAMA_BASE_URL.removeprefix('http://')})\n"
+    "  3) Custom / OpenAI-compatible endpoint"
+)
+
+
+def _restart_service() -> None:
+    """Restart the systemd user service when it is active; otherwise do nothing."""
+    try:
+        active = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", "strand"], check=False, timeout=10
+        ).returncode == 0
+        if not active:
+            return
+        done = subprocess.run(["systemctl", "--user", "restart", "strand"], check=False, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        print("note: could not restart the service; run 'systemctl --user restart strand'")
+        return
+    if done.returncode == 0:
+        print("restarted strand.service")
+    else:
+        print("note: restart failed; run 'systemctl --user restart strand'")
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Interactive first-run wizard: choose an engine and persist it to config.json (0600)."""
+    import getpass
+
+    try:
+        print(SETUP_MENU)
+        choice = input("Choice [1]: ").strip() or "1"
+        if choice == "1":
+            key = getpass.getpass("Gemini API key: ")
+            model = input(f"Model [{DEFAULT_GEMINI_MODEL}]: ").strip()
+            updates = engine_updates("gemini", key, model)
+        elif choice == "2":
+            model = input("Model [auto-detect]: ").strip()
+            updates = engine_updates("ollama", "", model)
+        elif choice == "3":
+            url = input("Base URL (e.g. https://host/v1): ").strip()
+            model = input("Model: ").strip()
+            key = getpass.getpass("API key (blank if none): ")
+            updates = engine_updates("custom", key, model, url)
+        else:
+            print(f"error: invalid choice {choice!r}; enter 1, 2 or 3", file=sys.stderr)
+            return 1
+        save_config(updates)
+    except (EOFError, KeyboardInterrupt):
+        print("\nsetup cancelled", file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"saved engine settings to {default_config_path()}")
+    for key_name, value in updates.items():
+        shown = mask_secret(value) if key_name in SECRET_KEYS else value
+        print(f"  {key_name}: {shown}")
+    _restart_service()
     return 0
 
 
@@ -589,6 +721,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", "-y", action="store_true", help="skip confirmation")
     p.set_defaults(func=cmd_drop)
 
+    p = sub.add_parser("mark-private", help="classify an entity as private (never sent upstream)")
+    p.add_argument("entity", metavar="name_or_id")
+    p.set_defaults(func=_cmd_mark_private)
+
     p = sub.add_parser("prune-stale", help="purge low-confidence model-inferred facts")
     p.add_argument("--confidence-below", type=_confidence, default=0.5, metavar="X")
     p.set_defaults(func=cmd_prune_stale)
@@ -621,6 +757,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("value")
     config.set_defaults(func=cmd_config, local=True)
 
+    p = sub.add_parser("setup", help="interactive first-run setup: choose and save an inference engine")
+    p.set_defaults(func=cmd_setup, local=True)
+
     p = sub.add_parser("daemon", help="run the daemon in the foreground (quiet unless --diag)")
     p.add_argument("--diag", "--debug", dest="diag", action="store_true", help="verbose colored logs on the terminal")
     p.set_defaults(func=cmd_daemon, local=True)
@@ -646,6 +785,10 @@ async def _run(args: argparse.Namespace) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if getattr(args, "local", False):
+        # Synchronous subcommands (daemon, chat, config, logs) may start their own event loop
+        # via asyncio.run(), so they must not run inside an outer one.
+        return args.func(args)
     return asyncio.run(_run(args))
 
 

@@ -225,3 +225,47 @@ def test_relative_path_accepts_cwd_inside_root(tmp_path, monkeypatch):
     # cwd outside every root contributes nothing
     monkeypatch.chdir(tmp_path)
     assert is_safe_path("../x", [first])[0] is False
+
+
+def test_single_line_megabyte_file_is_read_with_bounded_buffer(tmp_path):
+    root = _root(tmp_path)
+    big = root / "bundle.min.js"
+    big.write_text("a" * 1_000_000)
+    result = read_file(str(big), [root])
+    assert len(result["content"]) == MAX_READ_BYTES
+    assert result["byte_truncated"] is True and result["truncated"] is True
+    # Paging past an over-long first line must skip it in bounded chunks and continue cleanly.
+    big.write_text("a" * 1_000_000 + "\nsecond\n")
+    paged = read_file(str(big), [root], offset=2)
+    assert paged["content"] == "second\n" and paged["truncated"] is False
+
+
+def test_read_file_never_requests_more_than_cap_per_readline(tmp_path, monkeypatch):
+    import builtins
+
+    root = _root(tmp_path)
+    big = root / "one.json"
+    big.write_text("b" * 300_000)
+    sizes: list[int] = []
+    real_open = builtins.open
+
+    class Spy:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def readline(self, size=-1):
+            sizes.append(size)
+            return self._fh.readline(size)
+
+        def __getattr__(self, name):
+            return getattr(self._fh, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self._fh.__exit__(*exc)
+
+    monkeypatch.setattr("strand.tools.workspace.open", lambda *a, **k: Spy(real_open(*a, **k)), raising=False)
+    read_file(str(big), [root])
+    assert sizes and all(0 < s <= MAX_READ_BYTES + 1 for s in sizes)

@@ -418,7 +418,7 @@ def evolution_reply(**overrides):
 
 
 async def operator(db, summary_text="Primary operator", origin="user_explicit", confidence=1.0):
-    op = await db.upsert_entity("Nic", "person", summary_text, origin=origin, confidence=confidence)
+    op = await db.upsert_entity("Alice", "person", summary_text, origin=origin, confidence=confidence)
     host = await db.upsert_entity("box", "system", "host")
     await db.upsert_edge(op, host, "operates_host")
     return op
@@ -497,7 +497,7 @@ def test_compact_session_does_not_overwrite_explicit_operator_or_traits(tmp_path
                 edge = tuple(await cur.fetchone())
             async with db.conn.execute("SELECT archetype, summary FROM entities WHERE id = ?", (trait,)) as cur:
                 ent = tuple(await cur.fetchone())
-            return await summary(db, "Nic"), edge, ent
+            return await summary(db, "Alice"), edge, ent
 
     op_summary, edge, ent = run(scenario())
     assert op_summary == "Primary operator"
@@ -521,3 +521,41 @@ def test_compact_session_operator_profile_without_operator_is_noop(tmp_path):
 
     result, trait = run(scenario())
     assert not result["skipped"] and trait is None
+
+
+def test_compaction_never_overwrites_private_entity_summaries(tmp_path):
+    def handler(request):
+        return reply(
+            json.dumps(
+                {
+                    "entity_summaries": [
+                        {"name": "NAS", "summary": "Public rewrite."},
+                        {"name": "Vault", "summary": "Leaky rewrite."},
+                        {"name": "Diary", "summary": "Leaky rewrite."},
+                    ],
+                    "session_summary": "Homelab work.",
+                }
+            )
+        )
+
+    async def scenario():
+        async with DatabaseManager(tmp_path / "p.db") as db:
+            await seed(db)
+            await db.upsert_entity("Vault", "private", "secret original", origin="model_inferred", confidence=0.1)
+            await db.upsert_entity("Diary", "concept", "diary original", origin="model_inferred", confidence=0.1)
+            await db.conn.execute("UPDATE entities SET metadata = '{\"private\": true}' WHERE name = 'Diary'")
+            await db.conn.commit()
+            direct = await db.update_entity_summary("Vault", "direct", "user_explicit", 1.0)
+            result = await compactor_for(db, handler).compact_session("homelab")
+            return (
+                direct,
+                result,
+                await summary(db, "NAS"),
+                await summary(db, "Vault"),
+                await summary(db, "Diary"),
+            )
+
+    direct, result, nas, vault, diary = run(scenario())
+    assert direct is False
+    assert result["summaries_updated"] == 1 and nas == "Public rewrite."
+    assert vault == "secret original" and diary == "diary original"

@@ -127,7 +127,7 @@ def test_touch_access_handles_empty_and_unknown_ids(db_path):
 
 
 def test_decay_config_defaults_env_and_file(tmp_path):
-    assert Config().decay_enabled is False and Config().decay_half_life_days == 30.0
+    assert Config().decay_enabled is True and Config().decay_half_life_days == 30.0
     assert ENV_VARS["decay_enabled"] == "STRAND_DECAY_ENABLED"
     assert ENV_VARS["decay_half_life_days"] == "STRAND_DECAY_HALF_LIFE_DAYS"
     cfg = Config.from_env({"STRAND_DECAY_ENABLED": "true", "STRAND_DECAY_HALF_LIFE_DAYS": "0.5"}, {})

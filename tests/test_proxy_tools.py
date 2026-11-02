@@ -331,3 +331,56 @@ def test_provider_metadata_preserved_streaming(tmp_path):
     assistant = seen[1]["messages"][-2]
     assert assistant["thought_signature"] == "MSG_SIG"
     assert assistant["tool_calls"][0]["extra_content"] == {"google": {"thought_signature": "SIG_STREAM"}}
+
+
+def test_sensitive_files_denied_and_source_allowed(tmp_path):
+    from strand.tools.workspace import is_denied_file, read_file
+
+    root = tmp_path.resolve()
+    (root / ".git").mkdir()
+    (root / "src").mkdir()
+    (root / "docs").mkdir()
+    denied = [".env", ".env.local", "ID_RSA", "deploy.key", ".git/config", "api_token.txt", "cert.PEM"]
+    for name in denied:
+        (root / name).write_text("TOPSECRET")
+        assert is_denied_file(name)
+        result = read_file(str(root / name), [root])
+        assert result["error"] == "Access denied: sensitive file policy"
+        assert "TOPSECRET" not in json.dumps(result)
+    (root / "src" / "main.py").write_text("print('hi')\n")
+    (root / "docs" / "guide.md").write_text("# Guide\n")
+    for name in ("src/main.py", "docs/guide.md"):
+        assert not is_denied_file(name)
+        assert "content" in read_file(str(root / name), [root])
+
+
+def test_tool_output_redacted_before_upstream(tmp_path):
+    def responder(n, payload):
+        if n == 1:
+            return httpx.Response(200, json=tool_call_body(arguments={"path": "leaky.txt"}))
+        return httpx.Response(200, json=text_body("done"))
+
+    async def scenario():
+        async with tool_proxy(tmp_path, responder) as (client, seen, workspace, *_):
+            (workspace / "leaky.txt").write_text(
+                "key=sk-live-abcdefghijklmnopqrstuvwx\nAuthorization: Bearer abcdefghij1234567890\n"
+            )
+            await client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": QUESTION}]})
+            return seen
+
+    seen = run(scenario())
+    tool_msg = seen[1]["messages"][-1]
+    assert tool_msg["role"] == "tool"
+    assert "abcdefghijklmnopqrstuvwx" not in tool_msg["content"]
+    assert "abcdefghij1234567890" not in tool_msg["content"]
+    assert "[REDACTED_SECRET]" in tool_msg["content"]
+
+
+def test_run_tool_call_redact_toggle(tmp_path):
+    from strand.proxy import _run_tool_call
+
+    (tmp_path / "leaky.txt").write_text("Authorization: Bearer abcdefghij1234567890\n")
+    call = {"id": "c", "function": {"name": "read_file", "arguments": json.dumps({"path": "leaky.txt"})}}
+    roots = [tmp_path.resolve()]
+    assert "abcdefghij1234567890" not in run(_run_tool_call(call, roots))["content"]
+    assert "abcdefghij1234567890" in run(_run_tool_call(call, roots, redact=False))["content"]
