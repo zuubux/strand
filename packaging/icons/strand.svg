@@ -1,23 +1,33 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-  <title>Strand</title>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#1b2433"/>
-      <stop offset="1" stop-color="#0d1117"/>
+    <linearGradient id="strandTileBg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#141922" />
+      <stop offset="100%" stop-color="#0d1117" />
     </linearGradient>
+    <linearGradient id="strandTileStroke" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.12" />
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.03" />
+    </linearGradient>
+    <filter id="coreGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2.8" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
   </defs>
-  <rect x="4" y="4" width="120" height="120" rx="28" ry="28" fill="url(#bg)" stroke="#8aa4c8" stroke-opacity="0.55" stroke-width="2"/>
-  <!-- Three braided filaments crossing over a central conduit -->
-  <g fill="none" stroke-linecap="round" stroke-width="9">
-    <path d="M38 22 C38 46 90 54 90 64 C90 76 38 84 38 106" stroke="#2ee6c8"/>
-    <path d="M90 22 C90 46 38 54 38 64 C38 76 90 84 90 106" stroke="#7aa2ff"/>
-  </g>
-  <!-- Over-crossings: redraw segments to read as woven -->
-  <g fill="none" stroke-linecap="round" stroke-width="9">
-    <path d="M52 52 C60 57 68 57 76 52" stroke="#2ee6c8"/>
-    <path d="M52 76 C60 71 68 71 76 76" stroke="#7aa2ff"/>
-  </g>
-  <path d="M64 18 L64 110" fill="none" stroke="#f5f7fa" stroke-width="5" stroke-linecap="round" stroke-opacity="0.9"/>
-  <circle cx="64" cy="64" r="7" fill="#f5f7fa"/>
+
+  <!-- Enclosed Obsidian Squircle Base -->
+  <rect id="tile-chassis" x="4" y="4" width="120" height="120" rx="28" fill="url(#strandTileBg)" stroke="url(#strandTileStroke)" stroke-width="1.2" />
+
+  <!-- Structural Rails (Thinned) -->
+  <line id="rail-top" x1="20" y1="32" x2="108" y2="32" stroke="#334155" stroke-width="2.0" stroke-linecap="round" opacity="0.72" />
+  <line id="rail-bottom" x1="20" y1="88" x2="108" y2="88" stroke="#334155" stroke-width="2.0" stroke-linecap="round" opacity="0.72" />
+
+  <!-- Active Swell Path -->
+  <path id="conduit-stream" d="M 20,64 L 28,64 C 44,64 50,48 64,48 C 78,48 84,64 100,64 L 108,64" fill="none" stroke="#38bdf8" stroke-width="3.8" stroke-linecap="round" stroke-linejoin="round" />
+
+  <!-- Memory Focal Core -->
+  <circle id="node-glow" cx="64" cy="48" r="6" fill="#38bdf8" filter="url(#coreGlow)" />
+  <circle id="node-center" cx="64" cy="48" r="2.2" fill="#ffffff" />
 </svg>

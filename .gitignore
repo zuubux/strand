@@ -7,6 +7,17 @@
 *.bak
 *.dump
 
+# UNIX Sockets
+*.sock
+
+# Local User Data & Logs (if created inside the repo)
+*.log
+logs/
+.strand/
+.config/
+.cache/
+.local/
+
 # Python Bytecode & Cache
 __pycache__/
 *.py[cod]
@@ -20,11 +31,12 @@ venv/
 ENV/
 env/
 
-# Testing & Coverage
+# Testing, Coverage & Audit Reports
 .pytest_cache/
 .coverage
 .coverage.*
 htmlcov/
+strand_audit_report.html
 
 # Environments & Secrets
 .env

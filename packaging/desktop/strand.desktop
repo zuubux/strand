@@ -1,10 +1,12 @@
 [Desktop Entry]
 Type=Application
 Name=Strand
-Comment=Sovereign Cognitive Working Memory Companion
+GenericName=Working Memory
+Comment=Persistent memory for AI
 Exec=strand-gui
 Icon=strand
 Terminal=false
-Categories=Utility;Development;
-StartupWMClass=strand-gui
+Categories=Development;Utility;
+Keywords=ai;llm;memory;context;companion;
+StartupWMClass=strand
 StartupNotify=true

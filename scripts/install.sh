@@ -53,8 +53,15 @@ for d in "$HOME/.local/share/applications" "$HOME/.local/share/icons/hicolor/sca
 done
 
 # --- Package ----------------------------------------------------------------
+if systemctl --user is-active --quiet strand.service 2>/dev/null; then
+    info "Stopping active Strand daemon for upgrade..."
+    systemctl --user stop strand.service 2>/dev/null || true
+fi
+
 info "Installing Strand via pipx"
 cd "$REPO_DIR"
+# pipx may delegate to `uv venv`, which refuses to replace an existing venv unless told to.
+export UV_VENV_CLEAR=1
 if [ "$EDITABLE" -eq 1 ]; then
     pipx install --force --editable .
 else
@@ -67,8 +74,16 @@ BIN_DIR="$HOME/.local/bin"
 info "Installing desktop entry and icon"
 install -m 0644 "$REPO_DIR/packaging/desktop/strand.desktop" "$HOME/.local/share/applications/strand.desktop"
 install -m 0644 "$REPO_DIR/packaging/icons/strand.svg" "$HOME/.local/share/icons/hicolor/scalable/apps/strand.svg"
-update-desktop-database "$HOME/.local/share/applications/" 2>/dev/null || true
-gtk-update-icon-cache "$HOME/.local/share/icons/hicolor/" 2>/dev/null || true
+
+info "Updating desktop & icon caches..."
+update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+
+if command -v kbuildsycoca6 >/dev/null 2>&1; then
+    kbuildsycoca6 --noincremental >/dev/null 2>&1 || kbuildsycoca6 >/dev/null 2>&1 || true
+elif command -v kbuildsycoca5 >/dev/null 2>&1; then
+    kbuildsycoca5 --noincremental >/dev/null 2>&1 || kbuildsycoca5 >/dev/null 2>&1 || true
+fi
 
 # --- systemd user service ---------------------------------------------------
 # The packaged unit runs `/usr/bin/env python3 -m strand.daemon`, which cannot
@@ -82,15 +97,33 @@ systemctl --user daemon-reload
 systemctl --user enable --now strand
 systemctl --user restart strand
 
+# Type=notify makes start/restart block until READY=1, but verify the unit is (and stays) active.
+info "Waiting for Strand daemon to become active"
+STRAND_ACTIVE=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if systemctl --user is-active --quiet strand; then
+        STRAND_ACTIVE=1
+    else
+        STRAND_ACTIVE=0
+        # A crash-looping unit flips between activating and failed; keep polling until the deadline.
+    fi
+    sleep 0.5
+done
+if [ "$STRAND_ACTIVE" -ne 1 ]; then
+    echo "[ERROR] Strand daemon failed to start under systemd." >&2
+    journalctl --user -u strand -n 15 --no-pager >&2 || true
+    exit 1
+fi
+
 # --- Warm-up & doctor -------------------------------------------------------
 info "Warming up embedding model (downloads FastEmbed weights on first run)"
 PIPX_VENVS="$(pipx environment --value PIPX_LOCAL_VENVS 2>/dev/null || echo "$HOME/.local/share/pipx/venvs")"
-if ! "$PIPX_VENVS/strand/bin/python" -c 'from strand.embed import create_embedder; e = create_embedder(); assert e is not None; e.embed("warm up")'; then
+if ! HF_HUB_DISABLE_IMPLICIT_TOKEN=1 HF_HUB_ENABLE_HF_TRANSFER=0 "$PIPX_VENVS/strand/bin/python" -c 'from strand.embed import create_embedder; e = create_embedder(); assert e is not None; e.embed("warm up")' 2> >(grep -v "unauthenticated requests to the HF Hub" >&2); then
     echo "warning: embedding warm-up failed (offline?). Strand falls back to lexical matching; re-run later." >&2
 fi
 
 info "Running strand doctor"
-"$BIN_DIR/strand" doctor || true
+"$BIN_DIR/strand" doctor || echo "warning: strand doctor reported problems; see output above." >&2
 
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;

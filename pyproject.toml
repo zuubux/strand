@@ -5,31 +5,41 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "strand"
 version = "0.1.0"
-description = "Headless local cognitive working-memory daemon"
-requires-python = ">=3.11"
+description = "Sovereign cognitive working-memory daemon for Linux"
 readme = "README.md"
-license = "MIT"
-license-files = ["LICENSE"]
-authors = [{ name = "Strand Contributors" }]
-keywords = ["llm", "memory", "proxy", "knowledge-graph", "sqlite"]
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "zuubux", email = "zuubux@users.noreply.github.com" },
+]
+keywords = ["llm", "memory", "sqlite", "systemd", "wayland", "linux", "ai"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Environment :: No Input/Output (Daemon)",
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Framework :: AsyncIO",
     "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
-    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "aiosqlite",
-    "sqlite-vec",
-    "fastapi",
-    "uvicorn",
-    "httpx",
-    "fastembed",
-    "PySide6",
+    "aiosqlite>=0.20.0",
+    "sqlite-vec>=0.1.6",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0",
+    "httpx>=0.27.0",
+    "fastembed>=0.3.0",
+    "PySide6>=6.6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/zuubux/strand"
+Repository = "https://github.com/zuubux/strand"
+Issues = "https://github.com/zuubux/strand/issues"
 
 [project.scripts]
 strand = "strand.cli:main"

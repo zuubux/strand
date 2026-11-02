@@ -16,7 +16,8 @@
 Description=Strand cognitive working-memory daemon
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
 # Uses the python3 on the service PATH, where `pip install --user` put the strand package (or use %h/.local/bin/strand).
 ExecStart=/usr/bin/env python3 -m strand.daemon
 Restart=on-failure
