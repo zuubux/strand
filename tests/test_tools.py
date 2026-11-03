@@ -15,8 +15,12 @@ from strand.tools.workspace import (
     grep_workspace,
     is_safe_path,
     list_directory,
+    make_directory,
+    move_file,
     patch_file,
     read_file,
+    read_image,
+    remove_file,
     restore_backup,
     write_file,
 )
@@ -147,7 +151,8 @@ def test_schemas_and_dispatch(tmp_path):
     root = _root(tmp_path)
     (root / "f.txt").write_text("hi\n")
     names = {t["function"]["name"] for t in WORKSPACE_TOOLS}
-    assert names == {"read_file", "list_directory", "grep_workspace", "write_file", "patch_file", "restore_backup"}
+    assert names == {"read_file", "list_directory", "grep_workspace", "write_file", "patch_file", "restore_backup",
+                     "make_directory", "move_file", "remove_file", "read_image"}
     assert all(t["type"] == "function" for t in WORKSPACE_TOOLS)
     assert dispatch_tool_call("read_file", {"path": str(root / "f.txt")}, [root])["content"] == "hi\n"
     assert dispatch_tool_call("list_directory", {"path": str(root), "junk": 1}, [root])["entries"]
@@ -449,3 +454,152 @@ def test_dispatch_mutation_tools(tmp_path, home):
     env_args = {"path": str(root / ".env"), "content": "x"}
     assert dispatch_tool_call("write_file", env_args, [root])["error"] == "access_denied"
 
+
+
+def test_make_directory_and_nested_write(tmp_path, home):
+    root = _root(tmp_path)
+    made = make_directory(str(root / "a" / "b"), [root])
+    assert made == {"path": str(root / "a" / "b"), "status": "created"} and (root / "a" / "b").is_dir()
+    assert make_directory(str(root / "a" / "b"), [root])["status"] == "created"  # idempotent
+    out = write_file(str(root / "sub" / "nested" / "new.txt"), "hi", [root])
+    assert (root / "sub" / "nested" / "new.txt").read_text() == "hi" and "error" not in out
+    (root / "f").write_text("x")
+    assert make_directory(str(root / "f"), [root])["error"] == "not_a_directory"
+    for bad in (str(tmp_path / "outside"), "../escape", "", str(home / ".config" / "strand" / "x")):
+        assert make_directory(bad, [root])["error"] == "access_denied", bad
+    assert make_directory(str(home / ".config" / "strand" / "x"), [home])["error"] == "access_denied"
+    assert not (tmp_path / "outside").exists()
+
+
+def test_move_file_and_restore(tmp_path, home):
+    root = _root(tmp_path)
+    src = root / "a.txt"
+    src.write_text("data")
+    dst = root / "new" / "dir" / "b.txt"
+    moved = move_file(str(src), str(dst), [root])
+    assert moved["status"] == "moved" and dst.read_text() == "data" and not src.exists()
+    backups = home / ".local" / "share" / "strand" / "backups"
+    assert stat.S_IMODE((backups / moved["backup"]).stat().st_mode) == 0o600
+    back = restore_backup(moved["backup"], [root])
+    assert src.read_text() == "data" and not dst.exists() and back["deleted"] is False
+    restore_backup(back["redo_backup"], [root])  # redo moves it forward again
+    assert dst.read_text() == "data" and not src.exists()
+
+
+def test_move_file_guards(tmp_path, home):
+    root = _root(tmp_path)
+    (root / "a.txt").write_text("a")
+    (root / "b.txt").write_text("b")
+    (root / ".env").write_text("k")
+    assert move_file(str(root / "a.txt"), str(root / "b.txt"), [root])["error"] == "target_exists"
+    assert move_file(str(root / "none"), str(root / "c"), [root])["error"] == "not_found"
+    assert move_file(str(root / "a.txt"), str(tmp_path / "out.txt"), [root])["error"] == "access_denied"
+    assert move_file(str(tmp_path / "out.txt"), str(root / "c"), [root])["error"] == "access_denied"
+    assert move_file(str(root / ".env"), str(root / "e"), [root])["error"] == "access_denied"
+    assert move_file(str(root / "a.txt"), str(root / ".env.x"), [root])["error"] == "access_denied"
+    assert (root / "a.txt").read_text() == "a" and (root / ".env").exists()
+
+
+def test_move_file_git_clean_gate(tmp_path, home, monkeypatch):
+    root = _root(tmp_path)
+    (root / ".git").mkdir()
+    (root / "a.py").write_text("x")
+    monkeypatch.setattr(workspace, "_git_clean", lambda repo, path: "uncommitted changes in git")
+    assert move_file(str(root / "a.py"), str(root / "b.py"), [root])["error"] == "git_dirty"
+    monkeypatch.setattr(workspace, "_git_clean", lambda repo, path: None)
+    ok = move_file(str(root / "a.py"), str(root / "b.py"), [root])
+    assert ok["track"] == "git" and ok["backup"] is None and (root / "b.py").exists()
+
+
+def test_remove_file_and_restore(tmp_path, home):
+    root = _root(tmp_path)
+    target = root / "gone.txt"
+    target.write_text("precious")
+    os.chmod(target, 0o640)
+    out = remove_file(str(target), [root])
+    assert out["status"] == "removed" and not target.exists()
+    snap = home / ".local" / "share" / "strand" / "backups" / out["backup_id"]
+    assert snap.read_text() == "precious" and stat.S_IMODE(snap.stat().st_mode) == 0o600
+    assert out["backup_id"].endswith("_gone.txt")
+    restored = restore_backup(out["backup_id"], [root])
+    assert target.read_text() == "precious" and restored["deleted"] is False
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+def test_remove_file_guards(tmp_path, home):
+    root = _root(tmp_path)
+    cfg = home / ".config" / "strand"
+    cfg.mkdir(parents=True)
+    (cfg / "memory.db").write_text("db")
+    (root / ".env").write_text("k")
+    (root / ".git").mkdir()
+    (root / ".git" / "HEAD").write_text("ref")
+    (root / "d").mkdir()
+    (tmp_path / "outside.txt").write_text("o")
+    for bad in (cfg / "memory.db", root / ".env", root / ".git" / "HEAD", root / ".git", root):
+        assert remove_file(str(bad), [root, home])["error"] == "access_denied", bad
+    assert remove_file(str(cfg / "memory.db"), [root])["error"] == "access_denied"
+    assert remove_file(str(tmp_path / "outside.txt"), [root])["error"] == "access_denied"
+    assert remove_file(str(root), [root])["error"] == "access_denied"
+    assert remove_file(str(root / "none"), [root])["error"] == "not_found"
+    assert remove_file(str(root / "d"), [root])["error"] == "not_a_file"
+    assert (cfg / "memory.db").exists() and (root / ".env").exists() and (root / ".git" / "HEAD").exists()
+
+
+def test_dispatch_lifecycle_tools(tmp_path, home):
+    root = _root(tmp_path)
+    assert dispatch_tool_call("make_directory", {"path": str(root / "d")}, [root])["status"] == "created"
+    (root / "d" / "f").write_text("1")
+    mv = {"source_path": str(root / "d" / "f"), "target_path": str(root / "d" / "g")}
+    assert dispatch_tool_call("move_file", mv, [root])["status"] == "moved"
+    rm = dispatch_tool_call("remove_file", {"path": str(root / "d" / "g"), "junk": 1}, [root])
+    assert rm["status"] == "removed"
+    assert dispatch_tool_call("restore_backup", {"backup": rm["backup_id"]}, [root])["deleted"] is False
+    assert dispatch_tool_call("move_file", {"source_path": "x"}, [root])["error"] == "invalid_arguments"
+
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"\x01" * 32
+
+
+def test_read_image_encodes_valid_image(tmp_path):
+    import base64
+
+    root = _root(tmp_path)
+    (root / "pic.png").write_bytes(PNG_BYTES)
+    out = read_image(str(root / "pic.png"), [root])
+    assert out["mime_type"] == "image/png" and out["bytes"] == len(PNG_BYTES)
+    assert out["path"] == str(root / "pic.png")
+    prefix = "data:image/png;base64,"
+    assert out["data_uri"].startswith(prefix)
+    assert base64.b64decode(out["data_uri"][len(prefix):]) == PNG_BYTES
+    viaq = dispatch_tool_call("read_image", {"path": str(root / "pic.png")}, [root])
+    assert viaq["data_uri"] == out["data_uri"]
+
+
+def test_read_image_fails_closed(tmp_path, monkeypatch):
+    root = _root(tmp_path)
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(PNG_BYTES)
+    (root / "notes.txt").write_text("x")
+    (root / ".env.png").write_bytes(PNG_BYTES)
+    (root / "fake.png").write_bytes(b"not an image")
+    (root / "pic.jpg").write_bytes(PNG_BYTES)  # content/extension mismatch
+    assert read_image(str(outside), [root])["error"] == "access_denied"
+    assert read_image(str(root / ".env.png"), [root])["error"] == "access_denied"
+    assert read_image(str(root / "notes.txt"), [root])["error"] == "unsupported_extension"
+    assert read_image(str(root / "missing.png"), [root])["error"] == "not_found"
+    assert read_image(str(root / "fake.png"), [root])["error"] == "invalid_image"
+    assert read_image(str(root / "pic.jpg"), [root])["error"] == "invalid_image"
+    monkeypatch.setattr(workspace, "MAX_IMAGE_BYTES", 8)
+    (root / "big.png").write_bytes(PNG_BYTES)
+    assert read_image(str(root / "big.png"), [root])["error"] == "file_too_large"
+
+
+def test_read_file_rejects_binary_images(tmp_path):
+    root = _root(tmp_path)
+    (root / "pic.png").write_bytes(PNG_BYTES)
+    (root / "doc.pdf").write_bytes(b"%PDF-1.4 text only")
+    for name in ("pic.png", "doc.pdf"):
+        out = read_file(str(root / name), [root])
+        assert out["error"] == "binary_file"
+        assert out["message"] == "File appears to be binary. Use read_image for visual media."

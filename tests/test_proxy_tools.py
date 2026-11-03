@@ -138,7 +138,7 @@ def test_read_file_loop_nonstreaming(tmp_path):
     assert response.status_code == 200
     assert "Here is the file content" in response.json()["choices"][0]["message"]["content"]
     assert len(seen) == 2
-    assert {t["function"]["name"] for t in seen[0]["tools"]} == {"read_file", "list_directory", "grep_workspace", "write_file", "patch_file", "restore_backup"}
+    assert {t["function"]["name"] for t in seen[0]["tools"]} == {"read_file", "list_directory", "grep_workspace", "write_file", "patch_file", "restore_backup", "make_directory", "move_file", "remove_file", "read_image"}
     roles = [m["role"] for m in seen[1]["messages"]]
     assert roles[-2:] == ["assistant", "tool"]
     assistant, tool = seen[1]["messages"][-2:]
@@ -384,3 +384,96 @@ def test_run_tool_call_redact_toggle(tmp_path):
     roots = [tmp_path.resolve()]
     assert "abcdefghij1234567890" not in run(_run_tool_call(call, roots))["content"]
     assert "abcdefghij1234567890" in run(_run_tool_call(call, roots, redact=False))["content"]
+
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 8
+
+
+def test_read_image_multimodal_turn_and_stub_compaction(tmp_path):
+    import base64
+
+    b64 = base64.b64encode(PNG_BYTES).decode()
+
+    def responder(n, payload):
+        if n == 1:
+            return httpx.Response(
+                200, json=tool_call_body("read_image", {"path": str(tmp_path / "ws" / "shot.png")})
+            )
+        return httpx.Response(200, json=text_body("The image shows a gradient of bytes in a test file."))
+
+    async def scenario():
+        async with tool_proxy(tmp_path, responder) as (client, seen, workspace, db_path, app):
+            (workspace / "shot.png").write_bytes(PNG_BYTES)
+            first = await client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "Please inspect the screenshot shot.png in my workspace"}]},
+            )
+            # Turn N+1: a client that echoes the multimodal turn back gets only a stub upstream.
+            echoed = list(seen[1]["messages"][-3:])
+            followup = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [
+                        *echoed,
+                        {"role": "assistant", "content": "The image shows a gradient of bytes in a test file."},
+                        {"role": "user", "content": "Thanks, what else should I know about it please?"},
+                    ]
+                },
+            )
+            await drain(app)
+            return first, followup, seen, dump_db(db_path), workspace
+
+    first, followup, seen, dump, workspace = run(scenario())
+    assert first.status_code == 200 and followup.status_code == 200
+    # Turn N: tool message is text metadata; the data URI rides in an image_url content block.
+    tool_msg = seen[1]["messages"][-2]
+    assert tool_msg["role"] == "tool" and b64 not in tool_msg["content"]
+    image_turn = seen[1]["messages"][-1]
+    assert image_turn["role"] == "user"
+    assert any(
+        p.get("type") == "image_url" and p["image_url"]["url"] == f"data:image/png;base64,{b64}"
+        for p in image_turn["content"]
+    )
+    # Turn N+1: only the lightweight stub is transmitted.
+    later = json.dumps(seen[2]["messages"])
+    assert b64 not in later and "data:image/png" not in later
+    assert f"[Image: {workspace / 'shot.png'} inspected (image/png, 2 KB)]" in later
+    assert b64 not in dump and "base64" not in dump
+
+
+def test_ledger_stubs_inline_tool_data_uri():
+    uri = "data:image/png;base64," + "QUJD" * 400
+    tool = json.dumps({"path": "/p/a.png", "mime_type": "image/png", "data_uri": uri, "bytes": 2048})
+    messages = [
+        {"role": "user", "content": "look"},
+        {"role": "tool", "tool_call_id": "a", "content": tool},
+        {"role": "user", "content": "next"},
+    ]
+    out = SessionLedger.compact_history(messages)
+    assert out[1]["content"] == "[Image: /p/a.png inspected (image/png, 2 KB)]"
+    assert messages[1]["content"] == tool
+
+
+def test_distillation_strips_data_uris(tmp_path):
+    from strand.distill import DistillationEngine
+
+    uri = "data:image/png;base64," + "QUJD" * 100
+    seen_text = []
+
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            engine = DistillationEngine(db)
+
+            async def fake_extract(query, response):
+                seen_text.append(query + response)
+                return {"entities": [], "edges": [], "summary": ""}
+
+            engine._extract = fake_extract  # type: ignore[method-assign]
+            await engine.process_exchange(
+                "s", f"Please describe this screenshot {uri} for me in detail", f"It shows a chart {uri} with bars."
+            )
+        return dump_db(tmp_path / "m.db")
+
+    dump = run(scenario())
+    assert all("QUJDQUJD" not in t for t in seen_text)
+    assert "QUJDQUJD" not in dump

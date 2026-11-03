@@ -2,11 +2,12 @@
 
 Dependency-free and JIT: nothing is indexed or cached. Every failure is returned as an
 `{"error": ...}` dictionary; nothing here raises to the caller. Mutation (`write_file`,
-`patch_file`) is dual-track: files in a git repository must be clean in `git status`; loose files
+`patch_file`, `move_file`, `remove_file`, `make_directory`) is dual-track: files in a git repository must be clean in `git status`; loose files
 are snapshotted to `~/.local/share/strand/backups` (dir 0700, files 0600) and can be reverted with
 `restore_backup`. File bodies are returned to the caller only and never persisted by Strand.
 """
 
+import base64
 import fnmatch
 import json
 import os
@@ -54,6 +55,18 @@ MAX_WRITE_BYTES = 256 * 1024
 GIT_TIMEOUT_SECONDS = 10
 # Ring-1 write deny-list (on top of `is_denied_file`): never touch config, secrets or keys.
 WRITE_DENIED_NAME_PATTERNS = (".env*", "*.key", "id_rsa*")
+
+# Phase 8B: headless media inspection. Image bytes are ephemeral runtime data (never persisted).
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+IMAGE_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+BINARY_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".pdf", ".bin"})
+BINARY_FILE_MESSAGE = "File appears to be binary. Use read_image for visual media."
 
 
 def _error(code: str, message: str) -> dict[str, Any]:
@@ -131,6 +144,56 @@ def _check(path: Any, roots: list[Path]) -> tuple[Path | None, dict[str, Any] | 
     return Path(result), None
 
 
+def _sniff_image_mime(head: bytes) -> str | None:
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def read_image(path: str, roots: list[Path] | None = None) -> dict[str, Any]:
+    """Return an image inside the approved roots as a base64 data URI (<= 10 MB, fail closed)."""
+    resolved, err = _check(path, roots or [])
+    if err or resolved is None:
+        return err or _error("access_denied", "invalid path")
+    if is_denied_file(path) or is_denied_file(resolved):
+        return _error("access_denied", f"Access denied: '{path}' matches sensitive file deny-list")
+    expected = IMAGE_MIME_TYPES.get(resolved.suffix.lower())
+    if expected is None:
+        return _error(
+            "unsupported_extension",
+            f"unsupported image extension '{resolved.suffix}'; supported: {', '.join(sorted(IMAGE_MIME_TYPES))}",
+        )
+    if not resolved.exists():
+        return _error("not_found", f"no such path: {path}")
+    if not resolved.is_file():
+        return _error("not_a_file", f"not a regular file: {path}")
+    try:
+        if resolved.stat().st_size > MAX_IMAGE_BYTES:
+            return _error("file_too_large", f"image exceeds the {MAX_IMAGE_BYTES} byte limit: {path}")
+        with open(resolved, "rb") as fh:
+            data = fh.read(MAX_IMAGE_BYTES + 1)
+    except OSError as exc:
+        return _error("os_error", str(exc.strerror or exc))
+    if len(data) > MAX_IMAGE_BYTES:
+        return _error("file_too_large", f"image exceeds the {MAX_IMAGE_BYTES} byte limit: {path}")
+    mime = _sniff_image_mime(data[:16])
+    if mime is None or mime != expected:
+        return _error("invalid_image", f"file content is not a valid {expected} image: {path}")
+    encoded = base64.b64encode(data).decode("ascii")
+    return {
+        "path": str(resolved),
+        "mime_type": mime,
+        "data_uri": f"data:{mime};base64,{encoded}",
+        "bytes": len(data),
+    }
+
+
 def list_directory(path: str, roots: list[Path]) -> dict[str, Any]:
     """Single-level listing sorted by name: [{name, type, size}] (size in bytes)."""
     resolved, err = _check(path, roots)
@@ -181,6 +244,8 @@ def read_file(
         return _error("not_found", f"no such path: {path}")
     if not resolved.is_file():
         return _error("not_a_file", f"not a regular file: {path}")
+    if resolved.suffix.lower() in BINARY_EXTENSIONS:
+        return _error("binary_file", BINARY_FILE_MESSAGE)
     lines: list[str] = []
     used = 0
     byte_truncated = False
@@ -188,7 +253,7 @@ def read_file(
     try:
         with open(resolved, "rb") as fh:
             if b"\x00" in fh.read(1024):
-                return _error("binary_file", f"binary file not readable: {path}")
+                return _error("binary_file", BINARY_FILE_MESSAGE)
             fh.seek(0)
             lineno = 0
             while True:
@@ -428,8 +493,11 @@ def _atomic_write(path: Path, data: bytes, mode: int | None = None) -> None:
         raise
 
 
-def _snapshot(path: Path) -> str:
-    """Journal the pre-mutation state of `path`; return the backup id (file name)."""
+def _snapshot(path: Path, moved_to: Path | None = None) -> str:
+    """Journal the pre-mutation state of `path`; return the backup id (file name).
+
+    `moved_to` records the destination of a move so `restore_backup` can move the file back.
+    """
     directory = _backup_dir()
     directory.mkdir(parents=True, exist_ok=True)
     secure_parent_dir(directory.parent)
@@ -439,7 +507,12 @@ def _snapshot(path: Path) -> str:
     stamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
     backup_id = f"{stamp}_{path.name}"
     _atomic_write(directory / backup_id, data, 0o600)
-    meta = json.dumps({"original": str(path), "existed": existed}).encode()
+    info: dict[str, Any] = {"original": str(path), "existed": existed}
+    if existed:
+        info["mode"] = path.stat().st_mode & 0o777
+    if moved_to is not None:
+        info["moved_to"] = str(moved_to)
+    meta = json.dumps(info).encode()
     _atomic_write(directory / (backup_id + ".meta"), meta, 0o600)
     return backup_id
 
@@ -529,6 +602,89 @@ def patch_file(path: str, search_block: str, replace_block: str, roots: list[Pat
     return _commit_mutation(resolved, updated)
 
 
+def make_directory(path: str, roots: list[Path] | None = None) -> dict[str, Any]:
+    """Create a directory (and missing parents) inside an approved root; idempotent."""
+    resolved, err = _check(path, roots or [])
+    if err or resolved is None:
+        return err or _error("access_denied", "invalid path")
+    reason = _write_denied(path, resolved)
+    if reason:
+        return _error("access_denied", f"write denied: {reason}")
+    if resolved.exists() and not resolved.is_dir():
+        return _error("not_a_directory", f"path exists and is not a directory: {path}")
+    try:
+        resolved.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return _error("os_error", str(exc.strerror or exc))
+    return {"path": str(resolved), "status": "created"}
+
+
+def move_file(source_path: str, target_path: str, roots: list[Path] | None = None) -> dict[str, Any]:
+    """Move/rename a file (git-clean gated inside git, snapshotted outside) without overwriting."""
+    roots = roots or []
+    source, err = _prepare_mutation(source_path, roots)
+    if err or source is None:
+        return err or _error("access_denied", "invalid path")
+    target, err = _prepare_mutation(target_path, roots)
+    if err or target is None:
+        return err or _error("access_denied", "invalid path")
+    if not source.exists():
+        return _error("not_found", f"no such file: {source_path}")
+    if target.exists():
+        return _error("target_exists", f"target already exists: {target_path}")
+    repo = _git_root(source)
+    backup: str | None = None
+    if repo is not None:
+        reason = _git_clean(repo, source)
+        if reason:
+            return _error("git_dirty", f"refusing to move {source.name}: {reason}")
+    else:
+        try:
+            backup = _snapshot(source, moved_to=target)
+        except OSError as exc:
+            return _error("backup_failed", f"snapshot failed, file untouched: {exc.strerror or exc}")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source), str(target))
+    except OSError as exc:
+        return _error("os_error", str(exc.strerror or exc))
+    return {
+        "source": str(source),
+        "target": str(target),
+        "status": "moved",
+        "track": "git" if repo is not None else "snapshot",
+        "backup": backup,
+    }
+
+
+def remove_file(path: str, roots: list[Path] | None = None) -> dict[str, Any]:
+    """Soft-delete a file: a 0600 snapshot is journaled first so `restore_backup` can revive it."""
+    roots = roots or []
+    resolved, err = _check(path, roots)
+    if err or resolved is None:
+        return err or _error("access_denied", "invalid path")
+    for root in roots:
+        try:
+            if resolved == Path(root).expanduser().resolve():
+                return _error("access_denied", "workspace root directories cannot be removed")
+        except (OSError, RuntimeError, ValueError):
+            continue
+    resolved, err = _prepare_mutation(path, roots)
+    if err or resolved is None:
+        return err or _error("access_denied", "invalid path")
+    if not resolved.exists():
+        return _error("not_found", f"no such file: {path}")
+    try:
+        backup = _snapshot(resolved)
+    except OSError as exc:
+        return _error("backup_failed", f"snapshot failed, file untouched: {exc.strerror or exc}")
+    try:
+        resolved.unlink()
+    except OSError as exc:
+        return _error("os_error", str(exc.strerror or exc))
+    return {"path": str(resolved), "status": "removed", "backup_id": backup}
+
+
 def restore_backup(backup: str, roots: list[Path]) -> dict[str, Any]:
     """Revert a file to a journaled snapshot (id or path inside the backup directory).
 
@@ -549,6 +705,8 @@ def restore_backup(backup: str, roots: list[Path]) -> dict[str, Any]:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         original = Path(meta["original"])
         existed = bool(meta["existed"])
+        moved_to = meta.get("moved_to")
+        saved_mode = meta.get("mode")
         data = snapshot.read_bytes()
     except FileNotFoundError:
         return _error("not_found", f"no such backup: {backup}")
@@ -557,10 +715,25 @@ def restore_backup(backup: str, roots: list[Path]) -> dict[str, Any]:
     resolved, err = _prepare_mutation(str(original), roots)
     if err or resolved is None:
         return err or _error("access_denied", "invalid path")
+    moved: Path | None = None
+    if isinstance(moved_to, str):
+        moved, err = _prepare_mutation(moved_to, roots)
+        if err or moved is None:
+            return err or _error("access_denied", "invalid path")
     try:
+        if moved is not None:
+            # undo a move: put the file back at its origin and take it away from the target
+            redo = _snapshot(moved, moved_to=resolved) if moved.exists() else None
+            mode = saved_mode if isinstance(saved_mode, int) else None
+            _atomic_write(resolved, data, mode)
+            moved.unlink(missing_ok=True)
+            return {"path": str(resolved), "restored_from": snapshot.name, "deleted": False, "moved_back_from": str(moved), "redo_backup": redo}
         redo = _snapshot(resolved)
         if existed:
-            mode = resolved.stat().st_mode & 0o777 if resolved.exists() else None
+            if resolved.exists():
+                mode = resolved.stat().st_mode & 0o777
+            else:
+                mode = saved_mode if isinstance(saved_mode, int) else None
             _atomic_write(resolved, data, mode)
         else:
             resolved.unlink(missing_ok=True)
@@ -646,8 +819,35 @@ WORKSPACE_TOOLS: list[dict[str, Any]] = [
         ["path", "search_block", "replace_block"],
     ),
     _schema(
+        "read_image",
+        "Inspect an image (.png, .jpg, .jpeg, .webp, .gif; max 10 MB) inside an approved workspace root. "
+        "The image is shown to you for this turn only.",
+        {"path": "Image file path."},
+        ["path"],
+    ),
+    _schema(
+        "make_directory",
+        "Create a directory (including missing parents) inside an approved workspace root.",
+        {"path": "Directory path."},
+        ["path"],
+    ),
+    _schema(
+        "move_file",
+        "Move or rename a file inside approved workspace roots (never overwrites). Files outside git "
+        "are snapshotted first (undo with restore_backup); files in git must be clean.",
+        {"source_path": "Existing file path.", "target_path": "New file path."},
+        ["source_path", "target_path"],
+    ),
+    _schema(
+        "remove_file",
+        "Delete a file inside an approved workspace root. A snapshot is journaled first; undo with "
+        "restore_backup(backup_id). .git, .env, key and Strand config files are denied.",
+        {"path": "File path."},
+        ["path"],
+    ),
+    _schema(
         "restore_backup",
-        "Undo a write_file/patch_file by restoring the snapshot id returned in its `backup` field.",
+        "Undo a write_file/patch_file/move_file/remove_file by restoring the snapshot id returned in its `backup` field.",
         {"backup": "Backup id (or path in the Strand backup directory)."},
         ["backup"],
     ),
@@ -656,25 +856,37 @@ WORKSPACE_TOOLS: list[dict[str, Any]] = [
 _HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "list_directory": list_directory,
     "read_file": read_file,
+    "read_image": read_image,
     "grep_workspace": grep_workspace,
     "write_file": write_file,
     "patch_file": patch_file,
+    "make_directory": make_directory,
+    "move_file": move_file,
+    "remove_file": remove_file,
     "restore_backup": restore_backup,
 }
 _ALLOWED_ARGS = {
     "list_directory": ("path",),
     "read_file": ("path", "offset", "limit"),
+    "read_image": ("path",),
     "grep_workspace": ("pattern", "path", "max_results"),
     "write_file": ("path", "content"),
     "patch_file": ("path", "search_block", "replace_block"),
+    "make_directory": ("path",),
+    "move_file": ("source_path", "target_path"),
+    "remove_file": ("path",),
     "restore_backup": ("backup",),
 }
 _REQUIRED_ARGS = {
     "list_directory": ("path",),
     "read_file": ("path",),
+    "read_image": ("path",),
     "grep_workspace": ("pattern",),
     "write_file": ("path", "content"),
     "patch_file": ("path", "search_block", "replace_block"),
+    "make_directory": ("path",),
+    "move_file": ("source_path", "target_path"),
+    "remove_file": ("path",),
     "restore_backup": ("backup",),
 }
 

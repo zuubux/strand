@@ -1,6 +1,7 @@
 """In-memory session ledger: remembers which graph facts the LLM has already been shown."""
 
 import json
+import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -51,8 +52,27 @@ TOOL_EVICT_MIN_CHARS = 512  # earlier-turn tool outputs longer than this are com
 _EVICTED_MEDIA_TYPES = ("image_url", "input_audio", "input_image")
 
 
+IMAGE_PART_PREFIX = "read_image: "  # text part naming the file in a read_image follow-up message
+DATA_URI_RE = re.compile(r"data:(image/[A-Za-z0-9.+-]+);base64,[A-Za-z0-9+/=]+")
+
+
 def _tool_placeholder(size: int) -> str:
     return f"[tool output evicted: {size} chars]"
+
+
+def _image_stub(path: str, mime: str, size_bytes: int) -> str:
+    return f"[Image: {path or 'unknown'} inspected ({mime}, {max(1, round(size_bytes / 1024))} KB)]"
+
+
+def _uri_stub(uri: str, path: str = "") -> str:
+    match = DATA_URI_RE.match(uri)
+    mime = match.group(1) if match else "image"
+    payload = uri.split(",", 1)[-1]
+    return _image_stub(path, mime, len(payload) * 3 // 4)
+
+
+def _strip_data_uris(text: str, path: str = "") -> str:
+    return DATA_URI_RE.sub(lambda m: _uri_stub(m.group(0), path), text)
 
 
 def _evict_message(message: dict[str, Any]) -> dict[str, Any]:
@@ -60,16 +80,42 @@ def _evict_message(message: dict[str, Any]) -> dict[str, Any]:
     content = message.get("content")
     if message.get("role") == "tool":
         text = content if isinstance(content, str) else json.dumps(content, default=str)
+        if "data:image/" in text:  # read_image payload: keep a concise stub only
+            try:
+                data = json.loads(text)
+            except ValueError:
+                data = None
+            if isinstance(data, dict) and isinstance(data.get("data_uri"), str):
+                mime = str(data.get("mime_type") or "image")
+                size = data.get("bytes") if isinstance(data.get("bytes"), int) else len(data["data_uri"]) * 3 // 4
+                return {**message, "content": _image_stub(str(data.get("path", "")), mime, size)}
+            text = _strip_data_uris(text)
         if len(text) > TOOL_EVICT_MIN_CHARS:
             return {**message, "content": _tool_placeholder(len(text))}
-        return message
+        return {**message, "content": text} if text != content else message
+    if isinstance(content, str):
+        stripped = _strip_data_uris(content)
+        return {**message, "content": stripped} if stripped != content else message
     if isinstance(content, list):
-        parts = [
-            {"type": "text", "text": "[media evicted]"}
-            if isinstance(part, dict) and part.get("type") in _EVICTED_MEDIA_TYPES
-            else part
-            for part in content
-        ]
+        path = ""
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text")
+                if isinstance(text, str) and text.startswith(IMAGE_PART_PREFIX):
+                    path = text[len(IMAGE_PART_PREFIX) :]
+        parts: list[Any] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in _EVICTED_MEDIA_TYPES:
+                image = part.get("image_url")
+                url = image.get("url") if isinstance(image, dict) else image
+                if isinstance(url, str) and url.startswith("data:image/"):
+                    parts.append({"type": "text", "text": _uri_stub(url, path)})
+                else:
+                    parts.append({"type": "text", "text": "[media evicted]"})
+            elif isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                parts.append({**part, "text": _strip_data_uris(part["text"])})
+            else:
+                parts.append(part)
         if parts != content:
             return {**message, "content": parts}
     return message

@@ -92,6 +92,13 @@ Governed by `CONSTRAINTS.md` (Ring 0 ambient read, JIT pull, nothing raw in `mem
 - [x] **SEC-UI-009 UI Governance Alignment**: removed the dead `fail_closed_private` checkbox; fail-closed privacy is immutable. Tests: `tests/test_ui.py`.
 - [x] **SEC-PRIV-009 Mark-Private CLI**: `strand mark-private <name|id>` via `db.update_entity_metadata`. Tests: `tests/test_cli.py`.
 
+## Phase 8A: Ring 1 Safe Mutation & Fast Grep
+- [x] **WS-GREP-001 Workspace Fast Grep**: `grep_workspace` uses ripgrep when installed, else a Python regex scan; sandboxed by `is_safe_path`, capped at 20 matches / 4 KB, skips deny-listed files.
+- [x] **WS-MUT-002 Safe Mutation Engine**: `write_file` / `patch_file` with git-clean gating inside repositories and `0600` snapshots in `~/.local/share/strand/backups` (dir `0700`) for loose files; unique-match patching; deny-list for `~/.config/strand/`, `.env*`, `*.key`, `id_rsa*`.
+- [x] **WS-UNDO-003 Undo Journal**: `restore_backup` reverts a mutation and journals the pre-restore state (redo). Registered in `WORKSPACE_TOOLS` and `dispatch_tool_call`; file bodies stay ephemeral. Tests: `tests/test_tools.py`. Offline suite green with `-W error`.
+- [x] **WS-LIFE-004 Workspace File Lifecycle**: `make_directory`, `move_file`, `remove_file` plus automatic parent creation in `write_file`; moves and deletions are journaled (`0600`) and reversible through `restore_backup`; boundary, deny-list and git-clean checks apply. Tests: `tests/test_tools.py`. Offline suite (770 tests) green with `-W error`.
+- [x] **WS-IMG-005 Headless Media Inspection (Phase 8B)**: `read_image` (`.png/.jpg/.jpeg/.webp/.gif`, 10 MB cap, root sandbox, deny-list, magic-byte check) returns a base64 data URI; `read_file` rejects binary files with `binary_file`; the proxy sends the image upstream as an `image_url` content block; `SessionLedger.compact_history` replaces earlier-turn payloads with `[Image: path inspected (mime, N KB)]` stubs; `process_exchange` strips data URIs before Model B. Tests: `tests/test_tools.py`, `tests/test_proxy_tools.py`. Offline suite (776 tests) green with `-W error`.
+
 ## Phase 8: Public GitHub Release Readiness
 - [x] **PUB-SAN-001 Phase 1 Sanitization Sweep**: personal identities, hostnames, home paths and vehicle fixtures scrubbed from `src/`, `tests/`, `packaging/` and docs; `strand.service` is path-neutral (`%h`, `/usr/bin/env python3`); identity falls back to `Operator`/`workstation`. Offline suite (683 tests) green with `-W error`.
 - [x] **PUB-PKG-002 Desktop Packaging & Docker Cleanup**: orphaned `packaging/docker/` removed; added `packaging/desktop/strand.desktop` and `packaging/icons/strand.svg`; `strand-gui` guards against closed stdio and exits 0 after joining bridge workers on window close.

@@ -19,7 +19,7 @@ from .common import (
 from .db import DatabaseManager
 from .logging import get_logger
 from .sanitize import is_secret_token, sanitize_text
-from .session import SessionLedger
+from .session import DATA_URI_RE, SessionLedger
 from .stopwords import is_filler_name, is_stop_word, is_valid_entity_name, name_tokens
 
 logger = get_logger("distill")
@@ -581,6 +581,8 @@ class DistillationEngine:
         """
         try:
             query, response = sanitize_text(query), sanitize_text(strip_think(response))
+            # Phase 8B: media payloads are ephemeral; never let a data URI reach Model B or memory.db.
+            query, response = DATA_URI_RE.sub("[image]", query), DATA_URI_RE.sub("[image]", response)
             if not is_substantive_exchange(query, response):
                 logger.info("Skipped non-substantive exchange session=%r", session_id)
                 return None

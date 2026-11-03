@@ -32,7 +32,7 @@ from .onboarding import (
 )
 from .resolver import ContextResolver
 from .sanitize import sanitize_text
-from .session import MAX_SESSION_ID_LEN
+from .session import IMAGE_PART_PREFIX, MAX_SESSION_ID_LEN
 from .tools.workspace import WORKSPACE_TOOLS, dispatch_tool_call
 
 logger = get_logger("proxy")
@@ -341,20 +341,44 @@ async def _buffer_until_decided(upstream: httpx.Response) -> tuple[bytes, httpx.
     return b"".join(head), None
 
 
-async def _run_tool_call(
+async def _run_tool_call_full(
     call: dict[str, Any], roots: list[Path], redact: bool = True
-) -> dict[str, Any]:
-    """Execute one tool call locally; the result is an ephemeral `role: tool` message."""
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Execute one tool call locally: the ephemeral `role: tool` message plus an optional image turn.
+
+    `read_image` results are multimodal: the tool message keeps only lightweight metadata (tool
+    messages must be text) and the `data_uri` travels upstream as an `image_url` content block in
+    a follow-up user message. Both are runtime-only; `SessionLedger.compact_history` stubs them.
+    """
     function = call["function"]
     try:
         arguments = json.loads(function["arguments"] or "{}")
     except ValueError:
         arguments = None  # dispatch_tool_call reports invalid_arguments
     result = await asyncio.to_thread(dispatch_tool_call, function["name"], arguments, roots)
+    followup: dict[str, Any] | None = None
+    data_uri = result.get("data_uri") if function["name"] == "read_image" else None
+    if isinstance(data_uri, str):
+        result = {k: v for k, v in result.items() if k != "data_uri"}
+        result["note"] = "The image is attached in the next message."
+        followup = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"{IMAGE_PART_PREFIX}{result.get('path', '')}"},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        }
     content = json.dumps(result)
     if redact:  # SEC-PRIV-007: scrub secrets from tool output before it goes upstream
         content = sanitize_text(content)
-    return {"role": "tool", "tool_call_id": call["id"], "content": content}
+    return {"role": "tool", "tool_call_id": call["id"], "content": content}, followup
+
+
+async def _run_tool_call(
+    call: dict[str, Any], roots: list[Path], redact: bool = True
+) -> dict[str, Any]:
+    """Execute one tool call locally; the result is an ephemeral `role: tool` message."""
+    return (await _run_tool_call_full(call, roots, redact))[0]
 
 
 def _error(status: int, message: str, kind: str) -> JSONResponse:
@@ -489,8 +513,13 @@ def create_app(
                 break
             logger.info("Executing %d local tool call(s) round=%d", len(calls), round_no + 1)
             convo.append({**extras, "role": "assistant", "content": text or None, "tool_calls": calls})
+            images: list[dict[str, Any]] = []
             for call in calls:
-                convo.append(await _run_tool_call(call, roots, config.redact_secrets))
+                tool_message, followup = await _run_tool_call_full(call, roots, config.redact_secrets)
+                convo.append(tool_message)
+                if followup is not None:
+                    images.append(followup)
+            convo.extend(images)  # tool results must stay contiguous after the assistant tool_calls
         content_type = upstream.headers.get("content-type")
         return httpx.Response(
             upstream.status_code, headers={"content-type": content_type} if content_type else None, content=body
