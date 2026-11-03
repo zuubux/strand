@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from strand.tools.workspace import (
     MAX_READ_LINES,
     WORKSPACE_TOOLS,
     dispatch_tool_call,
+    get_file_info,
     grep_workspace,
     is_safe_path,
     list_directory,
@@ -152,7 +154,7 @@ def test_schemas_and_dispatch(tmp_path):
     (root / "f.txt").write_text("hi\n")
     names = {t["function"]["name"] for t in WORKSPACE_TOOLS}
     assert names == {"read_file", "list_directory", "grep_workspace", "write_file", "patch_file", "restore_backup",
-                     "make_directory", "move_file", "remove_file", "read_image"}
+                     "make_directory", "move_file", "remove_file", "read_image", "get_file_info", "read_multiple_files", "glob_files"}
     assert all(t["type"] == "function" for t in WORKSPACE_TOOLS)
     assert dispatch_tool_call("read_file", {"path": str(root / "f.txt")}, [root])["content"] == "hi\n"
     assert dispatch_tool_call("list_directory", {"path": str(root), "junk": 1}, [root])["entries"]
@@ -603,3 +605,171 @@ def test_read_file_rejects_binary_images(tmp_path):
         out = read_file(str(root / name), [root])
         assert out["error"] == "binary_file"
         assert out["message"] == "File appears to be binary. Use read_image for visual media."
+
+
+
+def test_get_file_info_regular_file(tmp_path):
+    root = _root(tmp_path)
+    f = root / "a.txt"
+    f.write_text("one\ntwo\nthree\n")
+    f.chmod(0o644)
+    result = get_file_info(str(f), [root])
+    info = result["info"]
+    assert result["path"] == str(f)
+    assert info["size_bytes"] == 14 and info["mode"] == "0644"
+    assert info["is_file"] is True and info["is_dir"] is False and info["line_count"] == 3
+    assert info["modified"] == datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc).isoformat()
+    f.chmod(0o755)
+    assert dispatch_tool_call("get_file_info", {"path": str(f)}, [root])["info"]["mode"] == "0755"
+
+
+def test_get_file_info_directory_binary_and_large(tmp_path):
+    root = _root(tmp_path)
+    (root / "d").mkdir()
+    (root / "b.dat").write_bytes(b"\x00\x01\n\x02")
+    (root / "p.png").write_bytes(b"abc\n")
+    (root / "big.txt").write_bytes(b"x\n" * (1024 * 1024 + 1))
+    d = get_file_info(str(root / "d"), [root])["info"]
+    assert d["is_dir"] is True and d["is_file"] is False and d["line_count"] is None
+    for name in ("b.dat", "p.png", "big.txt"):
+        assert get_file_info(str(root / name), [root])["info"]["line_count"] is None
+
+
+def test_get_file_info_boundaries_and_not_found(tmp_path, monkeypatch):
+    root = _root(tmp_path)
+    home = tmp_path / "home"
+    (home / ".config" / "strand").mkdir(parents=True)
+    (home / ".config" / "strand" / "memory.db").write_text("x")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    (root / ".git").mkdir()
+    (root / ".git" / "HEAD").write_text("ref")
+    (root / ".env").write_text("K=V")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x")
+    targets = (str(outside), "/etc/passwd", str(root / ".env"), str(root / ".git" / "HEAD"),
+               str(root / ".git"), str(home / ".config" / "strand" / "memory.db"))
+    for target in targets:
+        assert get_file_info(target, [root, home])["error"] == "access_denied", target
+    assert get_file_info(str(outside), [root])["error"] == "access_denied"
+    assert get_file_info(str(root / "nope"), [root])["error"] == "not_found"
+    assert get_file_info(123, [root])["error"] == "invalid_arguments"  # type: ignore[arg-type]
+
+
+def test_read_multiple_files_valid(tmp_path):
+    root = _root(tmp_path)
+    (root / "a.txt").write_text("one\ntwo\n")
+    (root / "b.py").write_text("x = 1\ny = 2\nz = 3")
+    result = workspace.read_multiple_files([str(root / "a.txt"), str(root / "b.py")], [root])
+    assert result["errors"] == []
+    assert [f["lines"] for f in result["files"]] == [2, 3]
+    assert result["files"][0]["content"] == "one\ntwo\n"
+    assert result["files"][1]["content"] == "x = 1\ny = 2\nz = 3"
+    via = dispatch_tool_call("read_multiple_files", {"paths": [str(root / "a.txt")], "junk": 1}, [root])
+    assert via["files"][0]["lines"] == 2
+    assert dispatch_tool_call("read_multiple_files", {}, [root])["error"] == "invalid_arguments"
+
+
+def test_read_multiple_files_partial_success(tmp_path):
+    root = _root(tmp_path)
+    (root / "ok.txt").write_text("fine\n")
+    (root / ".env").write_text("KEY=1\n")
+    (root / "pic.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00")
+    (root / "nul.dat").write_bytes(b"ab\x00cd")
+    (root / "big.txt").write_text("a" * (workspace.MAX_BATCH_FILE_BYTES + 1))
+    paths = [str(root / n) for n in ("ok.txt", "missing.txt", ".env", "pic.png", "nul.dat", "big.txt")]
+    paths.append(str(tmp_path / "outside.txt"))
+    result = workspace.read_multiple_files(paths, [root])
+    assert [f["path"] for f in result["files"]] == [paths[0]]
+    codes = {e["path"]: e["error"] for e in result["errors"]}
+    assert codes == {
+        paths[1]: "not_found",
+        paths[2]: "access_denied",
+        paths[3]: "binary_file",
+        paths[4]: "binary_file",
+        paths[5]: "file_too_large",
+        paths[6]: "access_denied",
+    }
+    denied = next(e for e in result["errors"] if e["path"] == paths[2])
+    assert denied["message"] == "Access denied: sensitive file policy"
+
+
+def test_read_multiple_files_batch_limit(tmp_path):
+    root = _root(tmp_path)
+    (root / "a.txt").write_text("a")
+    too_many = [str(root / "a.txt")] * 11
+    assert workspace.read_multiple_files(too_many, [root]) == {
+        "error": "batch_too_large",
+        "message": "Maximum 10 files per batch",
+    }
+    assert len(workspace.read_multiple_files(too_many[:10], [root])["files"]) == 10
+
+
+def test_glob_files_extensions_and_dispatch(tmp_path):
+    root = _root(tmp_path)
+    (root / "sub").mkdir()
+    (root / "a.txt").write_text("a")
+    (root / "sub" / "b.txt").write_text("b")
+    (root / "test_x.py").write_text("x")
+    (root / "other.py").write_text("x")
+    result = workspace.glob_files("**/*.txt", None, [root])
+    assert result == {
+        "pattern": "**/*.txt",
+        "base_path": str(root),
+        "matches": [str(root / "a.txt"), str(root / "sub" / "b.txt")],
+        "count": 2,
+        "truncated": False,
+    }
+    py = workspace.glob_files("test_*.py", str(root), [root])
+    assert py["matches"] == [str(root / "test_x.py")] and py["count"] == 1
+    via = dispatch_tool_call("glob_files", {"pattern": "*.py", "path": "", "junk": 1}, [root])
+    assert via["count"] == 2
+    assert dispatch_tool_call("glob_files", {}, [root])["error"] == "invalid_arguments"
+
+
+def test_glob_files_truncates_at_200(tmp_path):
+    root = _root(tmp_path)
+    for i in range(230):
+        (root / f"f{i:03d}.dat").write_text("x")
+    result = workspace.glob_files("*.dat", None, [root])
+    assert result["count"] == 200 and len(result["matches"]) == 200 and result["truncated"] is True
+    exact = _root(tmp_path / "e") if (tmp_path / "e").mkdir() is None else None
+    for i in range(200):
+        (exact / f"g{i}.dat").write_text("x")
+    assert workspace.glob_files("*.dat", None, [exact])["truncated"] is False
+
+
+def test_glob_files_boundaries_and_deny_list(tmp_path, monkeypatch):
+    root = _root(tmp_path)
+    home = tmp_path / "home"
+    (home / ".config" / "strand").mkdir(parents=True)
+    (home / ".config" / "strand" / "memory.db").write_text("x")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    (root / ".git").mkdir()
+    (root / ".git" / "HEAD").write_text("ref")
+    (root / ".env").write_text("K=V")
+    (root / ".env.local").write_text("K=V")
+    (root / "ok.txt").write_text("ok")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "leak.txt").write_text("x")
+    (root / "link.txt").symlink_to(outside / "leak.txt")
+    result = workspace.glob_files("**/*", None, [root, home])
+    assert result["matches"] == [str(root / "ok.txt")]
+    assert workspace.glob_files(".env*", None, [root])["matches"] == []
+    assert workspace.glob_files("**/*", str(outside), [root])["error"] == "access_denied"
+    assert workspace.glob_files("*", "/etc", [root])["error"] == "access_denied"
+    assert workspace.glob_files("*", str(home / ".config" / "strand"), [root, home])["error"] == "access_denied"
+    assert workspace.glob_files("*", str(root / ".git"), [root])["error"] == "access_denied"
+
+
+def test_glob_files_errors(tmp_path):
+    root = _root(tmp_path)
+    (root / "f.txt").write_text("x")
+    assert workspace.glob_files("*", str(root / "nope"), [root])["error"] == "not_found"
+    assert workspace.glob_files("*", str(root / "f.txt"), [root])["error"] == "not_a_directory"
+    for bad in ("", "   ", None, 5):
+        assert workspace.glob_files(bad, None, [root])["error"] == "invalid_arguments"  # type: ignore[arg-type]
+    assert workspace.glob_files("*", 5, [root])["error"] == "invalid_arguments"  # type: ignore[arg-type]
+    assert workspace.glob_files("/abs/*", None, [root])["error"] == "invalid_arguments"

@@ -13,10 +13,11 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ MAX_READ_BYTES = 8 * 1024
 MAX_READ_LINES = 200
 DEFAULT_READ_LIMIT = 120
 MAX_LIST_ENTRIES = 500
+GLOB_MAX_RESULTS = 200
 
 # SEC-PRIV-007: file-name globs (matched case-insensitively) that read_file never serves.
 DENIED_NAME_PATTERNS = (
@@ -67,6 +69,8 @@ IMAGE_MIME_TYPES = {
 }
 BINARY_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".pdf", ".bin"})
 BINARY_FILE_MESSAGE = "File appears to be binary. Use read_image for visual media."
+MAX_BATCH_FILES = 10
+MAX_BATCH_FILE_BYTES = 256 * 1024
 
 
 def _error(code: str, message: str) -> dict[str, Any]:
@@ -289,6 +293,55 @@ def read_file(
         "truncated": more,
         "byte_truncated": byte_truncated,
         "next_offset": offset + len(lines) if more else None,
+    }
+
+
+def _count_lines(path: Path) -> int | None:
+    """Count `\\n` bytes in a text file; None when the file looks binary."""
+    count = 0
+    first = True
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(64 * 1024)
+            if not chunk:
+                break
+            if first and b"\x00" in chunk[:1024]:
+                return None
+            first = False
+            count += chunk.count(b"\n")
+    return count
+
+
+def get_file_info(path: str, roots: list[Path] | None = None) -> dict[str, Any]:
+    """Return stat metadata (never the file body) for a path inside the approved roots."""
+    resolved, err = _check(path, roots or [])
+    if err or resolved is None:
+        return err or _error("access_denied", "invalid path")
+    if is_denied_file(path) or _write_denied(path, resolved) is not None:
+        return _error("access_denied", f"Access denied: '{path}' matches sensitive file deny-list")
+    try:
+        st = os.stat(resolved)
+    except FileNotFoundError:
+        return _error("not_found", f"no such path: {path}")
+    except OSError as exc:
+        return _error("os_error", str(exc.strerror or exc))
+    is_file = stat.S_ISREG(st.st_mode)
+    line_count: int | None = None
+    if is_file and st.st_size <= GREP_MAX_FILE_BYTES and resolved.suffix.lower() not in BINARY_EXTENSIONS:
+        try:
+            line_count = _count_lines(resolved)
+        except OSError:
+            line_count = None
+    return {
+        "path": str(resolved),
+        "info": {
+            "size_bytes": st.st_size,
+            "mode": format(stat.S_IMODE(st.st_mode), "04o"),
+            "is_file": is_file,
+            "is_dir": stat.S_ISDIR(st.st_mode),
+            "modified": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+            "line_count": line_count,
+        },
     }
 
 
@@ -742,6 +795,106 @@ def restore_backup(backup: str, roots: list[Path]) -> dict[str, Any]:
     return {"path": str(resolved), "restored_from": snapshot.name, "deleted": not existed, "redo_backup": redo}
 
 
+def read_multiple_files(paths: list[str], roots: list[Path] | None = None) -> dict[str, Any]:
+    """Read up to 10 text files (<= 256 KB each) in one call; per-file failures never abort the batch."""
+    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        return _error("invalid_arguments", "paths must be a list of strings")
+    if len(paths) > MAX_BATCH_FILES:
+        return _error("batch_too_large", f"Maximum {MAX_BATCH_FILES} files per batch")
+    workspace_roots = roots or []
+    files: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    def fail(path: str, code: str, message: str) -> None:
+        errors.append({"path": path, "error": code, "message": message})
+
+    for path in paths:
+        ok, result = is_safe_path(path, workspace_roots)
+        if not ok:
+            fail(path, "access_denied", str(result))
+            continue
+        resolved = Path(result)
+        if is_denied_file(path) or is_denied_file(resolved):
+            fail(path, "access_denied", "Access denied: sensitive file policy")
+            continue
+        if not resolved.exists():
+            fail(path, "not_found", f"no such path: {path}")
+            continue
+        if not resolved.is_file():
+            fail(path, "not_a_file", f"not a regular file: {path}")
+            continue
+        if resolved.suffix.lower() in BINARY_EXTENSIONS:
+            fail(path, "binary_file", "File appears to be binary.")
+            continue
+        try:
+            if resolved.stat().st_size > MAX_BATCH_FILE_BYTES:
+                fail(path, "file_too_large", f"file exceeds the {MAX_BATCH_FILE_BYTES} byte limit: {path}")
+                continue
+            with open(resolved, "rb") as fh:
+                data = fh.read(MAX_BATCH_FILE_BYTES + 1)
+        except OSError as exc:
+            fail(path, "os_error", str(exc.strerror or exc))
+            continue
+        if b"\x00" in data[:1024]:
+            fail(path, "binary_file", "File appears to be binary.")
+            continue
+        if len(data) > MAX_BATCH_FILE_BYTES:
+            fail(path, "file_too_large", f"file exceeds the {MAX_BATCH_FILE_BYTES} byte limit: {path}")
+            continue
+        text = data.decode("utf-8", errors="replace")
+        files.append({"path": path, "content": text, "lines": len(text.splitlines())})
+    return {"files": files, "errors": errors}
+
+
+def glob_files(pattern: str, path: str | None = None, roots: list[Path] | None = None) -> dict[str, Any]:
+    """Pattern-match file paths (e.g. `**/*.py`) under a base directory, capped at GLOB_MAX_RESULTS."""
+    roots = roots or []
+    if not isinstance(pattern, str) or not pattern.strip() or "\x00" in pattern:
+        return _error("invalid_arguments", "pattern must be a non-empty string")
+    if path is not None and not isinstance(path, str):
+        return _error("invalid_arguments", "path must be a string")
+    target = path if path and path.strip() else (str(roots[0]) if roots else "")
+    resolved, err = _check(target, roots)
+    if err or resolved is None:
+        return err or _error("access_denied", "invalid path")
+    if _write_denied(target, resolved) is not None:
+        return _error("access_denied", f"Access denied: '{target}' is a protected location")
+    if not resolved.exists():
+        return _error("not_found", f"no such path: {target}")
+    if not resolved.is_dir():
+        return _error("not_a_directory", f"not a directory: {target}")
+    found: list[str] = []
+    try:
+        for match in resolved.glob(pattern):
+            ok, real = is_safe_path(match, roots)
+            if not ok or isinstance(real, str):
+                continue
+            if _write_denied(str(match), real) is not None:
+                continue
+            try:
+                if not real.is_file():
+                    continue
+            except OSError:
+                continue
+            found.append(str(match))
+            if len(found) > GLOB_MAX_RESULTS:
+                break
+    except (NotImplementedError, ValueError):
+        return _error("invalid_arguments", f"unsupported glob pattern: {pattern}")
+    except OSError as exc:
+        return _error("os_error", str(exc.strerror or exc))
+    found.sort()
+    truncated = len(found) > GLOB_MAX_RESULTS
+    found = found[:GLOB_MAX_RESULTS]
+    return {
+        "pattern": pattern,
+        "base_path": str(resolved),
+        "matches": found,
+        "count": len(found),
+        "truncated": truncated,
+    }
+
+
 def _schema(name: str, description: str, props: dict[str, str], required: list[str]) -> dict[str, Any]:
     properties = {
         key: {"type": "integer" if key == "max_results" else "string", "description": text}
@@ -819,12 +972,49 @@ WORKSPACE_TOOLS: list[dict[str, Any]] = [
         ["path", "search_block", "replace_block"],
     ),
     _schema(
+        "glob_files",
+        f"Find files by glob pattern (e.g. '**/*.py', 'tests/test_*.py') inside approved workspace roots. "
+        f"Returns at most {GLOB_MAX_RESULTS} paths; sensitive files and .git are skipped.",
+        {
+            "pattern": "Glob pattern relative to the base directory.",
+            "path": "Base directory (default: primary workspace root).",
+        },
+        ["pattern"],
+    ),
+    _schema(
         "read_image",
         "Inspect an image (.png, .jpg, .jpeg, .webp, .gif; max 10 MB) inside an approved workspace root. "
         "The image is shown to you for this turn only.",
         {"path": "Image file path."},
         ["path"],
     ),
+    _schema(
+        "get_file_info",
+        "Return metadata (size_bytes, octal mode, is_file, is_dir, modified ISO 8601 UTC, line_count) for a "
+        "file or directory inside an approved workspace root, without reading its content.",
+        {"path": "File or directory path."},
+        ["path"],
+    ),
+    {
+        "type": "function",
+        "function": {
+            "name": "read_multiple_files",
+            "description": "Read up to 10 text files in one call (max 256 KB each). Returns {files, errors}; "
+            "failures (denied, missing, binary, too large) are reported per file without aborting the batch.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": MAX_BATCH_FILES,
+                        "description": "File paths inside approved workspace roots.",
+                    }
+                },
+                "required": ["paths"],
+            },
+        },
+    },
     _schema(
         "make_directory",
         "Create a directory (including missing parents) inside an approved workspace root.",
@@ -857,7 +1047,10 @@ _HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "list_directory": list_directory,
     "read_file": read_file,
     "read_image": read_image,
+    "read_multiple_files": read_multiple_files,
+    "get_file_info": get_file_info,
     "grep_workspace": grep_workspace,
+    "glob_files": glob_files,
     "write_file": write_file,
     "patch_file": patch_file,
     "make_directory": make_directory,
@@ -869,7 +1062,10 @@ _ALLOWED_ARGS = {
     "list_directory": ("path",),
     "read_file": ("path", "offset", "limit"),
     "read_image": ("path",),
+    "read_multiple_files": ("paths",),
+    "get_file_info": ("path",),
     "grep_workspace": ("pattern", "path", "max_results"),
+    "glob_files": ("pattern", "path"),
     "write_file": ("path", "content"),
     "patch_file": ("path", "search_block", "replace_block"),
     "make_directory": ("path",),
@@ -881,7 +1077,10 @@ _REQUIRED_ARGS = {
     "list_directory": ("path",),
     "read_file": ("path",),
     "read_image": ("path",),
+    "read_multiple_files": ("paths",),
+    "get_file_info": ("path",),
     "grep_workspace": ("pattern",),
+    "glob_files": ("pattern",),
     "write_file": ("path", "content"),
     "patch_file": ("path", "search_block", "replace_block"),
     "make_directory": ("path",),

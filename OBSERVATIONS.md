@@ -220,3 +220,15 @@ This document tracks real-world friction points, visual bugs, design observation
 ### `WS-IMG-005`: Headless Media Inspection & Ephemeral Eviction Verification (Phase 8B) — **Resolved**
 * **Component:** `src/strand/tools/workspace.py` (`read_image`, `read_file`), `src/strand/proxy.py` (`_run_tool_call_full`), `src/strand/session.py` (`compact_history`), `src/strand/distill.py` (`process_exchange`)
 * **Resolution:** Verified offline: `read_image` encodes valid images inside the roots as data URIs and fails closed on out-of-root paths, `.env*`-style names, unsupported extensions, mismatched content and files over 10 MB; `read_file` returns `binary_file` for images and PDFs. The upstream turn receives the image as an `image_url` block; on the next turn only an `[Image: path inspected (mime, N KB)]` stub is sent. A data URI in a distilled exchange is stripped before Model B, and `memory.db` dumps contain no base64. Limitation: the multimodal block uses the OpenAI-compatible shape; upstreams without vision support will ignore or reject it. 776 tests pass with `-W error`.
+
+### `WS-INFO-006`: Workspace Metadata Inspection Verification — **Resolved**
+* **Component:** `src/strand/tools/workspace.py` (`get_file_info`)
+* **Resolution:** Verified offline: regular files report size, octal mode (`0644`/`0755`), UTC ISO mtime and newline count; directories, binary files (NUL sniff or binary extension) and files over 2 MB report `line_count=None`; paths outside roots, `.env*`, `.git/` and `~/.config/strand/memory.db` fail with `access_denied`; missing paths return `not_found`. No file body is returned. Limitation: `line_count` counts `\n` bytes, so a final unterminated line is not counted. 779 tests pass with `-W error`.
+
+### `WS-BATCH-007`: Batched File Reading Verification — **Resolved**
+* **Component:** `src/strand/tools/workspace.py` (`read_multiple_files`)
+* **Resolution:** Verified offline: valid files return content and line counts in `files`; a mixed batch returns the valid file while missing (`not_found`), `.env` (`access_denied`), `.png`/NUL-byte (`binary_file`), oversized (`file_too_large`) and out-of-root (`access_denied`) paths land in `errors`; 11 paths return `batch_too_large`. Bodies are ephemeral and never written to `memory.db`. Limitation: `lines` uses `str.splitlines()`, so a final unterminated line counts. 782 tests pass with `-W error`.
+
+### `WS-GLOB-008`: Pattern Search Verification — **Resolved**
+* **Component:** `src/strand/tools/workspace.py` (`glob_files`)
+* **Resolution:** Verified offline: `**/*.txt` and `test_*.py` return sorted matches with correct counts; 230 files are cut at 200 with `truncated: true` (exactly 200 is not truncated); `.git/`, `.env*`, symlinks escaping the roots and Strand config files never appear in matches; bases outside the roots, in `.git` or `~/.config/strand` fail with `access_denied`; missing bases return `not_found`; empty, non-string or absolute patterns return `invalid_arguments`. Limitation: only regular files are returned (directories are skipped), and the walk is lazy but unindexed, so a very broad `**` over a huge tree is bounded only by the 200-match cap.
