@@ -138,7 +138,7 @@ def test_read_file_loop_nonstreaming(tmp_path):
     assert response.status_code == 200
     assert "Here is the file content" in response.json()["choices"][0]["message"]["content"]
     assert len(seen) == 2
-    assert {t["function"]["name"] for t in seen[0]["tools"]} == {"read_file", "list_directory"}
+    assert {t["function"]["name"] for t in seen[0]["tools"]} == {"read_file", "list_directory", "grep_workspace", "write_file", "patch_file", "restore_backup"}
     roles = [m["role"] for m in seen[1]["messages"]]
     assert roles[-2:] == ["assistant", "tool"]
     assistant, tool = seen[1]["messages"][-2:]

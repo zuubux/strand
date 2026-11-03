@@ -1,15 +1,24 @@
+import json
 import os
+import stat
 from pathlib import Path
 
+import pytest
+
 from strand.config import Config, load_config
+from strand.tools import workspace
 from strand.tools.workspace import (
     MAX_READ_BYTES,
     MAX_READ_LINES,
     WORKSPACE_TOOLS,
     dispatch_tool_call,
+    grep_workspace,
     is_safe_path,
     list_directory,
+    patch_file,
     read_file,
+    restore_backup,
+    write_file,
 )
 
 
@@ -138,7 +147,7 @@ def test_schemas_and_dispatch(tmp_path):
     root = _root(tmp_path)
     (root / "f.txt").write_text("hi\n")
     names = {t["function"]["name"] for t in WORKSPACE_TOOLS}
-    assert names == {"read_file", "list_directory"}
+    assert names == {"read_file", "list_directory", "grep_workspace", "write_file", "patch_file", "restore_backup"}
     assert all(t["type"] == "function" for t in WORKSPACE_TOOLS)
     assert dispatch_tool_call("read_file", {"path": str(root / "f.txt")}, [root])["content"] == "hi\n"
     assert dispatch_tool_call("list_directory", {"path": str(root), "junk": 1}, [root])["entries"]
@@ -269,3 +278,174 @@ def test_read_file_never_requests_more_than_cap_per_readline(tmp_path, monkeypat
     monkeypatch.setattr("strand.tools.workspace.open", lambda *a, **k: Spy(real_open(*a, **k)), raising=False)
     read_file(str(big), [root])
     assert sizes and all(0 < s <= MAX_READ_BYTES + 1 for s in sizes)
+
+
+# ---------------------------------------------------------------- Ring 1 / grep
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    h = tmp_path / "home"
+    h.mkdir()
+    monkeypatch.setenv("HOME", str(h))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    return h
+
+
+@pytest.fixture(params=["python", "rg"])
+def grep_engine(request, monkeypatch):
+    if request.param == "python":
+        monkeypatch.setattr(workspace, "_find_rg", lambda: None)
+    elif workspace._find_rg() is None:
+        pytest.skip("ripgrep not installed")
+    return request.param
+
+
+def test_grep_finds_matches_and_respects_limits(tmp_path, grep_engine):
+    root = _root(tmp_path)
+    (root / "a.md").write_text("alpha\nneedle one\nomega\n")
+    (root / "sub").mkdir()
+    (root / "sub" / "b.py").write_text("x = 1\n# needle two\n")
+    (root / "many.txt").write_text("needle\n" * 100)
+    (root / "bin.dat").write_bytes(b"\x00needle")
+    result = grep_workspace("needle one|needle two", [root], str(root))
+    assert {(Path(m["path"]).name, m["line_number"], m["line_text"]) for m in result["matches"]} == {
+        ("a.md", 2, "needle one"),
+        ("b.py", 2, "# needle two"),
+    }
+    assert result["engine"] == grep_engine and result["truncated"] is False
+    capped = grep_workspace("needle", [root], str(root / "many.txt"), max_results=500)
+    assert len(capped["matches"]) == 20 and capped["truncated"] is True
+    assert len(grep_workspace("needle", [root], str(root / "many.txt"), max_results=3)["matches"]) == 3
+    (root / "wide.txt").write_text(("needle " + "y" * 150 + "\n") * 30)
+    wide = grep_workspace("needle", [root], str(root / "wide.txt"))
+    assert len(json.dumps(wide["matches"])) <= 4096 and wide["truncated"] is True
+
+
+def test_grep_sandbox_and_denied_files(tmp_path, grep_engine):
+    root = _root(tmp_path)
+    (root / ".env").write_text("needle=1\n")
+    (root / "ok.txt").write_text("needle\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x.txt").write_text("needle\n")
+    assert grep_workspace("needle", [root], str(outside))["error"] == "access_denied"
+    assert grep_workspace("needle", [root], "../outside")["error"] == "access_denied"
+    names = {Path(m["path"]).name for m in grep_workspace("needle", [root], str(root))["matches"]}
+    assert names == {"ok.txt"}
+    assert grep_workspace("(", [root], str(root))["error"] == "invalid_arguments"
+    assert grep_workspace("", [root], str(root))["error"] == "invalid_arguments"
+    assert grep_workspace("zzz", [root], str(root / "missing"))["error"] == "not_found"
+
+
+def test_write_and_patch_snapshot_and_restore(tmp_path, home):
+    root = _root(tmp_path)
+    target = root / "note.md"
+    created = write_file(str(target), "v1\n", [root])
+    assert target.read_text() == "v1\n" and created["track"] == "snapshot"
+    backups = home / ".local" / "share" / "strand" / "backups"
+    assert stat.S_IMODE(backups.stat().st_mode) == 0o700
+    first = backups / created["backup"]
+    assert first.read_bytes() == b"" and stat.S_IMODE(first.stat().st_mode) == 0o600
+    assert created["backup"].endswith("_note.md")
+
+    patched = patch_file(str(target), "v1", "v2", [root])
+    assert target.read_text() == "v2\n"
+    snap = backups / patched["backup"]
+    assert snap.read_text() == "v1\n" and stat.S_IMODE(snap.stat().st_mode) == 0o600
+    assert all(stat.S_IMODE(p.stat().st_mode) == 0o600 for p in backups.iterdir())
+
+    restored = restore_backup(patched["backup"], [root])
+    assert target.read_text() == "v1\n"
+    # restoring is itself undoable
+    restore_backup(restored["redo_backup"], [root])
+    assert target.read_text() == "v2\n"
+    # undoing a creation removes the file
+    gone = restore_backup(created["backup"], [root])
+    assert gone["deleted"] is True and not target.exists()
+
+
+def test_patch_file_ambiguous_missing_untouched(tmp_path, home):
+    root = _root(tmp_path)
+    target = root / "f.txt"
+    target.write_text("dup\ndup\nuniq\n")
+    assert patch_file(str(target), "dup", "x", [root])["error"] == "search_ambiguous"
+    assert patch_file(str(target), "nope", "x", [root])["error"] == "search_not_found"
+    assert patch_file(str(target), "", "x", [root])["error"] == "invalid_arguments"
+    assert patch_file(str(root / "none.txt"), "a", "b", [root])["error"] == "not_found"
+    assert target.read_text() == "dup\ndup\nuniq\n"
+    assert not (home / ".local").exists()  # failures never snapshot
+
+
+
+def test_mutation_security_fails_closed(tmp_path, home):
+    root = _root(tmp_path)
+    cfg = home / ".config" / "strand"
+    cfg.mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    denied = (
+        outside,
+        cfg / "config.json",
+        root / ".env",
+        root / ".env.local",
+        root / "a.key",
+        root / "id_rsa",
+        root / "id_rsa.pub",
+    )
+    for target in denied:
+        assert write_file(str(target), "x", [root])["error"] == "access_denied", target
+        assert patch_file(str(target), "a", "b", [root])["error"] == "access_denied", target
+        assert not target.exists()
+    assert write_file("../outside.txt", "x", [root])["error"] == "access_denied"
+    # config dir denied even when it is an approved root
+    assert write_file(str(cfg / "config.json"), "x", [home])["error"] == "access_denied"
+    assert write_file(str(root / ".git" / "hooks" / "pre-commit"), "x", [root])["error"] == "access_denied"
+    assert restore_backup("../../etc/passwd", [root])["error"] == "access_denied"
+    assert restore_backup("missing_id", [root])["error"] == "not_found"
+    big = "x" * (workspace.MAX_WRITE_BYTES + 1)
+    assert write_file(str(root / "big"), big, [root])["error"] == "too_large"
+
+
+def test_restore_cannot_target_outside_roots(tmp_path, home):
+    root = _root(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    victim = other / "v.txt"
+    victim.write_text("keep")
+    backups = home / ".local" / "share" / "strand" / "backups"
+    backups.mkdir(parents=True)
+    (backups / "1_v.txt").write_text("evil")
+    (backups / "1_v.txt.meta").write_text(json.dumps({"original": str(victim), "existed": True}))
+    assert restore_backup("1_v.txt", [root])["error"] == "access_denied"
+    assert victim.read_text() == "keep"
+
+
+def test_git_track_requires_clean_status(tmp_path, home, monkeypatch):
+    root = _root(tmp_path)
+    (root / ".git").mkdir()
+    target = root / "code.py"
+    target.write_text("a = 1\n")
+    monkeypatch.setattr(workspace, "_git_clean", lambda repo, path: "uncommitted changes in git")
+    dirty = patch_file(str(target), "1", "2", [root])
+    assert dirty["error"] == "git_dirty" and target.read_text() == "a = 1\n"
+    assert write_file(str(target), "b", [root])["error"] == "git_dirty"
+    monkeypatch.setattr(workspace, "_git_clean", lambda repo, path: None)
+    ok = patch_file(str(target), "1", "2", [root])
+    assert ok["track"] == "git" and ok["backup"] is None and target.read_text() == "a = 2\n"
+    assert not (home / ".local").exists()  # git track writes no snapshot
+
+
+def test_dispatch_mutation_tools(tmp_path, home):
+    root = _root(tmp_path)
+    target = root / "d.txt"
+    out = dispatch_tool_call("write_file", {"path": str(target), "content": "hello", "junk": 1}, [root])
+    assert target.read_text() == "hello"
+    patch_args = {"path": str(target), "search_block": "hello", "replace_block": "bye"}
+    assert dispatch_tool_call("patch_file", patch_args, [root])["bytes_written"] == 3
+    assert dispatch_tool_call("restore_backup", {"backup": out["backup"]}, [root])["deleted"] is True
+    assert dispatch_tool_call("write_file", {"path": str(target)}, [root])["error"] == "invalid_arguments"
+    grep_args = {"pattern": "zzz", "path": str(root)}
+    assert dispatch_tool_call("grep_workspace", grep_args, [root])["matches"] == []
+    env_args = {"path": str(root / ".env"), "content": "x"}
+    assert dispatch_tool_call("write_file", env_args, [root])["error"] == "access_denied"
+

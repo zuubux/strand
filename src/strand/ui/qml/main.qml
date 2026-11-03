@@ -1556,9 +1556,9 @@ ApplicationWindow {
                                 Layout.fillHeight: true
                                 Layout.topMargin: 6
                                 spacing: 6
-                                visible: bridge.activeStanceNodes.length > 0
+                                visible: (bridge ? bridge.activeStanceNodes : []).length > 0
                                 Repeater {
-                                    model: bridge.activeStanceNodes
+                                    model: (bridge ? bridge.activeStanceNodes : [])
                                     delegate: Label {
                                         width: stanceList.width
                                         text: "\u2022 " + modelData
@@ -1576,7 +1576,7 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
                                 Layout.topMargin: 6
-                                visible: bridge.activeStanceNodes.length === 0
+                                visible: (bridge ? bridge.activeStanceNodes : []).length === 0
                                 text: "Adapting to your workflow. Standing directives and stylistic preferences will appear here as Strand learns your habits."
                                 wrapMode: Text.WordWrap
                                 color: root.dim
@@ -1589,7 +1589,7 @@ ApplicationWindow {
                                 objectName: "stanceFooter"
                                 Layout.fillWidth: true
                                 horizontalAlignment: Text.AlignRight
-                                text: bridge.activeStanceCount + " Active Directives in Memory"
+                                text: (bridge ? bridge.activeStanceCount : 0) + " Active Directives in Memory"
                                 color: root.dim
                                 font.family: root.uiFamily
                                 font.pixelSize: 11
@@ -1876,7 +1876,7 @@ ApplicationWindow {
                                 objectName: "extractorModelBox"
                                 Layout.fillWidth: true
                                 editable: true
-                                model: bridge.availableExtractorModels
+                                model: (bridge ? bridge.availableExtractorModels : [])
                                 font.family: root.monoFamily
                                 font.pixelSize: 12
                                 // Free typing stays possible for custom endpoints or when offline.
@@ -1884,7 +1884,7 @@ ApplicationWindow {
                                 onAccepted: root.persist({ extractor_model: editText })
                                 onActiveFocusChanged: if (!activeFocus && settingsOpen) root.persist({ extractor_model: editText })
                                 function applyDetected() {
-                                    var list = bridge.availableExtractorModels
+                                    var list = (bridge ? bridge.availableExtractorModels : [])
                                     if (list.length === 0)
                                         return
                                     var configured = bridge.getConfig().extractor_model
@@ -1909,12 +1909,12 @@ ApplicationWindow {
                             Label {
                                 objectName: "extractorModelsStatus"
                                 visible: text.length > 0
-                                text: bridge.extractorProbeStatus === "success" && bridge.availableExtractorModels.length > 0
-                                    ? "\u2713 Detected " + bridge.availableExtractorModels.length + " local models"
-                                    : bridge.extractorProbeStatus === "failed" || (bridge.extractorProbeStatus === "success" && bridge.availableExtractorModels.length === 0)
+                                text: (bridge ? bridge.extractorProbeStatus : "") === "success" && (bridge ? bridge.availableExtractorModels : []).length > 0
+                                    ? "\u2713 Detected " + (bridge ? bridge.availableExtractorModels : []).length + " local models"
+                                    : (bridge ? bridge.extractorProbeStatus : "") === "failed" || ((bridge ? bridge.extractorProbeStatus : "") === "success" && (bridge ? bridge.availableExtractorModels : []).length === 0)
                                     ? "Ollama offline (start with 'ollama serve')"
                                     : ""
-                                color: bridge.availableExtractorModels.length > 0 ? root.diffAdded : root.dim
+                                color: (bridge ? bridge.availableExtractorModels : []).length > 0 ? root.diffAdded : root.dim
                                 font.pixelSize: 11
                                 Layout.fillWidth: true
                             }

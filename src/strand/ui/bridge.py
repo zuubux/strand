@@ -445,12 +445,12 @@ class Bridge(QObject):
     @Property(list, notify=activeStanceNodesChanged)
     def activeStanceNodes(self) -> list[str]:
         """Top learned directive / preference / trait names (read-only mirror of memory.db)."""
-        return list(self._stance_nodes)
+        return list(self._stance_nodes or [])
 
     @Property(int, notify=activeStanceNodesChanged)
     def activeStanceCount(self) -> int:
         """Total active stance nodes in memory (the list above is capped)."""
-        return self._stance_count
+        return int(self._stance_count or 0)
 
     @Slot()
     def refreshActiveStance(self) -> None:
@@ -546,11 +546,11 @@ class Bridge(QObject):
 
     @Property(list, notify=availableExtractorModelsChanged)
     def availableExtractorModels(self) -> list[str]:
-        return list(self._available_extractor_models)
+        return list(self._available_extractor_models or [])
 
     @Property(str, notify=extractorProbeStatusChanged)
     def extractorProbeStatus(self) -> str:
-        return self._extractor_probe_status
+        return self._extractor_probe_status or ""
 
     @Slot(result=str)
     def pickDefaultModel(self) -> str:

@@ -25,6 +25,7 @@ from .onboarding import (
     MODE_TRIAGE,
     ONBOARDING_MODE,
     count_operators,
+    is_onboarding_completed,
     onboarding_directive,
     reanchor_generic_user,
     telemetry_preference,
@@ -560,8 +561,9 @@ def create_app(
             telemetry = request.headers.get("x-strand-host-telemetry", "").strip().lower()
             if telemetry in ("1", "true", "yes", "on", "0", "false", "no", "off"):
                 resolver.ledger.set_allow_host_telemetry(session_id, telemetry in ("1", "true", "yes", "on"))
-            if resolution_failed:
-                pass  # fail open: forward the request untouched
+            graduated = not resolution_failed and not explicit and session_id not in onboarding_sessions and await is_onboarding_completed(resolver.db)
+            if resolution_failed or graduated:
+                pass  # fail open / already onboarded: no directive, no onboarding flag
             elif session_id not in onboarding_sessions and (explicit or await count_operators(resolver.db) == 0):
                 # No explicit operator yet: Day Zero. /onboard with one on record: intent triage.
                 has_operator = await count_operators(resolver.db) > 0

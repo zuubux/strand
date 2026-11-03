@@ -4,7 +4,7 @@ import os
 
 import httpx
 import pytest
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import QCoreApplication, QEvent
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -38,7 +38,9 @@ def _drain_bridges(monkeypatch):
     yield
     for b in bridges:
         b.shutdown()
-        b._timer.stop()
+        for timer in (b._timer, b._distill_timer, b._strike_timer):
+            timer.stop()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
     QCoreApplication.processEvents()
     QCoreApplication.sendPostedEvents(None, 0)
 

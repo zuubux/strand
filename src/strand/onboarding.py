@@ -73,6 +73,13 @@ async def count_operators(db: DatabaseManager) -> int:
     return int(row[0])
 
 
+async def is_onboarding_completed(db: DatabaseManager) -> bool:
+    """Permanent graduation: an explicit operator exists AND the telemetry choice is resolved."""
+    if await count_operators(db) <= 0:
+        return False
+    return await telemetry_preference(db) is not None
+
+
 async def reanchor_generic_user(db: DatabaseManager) -> bool:
     """Fold a generic `User` node into the named operator, keeping every edge.
 
@@ -107,12 +114,24 @@ async def reanchor_generic_user(db: DatabaseManager) -> bool:
     return True
 
 
+TASK_YIELD_RULE = (
+    "TASK-YIELD CONSTRAINT: When the operator provides an imperative command, tool instruction, "
+    "code/file edit, or debugging task, execute or report the result plainly and STOP. Do NOT append "
+    "onboarding questions, follow-up banter, or conversational filler."
+)
+QUESTION_BUDGET_RULE = (
+    "Default question budget = 0. Do not ask conversational follow-up questions to keep dialogue "
+    "moving. Ask a question only if strictly blocked by ambiguity or missing parameters."
+)
+
 _GUIDELINES = (
     "- Conversational Guidelines:\n"
     "  * Acknowledge and react to the user's previous answer with genuine curiosity before asking "
     "anything new.\n"
     "  * Ask exactly ONE question per turn. Never bombard the user with multiple questions or "
     "bullet points.\n"
+    f"  * {TASK_YIELD_RULE}\n"
+    f"  * {QUESTION_BUDGET_RULE}\n"
 )
 
 
@@ -228,8 +247,10 @@ def onboarding_directive(
                     "- Turn 4/5 Telemetry Gate: while exploring their workbench, stacks and tools, casually "
                     "check in on hardware awareness, in your own warm words, with exactly this question "
                     f'(still only ONE question this turn): "{TELEMETRY_GATE_QUESTION}"\n'
-                    "  * If they agree (e.g. 'Yeah, check it out', 'Tune into the iron'), acknowledge it and "
-                    "say machine specs are now active.\n"
+                    "  * If they agree (e.g. 'sure', 'yes', 'go ahead', 'Tune into the iron'), briefly "
+                    "acknowledge the machine specs from the Ambient Host Context (hostname, RAM, cores) in one "
+                    "plain sentence, say machine specs are now active, then yield back to the operator: no "
+                    "corporate fluff and no follow-up question.\n"
                     f'  * If they decline (e.g. "Keep it on-demand", "Leave it local"), reply smoothly: '
                     f'"{TELEMETRY_DECLINED_ACK}".\n'
                     "  * Do not raise the hardware question again once they have answered.\n"

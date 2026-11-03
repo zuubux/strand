@@ -330,3 +330,43 @@ def test_telemetry_preference_requires_authenticated_operator_source(tmp_path):
             return await telemetry_preference(db)
 
     assert run(go()) is None
+
+
+def test_is_onboarding_completed_requires_operator_and_telemetry_choice(tmp_path):
+    from strand.onboarding import is_onboarding_completed
+
+    async def go():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            states = [await is_onboarding_completed(db)]
+            alice = await db.upsert_entity(
+                "Alice", "person", "Operator", origin="user_explicit", confidence=1.0
+            )
+            states.append(await is_onboarding_completed(db))  # operator only
+            on = await db.upsert_entity("Host Telemetry On-Demand", "preference", "x")
+            await db.upsert_edge(alice, on, "prefers")
+            states.append(await is_onboarding_completed(db))  # both
+        async with DatabaseManager(tmp_path / "n.db") as db:
+            bob = await db.upsert_entity("Bob", "person", "x", origin="model_inferred", confidence=0.6)
+            on = await db.upsert_entity("Host Telemetry On-Demand", "preference", "x")
+            await db.upsert_edge(bob, on, "prefers")
+            states.append(await is_onboarding_completed(db))  # telemetry only, no explicit operator
+        return states
+
+    assert run(go()) == [False, False, True, False]
+
+
+def test_directive_carries_task_yield_and_question_budget():
+    from strand.onboarding import QUESTION_BUDGET_RULE, TASK_YIELD_RULE
+
+    for kwargs in ({}, {"turn": 2}, {"turn": 4}):
+        text = onboarding_directive(HOST, **kwargs)
+        assert TASK_YIELD_RULE in text and QUESTION_BUDGET_RULE in text
+    assert "TASK-YIELD CONSTRAINT: When the operator provides an imperative command" in TASK_YIELD_RULE
+    assert "Default question budget = 0." in QUESTION_BUDGET_RULE
+
+
+def test_telemetry_agreement_acknowledges_specs_and_yields():
+    text = onboarding_directive(HOST, turn=4)
+    assert "'sure', 'yes', 'go ahead'" in text
+    assert "hostname, RAM, cores" in text
+    assert "no follow-up question" in text

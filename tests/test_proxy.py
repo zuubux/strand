@@ -303,6 +303,39 @@ def test_day_zero_does_not_trigger_with_user_explicit_person(tmp_path, monkeypat
     assert "[Onboarding Directive" not in system
 
 
+def test_graduated_database_boots_new_sessions_without_onboarding(tmp_path, monkeypatch):
+    import strand.proxy as proxy_mod
+
+    monkeypatch.setattr(proxy_mod, "get_host_context", lambda: dict(HOST))
+
+    async def scenario():
+        seen: list[httpx.Request] = []
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: (seen.append(r), ok_json(r))[1]))
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            alice = await db.upsert_entity("Alice", "person", "x", origin="user_explicit", confidence=1.0)
+            pref = await db.upsert_entity("Host Telemetry On-Demand", "preference", "x")
+            await db.upsert_edge(alice, pref, "prefers")
+            app = create_app(Config(upstream_url="http://upstream.test/v1"), ContextResolver(db, SessionLedger()), upstream)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://strand") as client:
+                await _post_chat(client, "hello there")
+                await _post_chat(client, "fix the bug in foo.py", headers={"X-Strand-Mode": "onboarding"})
+                await asyncio.gather(*app.state.background_tasks)
+            await upstream.aclose()
+        return _systems(seen)
+
+    ambient, explicit = run(scenario())
+    assert "[Onboarding Directive" not in ambient
+    assert "Hi, I'm Strand" not in ambient
+    assert "TASK-YIELD CONSTRAINT" not in ambient
+    assert "Intent Triage" in explicit  # explicit /onboard still works
+
+
+def test_directive_envelope_has_task_yield_and_question_budget(tmp_path, monkeypatch):
+    (system,) = _onboard_scenario(tmp_path, monkeypatch, [])
+    assert "TASK-YIELD CONSTRAINT" in system
+    assert "Default question budget = 0." in system
+
+
 def test_turn_one_directive_forces_name_question_and_softens_user_fallback(tmp_path, monkeypatch):
     (system,) = _onboard_scenario(tmp_path, monkeypatch, [])
     assert "Hi, I'm Strand. What should I call you?" in system

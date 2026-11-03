@@ -204,3 +204,11 @@ This document tracks real-world friction points, visual bugs, design observation
 ### `OBS-SVC-007`: False-Positive Startup Reports & Static-Only Doctor — **Resolved**
 * **Component:** `src/strand/daemon.py`, `src/strand/cli.py`, `scripts/install.sh`, `packaging/systemd/strand.service`
 * **Resolution:** The unit is now `Type=notify`; the daemon sends `READY=1` after the socket is listening and migrations are done. The installer polls `is-active` and dumps the last 15 journal lines (exit 1) on failure. `strand doctor` actively probes `GET /health` on the daemon socket (0.5s) and exits 1 when unreachable.
+
+### `WS-MUT-002`: Ring 1 Safe File Mutation Verification — **Resolved**
+* **Component:** `src/strand/tools/workspace.py` (`grep_workspace`, `write_file`, `patch_file`, `restore_backup`)
+* **Resolution:** Verified offline: grep honors the 20-match / 4 KB caps and the root sandbox; writes outside roots, into `~/.config/strand/`, or to `.env*` / `*.key` / `id_rsa*` fail with `access_denied`; ambiguous or missing patch blocks leave the disk and journal untouched; snapshots are `0600` in a `0700` directory; `restore_backup` reverts (and can redo) a mutation and refuses targets outside the roots; dirty git files are refused. Limitation: the ripgrep code path is covered by tests only on hosts with `rg` installed (skipped otherwise); the Python fallback is always tested.
+
+### `OBS-ONB-008`: Eager Golden Retriever & Cross-Session Onboarding Amnesia — **Resolved**
+* **Component:** `src/strand/onboarding.py`, `src/strand/proxy.py`
+* **Resolution:** The onboarding persona kept asking conversational questions after imperative tasks, and every new session on an already-onboarded database could re-trigger Day Zero. Added `is_onboarding_completed(db)` (explicit operator AND resolved telemetry preference) as a permanent graduation gate: without `X-Strand-Mode: onboarding` such sessions get no directive and no onboarding flag. The directive now carries a Task-Yield constraint and a default question budget of 0, and an affirmative telemetry answer gets a one-sentence hostname/RAM/cores acknowledgement, then yields. No schema change.
