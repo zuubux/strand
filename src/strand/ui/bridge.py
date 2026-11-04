@@ -24,6 +24,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import httpx
 from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
@@ -41,6 +42,7 @@ from strand.config import (
 )
 from strand.db import _ACTIVE, PRIVATE_ENTITY_SQL
 from strand.perms import secure_parent_dir
+from strand.tools.workspace import IMAGE_MIME_TYPES, MAX_BATCH_FILE_BYTES, is_safe_path
 from strand.onboarding import ONBOARD_TRIGGER, ONBOARDING_HEADER, ONBOARDING_MODE
 
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -48,6 +50,7 @@ UDS_BASE_URL = "http://strand"
 CHAT_PATH = "/v1/chat/completions"
 PRIVATE_HEADER = "X-Strand-Allow-Private"
 HISTORY_LIMIT = 100
+IMAGE_TOKEN_ESTIMATE = 1600
 EXTRACTOR_TIMEOUT = 1.5
 MODEL_PROBE_TIMEOUT = 3.0
 EXTRACTOR_TAGS_TIMEOUT = 2.0
@@ -71,6 +74,11 @@ PACE_TOKENS_PER_SEC = 67.0  # ~65-70 t/s (~270 chars/s): ~1.07 token (~4-5 chars
 PACE_INTERVAL_MS = 16
 CHARS_PER_TOKEN = 4
 GROUNDING_HEADER_NAME = "X-Strand-Grounding"
+MUTATIONS_HEADER_NAME = "X-Strand-Mutations"
+RESTORE_PATH = "/v1/backups/restore"
+RESTORE_TIMEOUT = 10.0
+MUTATION_OPS = ("created", "modified", "patched", "moved", "removed")
+MAX_MUTATION_RECORDS = 20
 GROUNDING_STRIKE_MS = 150  # transient submit-to-first-chunk flash (3-beat conduit, beat 1)
 DISTILL_HOLD_MS = 1800  # Model B weave window shown after a stream completes (beat 3)
 GROUNDING_HOLD_S = 0.15  # grounded turns: the pulse is perceptible before the first token
@@ -275,6 +283,26 @@ def split_blocks(text: str) -> list[dict[str, Any]]:
     return blocks
 
 
+def parse_mutations(value: str | None) -> list[dict[str, str]]:
+    """Parse the proxy's `X-Strand-Mutations` JSON header into `{path, op, backup_id}` records."""
+    if not value:
+        return []
+    try:
+        raw = json.loads(value)
+    except ValueError:
+        return []
+    records: list[dict[str, str]] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        path, op, backup_id = item.get("path"), item.get("op"), item.get("backup_id")
+        if isinstance(path, str) and isinstance(backup_id, str) and backup_id and op in MUTATION_OPS:
+            records.append({"path": path, "op": op, "backup_id": backup_id})
+        if len(records) >= MAX_MUTATION_RECORDS:
+            break
+    return records
+
+
 def parse_grounding(value: str | None) -> dict[str, int]:
     """Parse the proxy's `entities=2 edges=1 ...` grounding header into counts."""
     return {key: int(num) for key, num in GROUNDING_RE.findall(value or "")}
@@ -359,6 +387,9 @@ class Bridge(QObject):
     conversationReset = Signal()
     extractorStatusChanged = Signal(bool, str)
     groundingChanged = Signal()
+    mutationsRecorded = Signal(str)
+    backupReverted = Signal(str)
+    revertedBackupsChanged = Signal()
     configuredChanged = Signal()
     availableModelsChanged = Signal()
     availableExtractorModelsChanged = Signal()
@@ -407,6 +438,7 @@ class Bridge(QObject):
         self._strike_timer.setInterval(GROUNDING_STRIKE_MS)
         self._strike_timer.timeout.connect(self._end_strike)
         self.streamFinished.connect(self._begin_distilling)
+        self.streamAborted.connect(self._end_distilling)
         self._wake.connect(self._on_wake)
         self._probe_factory = probe_factory
         self._available_models: list[str] = []
@@ -440,6 +472,8 @@ class Bridge(QObject):
         self._prompts: list[str] = []
         self._prompt_index: int | None = None
         self._turn: dict[str, Any] = {}
+        self._mutations: list[dict[str, str]] = []
+        self._reverted: list[str] = []
         self._workers: dict[threading.Thread, tuple[asyncio.AbstractEventLoop, asyncio.Task[None]]] = {}
 
     @Property(list, notify=activeStanceNodesChanged)
@@ -591,6 +625,7 @@ class Bridge(QObject):
 
     @Slot()
     def _end_distilling(self) -> None:
+        self._distill_timer.stop()
         self._set_distilling(False)
 
     def _set_distilling(self, value: bool) -> None:
@@ -636,6 +671,51 @@ class Bridge(QObject):
         if pulse != self._pulse or summary != self._grounding:
             self._pulse, self._grounding = pulse, summary
             self.groundingChanged.emit()
+
+    def _note_mutations(self, value: str | None, generation: int) -> None:
+        records = parse_mutations(value)
+        if records and generation == self._generation:
+            self._mutations = records
+            self.mutationsRecorded.emit(json.dumps(records))
+
+    @Property(list, notify=revertedBackupsChanged)
+    def revertedBackups(self) -> list[str]:
+        """Backup ids already rolled back this session (drives the pill's Reverted state)."""
+        return list(self._reverted)
+
+    @Slot(str, result=bool)
+    def revertBackup(self, backup_id: str) -> bool:
+        """Ask the daemon to restore a journaled mutation; True on success, False on any failure."""
+        backup_id = backup_id.strip() if isinstance(backup_id, str) else ""
+        if not backup_id:
+            return False
+        if backup_id in self._reverted:
+            return True
+
+        async def post() -> bool:
+            async with self.make_client() as client:
+                resp = await client.post(
+                    RESTORE_PATH, json={"backup_id": backup_id}, headers=self._headers(), timeout=RESTORE_TIMEOUT
+                )
+                return resp.status_code == 200
+
+        try:
+            ok = asyncio.run(post())
+        except Exception:  # noqa: BLE001 - a failed undo must never crash the UI
+            ok = False
+        if ok:
+            self._reverted.append(backup_id)
+            self.revertedBackupsChanged.emit()
+            self.backupReverted.emit(backup_id)
+        return ok
+
+    @Slot(str, result="QVariantList")
+    def mutationRecords(self, text: str) -> list[dict[str, str]]:
+        """Decode a turn's JSON mutation payload for the QML pill row (never raises)."""
+        try:
+            return parse_mutations(text)
+        except Exception:  # noqa: BLE001
+            return []
 
     def _note_grounding(self, value: str | None) -> None:
         counts = parse_grounding(value)
@@ -813,6 +893,7 @@ class Bridge(QObject):
         started = time.perf_counter()
         self._first_token_ms = 0
         self._token_count = 0
+        self._mutations = []
         try:
             async with self.make_client() as client:
                 async with client.stream("POST", CHAT_PATH, json=body, headers=self._headers()) as resp:
@@ -821,6 +902,7 @@ class Bridge(QObject):
                         error = f"HTTP {resp.status_code}: {detail[:300]}" if detail else f"HTTP {resp.status_code}"
                     else:
                         self._note_grounding(resp.headers.get(GROUNDING_HEADER_NAME))
+                        self._note_mutations(resp.headers.get(MUTATIONS_HEADER_NAME), gen)
                         error = await self._consume(resp, parts, started, gen, paced)
                         self._set_status(status_label(self._uds_path, self._base_url))
         except asyncio.CancelledError:
@@ -849,6 +931,7 @@ class Bridge(QObject):
                 "replyChars": sum(len(p) for p in parts),
                 "latencyMs": int((time.perf_counter() - started) * 1000),
                 "firstTokenMs": self._first_token_ms,
+                "mutations": list(self._mutations),
                 "outcome": "aborted" if aborted else ("error" if error is not None else "ok"),
             }
             self.diagnosticsChanged.emit()
@@ -951,18 +1034,62 @@ class Bridge(QObject):
         return thread
 
     # -- slots ---------------------------------------------------------------------
-    @Slot(str)
-    def sendMessage(self, text: str) -> None:
+    @Slot(str, result="QVariantMap")
+    def inspectDroppedFile(self, file_url: str) -> dict[str, Any]:
+        """Sandbox-check a dropped file and estimate its token cost (ephemeral; nothing persisted)."""
+        raw = str(file_url).strip()
+        if raw.startswith("file://"):
+            raw = urlparse(raw).path
+        try:
+            path = Path(unquote(raw)).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return {"safe": False, "error": "invalid_path", "path": raw}
+        ok, _ = is_safe_path(path, self._config.resolved_workspace_roots())
+        if not ok:
+            return {"safe": False, "error": "outside_workspace", "path": str(path)}
+        try:
+            if not path.is_file():
+                return {"safe": False, "error": "not_a_file", "path": str(path)}
+            size = path.stat().st_size
+        except OSError:
+            return {"safe": False, "error": "unreadable", "path": str(path)}
+        is_image = path.suffix.lower() in IMAGE_MIME_TYPES
+        tokens = IMAGE_TOKEN_ESTIMATE if is_image else max(1, min(size, MAX_BATCH_FILE_BYTES) // 4)
+        return {
+            "safe": True,
+            "path": str(path),
+            "name": path.name,
+            "tokens": tokens,
+            "is_image": is_image,
+            "size_bytes": size,
+        }
+
+    def _attachment_preamble(self, attachments: Any) -> str:
+        """Prompt header naming re-validated attachments so Model A inspects them via tools."""
+        lines: list[str] = []
+        for item in attachments or []:
+            info = self.inspectDroppedFile(str(item))
+            if not info.get("safe"):
+                continue
+            tool = "read_image" if info["is_image"] else "read_file"
+            lines.append(f"- {info['path']} (~{info['tokens']} tokens, use {tool})")
+        if not lines:
+            return ""
+        return "[Attached files: inspect them with the workspace tools (read_file, read_image)]\n" + "\n".join(lines) + "\n\n"
+
+    @Slot(str, "QVariantList")
+    def sendMessage(self, text: str, attachments: Any = None) -> None:
         text = text.strip()
         if not text:
             return
+        prompt = self._attachment_preamble(attachments) + text
         with self._lock:
             if self._busy:
                 return
             self._abort_requested = False
             self._set_busy(True)
         self._remember(text)
-        self._start_turn(text, locked=True)
+        self._start_turn(prompt, locked=True)
 
     def _start_turn(self, text: str, locked: bool = False) -> None:
         """Append `text` as a user turn and stream the reply (no-op while busy)."""
@@ -975,6 +1102,7 @@ class Bridge(QObject):
         self._history.append({"role": "user", "content": text})
         messages = list(self._history)
         generation = self._generation
+        self._end_distilling()  # a new turn supersedes the previous weave feedback
         self._begin_strike()
         self._run_async(
             lambda: self._stream(messages, generation, paced=True),

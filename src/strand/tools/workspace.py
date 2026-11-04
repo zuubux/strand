@@ -738,6 +738,31 @@ def remove_file(path: str, roots: list[Path] | None = None) -> dict[str, Any]:
     return {"path": str(resolved), "status": "removed", "backup_id": backup}
 
 
+MUTATION_OPS = {"write_file": "modified", "patch_file": "patched", "move_file": "moved", "remove_file": "removed"}
+
+
+def mutation_record(name: str, result: Any) -> dict[str, str] | None:
+    """UI-facing `{path, op, backup_id}` for a successful snapshot-tracked mutation, else None.
+
+    Git-tracked mutations carry no backup id (git is their undo), so they yield no record.
+    """
+    op = MUTATION_OPS.get(name)
+    if op is None or not isinstance(result, dict) or "error" in result:
+        return None
+    backup = result.get("backup_id") or result.get("backup")
+    path = result.get("target") or result.get("path")
+    if not isinstance(backup, str) or not backup or not isinstance(path, str):
+        return None
+    if name == "write_file":
+        try:
+            meta = json.loads((_backup_dir() / (backup + ".meta")).read_text(encoding="utf-8"))
+            if not meta.get("existed", True):
+                op = "created"
+        except (OSError, ValueError, AttributeError):
+            pass
+    return {"path": path, "op": op, "backup_id": backup}
+
+
 def restore_backup(backup: str, roots: list[Path]) -> dict[str, Any]:
     """Revert a file to a journaled snapshot (id or path inside the backup directory).
 

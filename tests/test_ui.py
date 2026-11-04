@@ -1237,6 +1237,33 @@ def test_distilling_real_timeout_fires(qapp):
     assert b.distilling is False and not b._distill_timer.isActive()
 
 
+def test_distilling_cleared_by_new_turn_and_abort(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("hi")))
+    seen = []
+    b.distillingChanged.connect(lambda: seen.append(b.distilling))
+    b.streamFinished.emit()
+    assert b.distilling is True
+    b.sendMessage("next")
+    assert b.distilling is False and not b._distill_timer.isActive()
+    for t in list(b._workers):
+        t.join(2)
+    b._end_strike()
+    b._distill_timer.stop()
+    b._set_distilling(False)
+    seen.clear()
+    b.streamFinished.emit()
+    b.streamAborted.emit()
+    assert b.distilling is False and not b._distill_timer.isActive()
+    assert seen == [True, False]
+
+
+def test_distilling_is_notifying_bool_property(qapp):
+    meta = Bridge.staticMetaObject
+    prop = meta.property(meta.indexOfProperty("distilling"))
+    assert prop.typeName() == "bool" and prop.hasNotifySignal()
+    assert prop.notifySignal().name().data().decode() == "distillingChanged"
+
+
 def test_grounding_strike_on_submit_clears_on_first_chunk(qapp):
     b = make_bridge(lambda r: httpx.Response(200, content=sse("hi")))
     seen = []
@@ -1277,9 +1304,12 @@ def test_conduit_glyph_wired_in_qml(qapp):
     assert glyph.property("active") is False  # idle: nothing animating
     assert win.findChild(object, "weaveGlyph").property("visible") is False
     b.streamFinished.emit()
-    assert glyph.property("ingress") is True
+    assert glyph.property("ingress") is True and glyph.property("active") is True
+    assert glyph.property("tint").name() == "#f59e0b"
+    assert glyph.property("head") == 1 - glyph.property("phase")  # reverse polarity
     b._distill_timer.timeout.emit()
-    assert glyph.property("active") is False
+    assert glyph.property("active") is False and glyph.property("ingress") is False
+    assert glyph.property("tint").name() == "#38bdf8" and glyph.property("phase") == 0
     engine.deleteLater()
 
 
@@ -1486,3 +1516,232 @@ def test_active_stance_reads_memory_and_settings_card_is_read_only(qapp, home):
     assert win.findChild(object, "stancePlaceholder").property("visible") is False
     assert win.findChild(object, "stanceFooter").property("text") == "3 Active Directives in Memory"
     engine.deleteLater()
+
+
+def test_tray_controller_toggle_menu_and_quit():
+    from PySide6.QtGui import QWindow
+
+    from strand.ui import app as app_mod
+
+    class Win:
+        def __init__(self):
+            self.visible, self.active, self.vis = True, True, QWindow.Visibility.Windowed
+            self.calls = []
+
+        def isVisible(self):
+            return self.visible
+
+        def isActive(self):
+            return self.active
+
+        def visibility(self):
+            return self.vis
+
+        def hide(self):
+            self.visible = False
+            self.calls.append("hide")
+
+        def show(self):
+            self.calls.append("show")
+
+        def showNormal(self):
+            self.calls.append("showNormal")
+
+        def raise_(self):
+            self.calls.append("raise")
+
+        def requestActivate(self):
+            self.calls.append("activate")
+
+    class Fake:
+        def __init__(self):
+            self.calls = []
+
+        def shutdown(self):
+            self.calls.append("shutdown")
+
+        def quit(self):
+            self.calls.append("quit")
+
+        def newConversation(self):
+            self.calls.append("new")
+
+    win, fake = Win(), Fake()
+    ctl = app_mod.TrayController(fake, win, fake, None, None, {})
+    ctl.toggle_window()  # foreground -> hide
+    assert win.calls == ["hide"]
+    ctl.toggle_window()  # hidden -> show, raise, activate
+    assert win.calls[1:] == ["show", "raise", "activate"]
+    win.calls.clear()
+    win.vis = QWindow.Visibility.Minimized
+    ctl.toggle_window()
+    assert win.calls == ["showNormal", "raise", "activate"]
+    ctl.new_session()  # a plain object has no QML method -> bridge fallback
+    ctl.quit()
+    assert fake.calls == ["new", "shutdown", "quit"]
+
+
+# ---- Ring-1 mutation & rollback pills ----
+
+
+def test_revert_backup_dispatches_and_reports_result(qapp):
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        ok = json.loads(request.content)["backup_id"] == "good_id"
+        return httpx.Response(200, json={"path": "/x"}) if ok else httpx.Response(409, json={"error": {}})
+
+    b = make_bridge(handler)
+    reverted = []
+    b.backupReverted.connect(reverted.append)
+    assert b.revertBackup("") is False
+    assert b.revertBackup("bad_id") is False
+    assert b.revertedBackups == [] and reverted == []
+    assert b.revertBackup("good_id") is True
+    assert seen[-1] == ("/v1/backups/restore", {"backup_id": "good_id"})
+    assert b.revertedBackups == ["good_id"] and reverted == ["good_id"]
+    n = len(seen)
+    assert b.revertBackup("good_id") is True  # idempotent: no second restore request
+    assert len(seen) == n
+
+    broken = make_bridge(lambda r: (_ for _ in ()).throw(httpx.ConnectError("down")))
+    assert broken.revertBackup("good_id") is False
+
+
+def test_mutation_header_recorded_on_turn(qapp):
+    records = [{"path": "/p/a.txt", "op": "created", "backup_id": "b1"}]
+    header = json.dumps(records)
+    handler = lambda r: httpx.Response(  # noqa: E731
+        200, content=sse("ok"), headers={bridge_mod.MUTATIONS_HEADER_NAME: header}
+    )
+    b = make_bridge(handler)
+    emitted = []
+    b.mutationsRecorded.connect(emitted.append)
+    asyncio.run(b._stream([{"role": "user", "content": "hi"}]))
+    assert json.loads(emitted[0]) == records
+    assert b.diagnostics["mutations"] == records
+    assert bridge_mod.parse_mutations('[{"path": 1}, {"path": "p", "op": "bogus", "backup_id": "b"}]') == []
+    assert bridge_mod.parse_mutations("not json") == [] and bridge_mod.parse_mutations(None) == []
+
+
+def test_qml_turn_model_exposes_mutations(qapp):
+    from PySide6.QtCore import QMetaObject, Q_ARG, Qt
+
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    win.setWidth(900)
+    win.setHeight(640)
+    win.show()
+    payload = json.dumps([
+        {"path": "/p/a.txt", "op": "created", "backup_id": "b1"},
+        {"path": "/p/b.txt", "op": "removed", "backup_id": "b2"},
+    ])
+    assert len(b.mutationRecords(payload)) == 2 and b.mutationRecords("garbage") == []
+    QMetaObject.invokeMethod(win, "note", Qt.ConnectionType.DirectConnection, Q_ARG("QVariant", "n"))
+    b.mutationsRecorded.emit(payload)  # last row is a note: ignored, no crash
+    QCoreApplication.processEvents()
+    b.backupReverted.emit("b1")
+    QCoreApplication.processEvents()
+    win.hide()
+    engine.deleteLater()
+
+
+def test_proxy_mutation_record_and_restore_endpoint(tmp_path, monkeypatch):
+    from strand.tools import workspace
+
+    monkeypatch.setattr(workspace.Path, "home", classmethod(lambda cls: tmp_path))
+    root = tmp_path / "ws"
+    root.mkdir()
+    target = root / "a.txt"
+    res = workspace.write_file(str(target), "one", [root])
+    rec = workspace.mutation_record("write_file", res)
+    assert rec == {"path": str(target.resolve()), "op": "created", "backup_id": res["backup"]}
+    res2 = workspace.write_file(str(target), "two", [root])
+    assert workspace.mutation_record("write_file", res2)["op"] == "modified"
+    assert workspace.mutation_record("read_file", res2) is None
+    assert workspace.mutation_record("write_file", {"error": "x"}) is None
+    assert workspace.restore_backup(res2["backup"], [root])["deleted"] is False
+    assert target.read_text() == "one"
+
+
+def _roots_bridge(tmp_path):
+    root = tmp_path / "ws"
+    root.mkdir()
+    cfg = Config(workspace_roots=[str(root)])
+    return make_bridge(lambda r: httpx.Response(200, content=b""), config=cfg), root
+
+
+def test_inspect_dropped_text_file(qapp, tmp_path):
+    b, root = _roots_bridge(tmp_path)
+    f = root / "my notes.txt"
+    f.write_text("x" * 4000)
+    info = b.inspectDroppedFile(f.as_uri())
+    assert info == {
+        "safe": True,
+        "path": str(f.resolve()),
+        "name": "my notes.txt",
+        "tokens": 1000,
+        "is_image": False,
+        "size_bytes": 4000,
+    }
+
+
+def test_inspect_dropped_tiny_and_large_text_caps(qapp, tmp_path):
+    b, root = _roots_bridge(tmp_path)
+    tiny = root / "t.md"
+    tiny.write_text("")
+    assert b.inspectDroppedFile(str(tiny))["tokens"] == 1
+    big = root / "big.txt"
+    big.write_bytes(b"a" * (512 * 1024))
+    info = b.inspectDroppedFile(big.as_uri())
+    assert info["tokens"] == 256 * 1024 // 4
+    assert info["size_bytes"] == 512 * 1024
+
+
+def test_inspect_dropped_image(qapp, tmp_path):
+    b, root = _roots_bridge(tmp_path)
+    img = root / "shot.PNG"
+    img.write_bytes(b"\x89PNG" + b"0" * 100)
+    info = b.inspectDroppedFile(img.as_uri())
+    assert info["safe"] is True
+    assert info["is_image"] is True
+    assert info["tokens"] == 1600
+
+
+def test_inspect_dropped_outside_workspace(qapp, tmp_path):
+    b, root = _roots_bridge(tmp_path)
+    outside = tmp_path / "secret.txt"
+    outside.write_text("nope")
+    info = b.inspectDroppedFile(outside.as_uri())
+    assert info == {"safe": False, "error": "outside_workspace", "path": str(outside.resolve())}
+
+
+def test_inspect_dropped_symlink_escape_and_directory(qapp, tmp_path):
+    b, root = _roots_bridge(tmp_path)
+    outside = tmp_path / "o.txt"
+    outside.write_text("nope")
+    link = root / "link.txt"
+    link.symlink_to(outside)
+    assert b.inspectDroppedFile(link.as_uri())["error"] == "outside_workspace"
+    assert b.inspectDroppedFile(root.as_uri())["safe"] is False
+
+
+def test_send_message_prepends_attachment_context(qapp, tmp_path):
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, content=b"data: [DONE]\n\n")
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    f = root / "a.py"
+    f.write_text("print(1)")
+    out = tmp_path / "out.txt"
+    out.write_text("x")
+    b = make_bridge(handler, config=Config(workspace_roots=[str(root)]))
+    pre = b._attachment_preamble([f.as_uri(), out.as_uri()])
+    assert str(f.resolve()) in pre and "read_file" in pre
+    assert str(out.resolve()) not in pre
+    assert b._attachment_preamble([]) == ""

@@ -33,7 +33,7 @@ from .onboarding import (
 from .resolver import ContextResolver
 from .sanitize import sanitize_text
 from .session import IMAGE_PART_PREFIX, MAX_SESSION_ID_LEN
-from .tools.workspace import WORKSPACE_TOOLS, dispatch_tool_call
+from .tools.workspace import WORKSPACE_TOOLS, dispatch_tool_call, mutation_record, restore_backup
 
 logger = get_logger("proxy")
 DEFAULT_SESSION_ID = "default"
@@ -174,6 +174,9 @@ def _stream_outcome(raw: bytes) -> tuple[bool, bool]:
 
 # Response header telling the UI what the resolved context delta held (drives the grounding pulse).
 GROUNDING_HEADER = "X-Strand-Grounding"
+# Response header carrying this request's snapshot-tracked workspace mutations (JSON list; drives UI undo pills).
+MUTATIONS_HEADER = "X-Strand-Mutations"
+MAX_MUTATION_RECORDS = 20
 
 _DELTA_SECTIONS = {
     "Entities:": "entities",
@@ -480,7 +483,9 @@ def create_app(
         request = http.build_request("POST", chat_url, content=json.dumps(payload), headers=headers)
         return await http.send(request, stream=True)
 
-    async def run_tool_loop(payload: dict[str, Any], headers: dict[str, str], streaming: bool) -> httpx.Response:
+    async def run_tool_loop(
+        payload: dict[str, Any], headers: dict[str, str], streaming: bool, mutations: list[dict[str, str]]
+    ) -> httpx.Response:
         """JIT tool loop: run workspace tool calls locally and re-post until a final answer.
 
         Each upstream turn is fully buffered, so tool-call deltas never reach the client; the
@@ -517,6 +522,12 @@ def create_app(
             for call in calls:
                 tool_message, followup = await _run_tool_call_full(call, roots, config.redact_secrets)
                 convo.append(tool_message)
+                try:
+                    record = mutation_record(call["function"]["name"], json.loads(tool_message["content"]))
+                except ValueError:
+                    record = None
+                if record is not None and len(mutations) < MAX_MUTATION_RECORDS:
+                    mutations.append(record)
                 if followup is not None:
                     images.append(followup)
             convo.extend(images)  # tool results must stay contiguous after the assistant tool_calls
@@ -528,6 +539,25 @@ def create_app(
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.post("/v1/backups/restore")
+    async def restore_workspace_backup(request: Request) -> Response:
+        """Undo one journaled workspace mutation (UI undo pill); same sandbox as the `restore_backup` tool."""
+        try:
+            body = await request.json()
+        except (ValueError, RecursionError):
+            return _error(400, "Request body must be valid JSON", "invalid_request_error")
+        backup_id = body.get("backup_id") if isinstance(body, dict) else None
+        if not isinstance(backup_id, str) or not backup_id.strip():
+            return _error(400, "'backup_id' must be a non-empty string", "invalid_request_error")
+        roots = config.resolved_workspace_roots()
+        try:
+            result = await asyncio.to_thread(restore_backup, backup_id, roots)
+        except Exception as exc:  # noqa: BLE001 - fail closed, never leak a traceback
+            return _error(500, f"restore failed: {type(exc).__name__}", "restore_error")
+        if "error" in result:
+            return _error(409, str(result.get("message", result["error"])), str(result["error"]))
+        return JSONResponse(result)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> Response:
@@ -633,10 +663,11 @@ def create_app(
             headers["Accept-Encoding"] = "identity"
         # Earlier-turn raw tool output and media are transient: keep only the syntheses.
         payload["messages"] = resolver.ledger.compact_history(payload["messages"])
+        mutations: list[dict[str, str]] = []
         try:
             if config.tools_enabled:
                 payload["tools"] = _merge_tools(payload.get("tools"))
-                upstream = await run_tool_loop(payload, headers, streaming)
+                upstream = await run_tool_loop(payload, headers, streaming, mutations)
             else:
                 upstream = await post_upstream(payload, headers)
         except httpx.HTTPError as exc:
@@ -644,6 +675,9 @@ def create_app(
             resolver.ledger.reset(session_id)
             return _error(502, f"Upstream request failed: {safe_exc(exc)}", "upstream_error")
 
+        out_headers = {GROUNDING_HEADER: grounding}
+        if mutations:
+            out_headers[MUTATIONS_HEADER] = json.dumps(mutations, separators=(",", ":"))
         content_type = upstream.headers.get("content-type")
         if streaming and upstream.status_code < 400:
             logger.info("Upstream status=%d session=%r (streaming)", upstream.status_code, session_id)
@@ -666,7 +700,7 @@ def create_app(
                 body,
                 status_code=upstream.status_code,
                 media_type=content_type,
-                headers={GROUNDING_HEADER: grounding},
+                headers=out_headers,
             )
 
         async def relay() -> AsyncIterator[bytes]:
@@ -707,7 +741,7 @@ def create_app(
             relay(),
             status_code=upstream.status_code,
             media_type=content_type or "text/event-stream",
-            headers={"Cache-Control": "no-cache", GROUNDING_HEADER: grounding},
+            headers={"Cache-Control": "no-cache", **out_headers},
             background=BackgroundTask(upstream.aclose),
         )
 

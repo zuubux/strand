@@ -10,6 +10,15 @@ ApplicationWindow {
     minimumWidth: 420
     minimumHeight: 360
     title: "Strand"
+
+    // Set by app.install_tray when a system tray exists: the titlebar close hides to tray.
+    property bool hideOnClose: false
+    onClosing: function(close) {
+        if (hideOnClose) {
+            close.accepted = false
+            root.hide()
+        }
+    }
     color: theme.canvas
 
     // Centralized theme tokens: every colour and font stack used by the transcript,
@@ -257,7 +266,7 @@ ApplicationWindow {
     ListModel { id: transcript }
 
     function note(message) {
-        transcript.append({ role: "note", body: message, pending: false, trail: "" })
+        transcript.append({ role: "note", body: message, pending: false, trail: "", mutations: "" })
     }
 
     // Context-delta whisper: nodes/rules traversed for the latest assistant turn.
@@ -433,7 +442,7 @@ ApplicationWindow {
     function beginOnboarding() {
         var feedback = bridge.runCommand("/onboard")
         if (feedback.length > 0 && bridge.busy)
-            transcript.append({ role: "assistant", body: "", pending: true, trail: "" })
+            transcript.append({ role: "assistant", body: "", pending: true, trail: "", mutations: "" })
     }
 
     function closeSettings() {
@@ -472,6 +481,33 @@ ApplicationWindow {
         return true
     }
 
+    ListModel { id: attachedFiles }
+
+    function formatTokens(n) {
+        return n >= 1000 ? "~" + Math.round(n / 1000) + "k tokens" : "~" + n + " tokens"
+    }
+
+    function attachDropped(urls) {
+        var rejected = false
+        for (var i = 0; i < urls.length; i++) {
+            var info = bridge.inspectDroppedFile(urls[i].toString())
+            if (!info.safe) {
+                rejected = true
+                continue
+            }
+            var dup = false
+            for (var j = 0; j < attachedFiles.count; j++)
+                if (attachedFiles.get(j).path === info.path)
+                    dup = true
+            if (!dup)
+                attachedFiles.append({ path: info.path, name: info.name, tokens: info.tokens, isImage: info.is_image })
+        }
+        if (rejected) {
+            dropWarning.visible = true
+            dropWarningTimer.restart()
+        }
+    }
+
     function send() {
         var text = input.text.trim()
         if (text.length === 0)
@@ -484,16 +520,20 @@ ApplicationWindow {
                 input.text = ""
                 note(feedback)
                 if (bridge.busy)  // /onboard: Strand opens, so show its streaming reply
-                    transcript.append({ role: "assistant", body: "", pending: true, trail: "" })
+                    transcript.append({ role: "assistant", body: "", pending: true, trail: "", mutations: "" })
                 return
             }
         }
         if (bridge.busy)
             return
-        transcript.append({ role: "user", body: text, pending: false, trail: "" })
-        transcript.append({ role: "assistant", body: "", pending: true, trail: "" })
+        transcript.append({ role: "user", body: text, pending: false, trail: "", mutations: "" })
+        transcript.append({ role: "assistant", body: "", pending: true, trail: "", mutations: "" })
         input.text = ""
-        bridge.sendMessage(text)
+        var paths = []
+        for (var i = 0; i < attachedFiles.count; i++)
+            paths.push(attachedFiles.get(i).path)
+        attachedFiles.clear()
+        bridge.sendMessage(text, paths)
     }
 
     function finishPending(replacement) {
@@ -522,6 +562,11 @@ ApplicationWindow {
             var last = transcript.count - 1
             var partial = last >= 0 ? transcript.get(last).body : ""
             root.finishPending(partial.length > 0 ? partial + "\n\n_[stopped]_" : "_[stopped]_")
+        }
+        function onMutationsRecorded(payload) {
+            var last = transcript.count - 1
+            if (last >= 0 && transcript.get(last).role === "assistant")
+                transcript.setProperty(last, "mutations", payload)
         }
         function onConversationReset() { transcript.clear() }
         function onBusyChanged() { if (bridge && !bridge.busy) input.forceActiveFocus() }
@@ -769,6 +814,7 @@ ApplicationWindow {
                 required property string body
                 required property bool pending
                 required property string trail
+                required property string mutations
                 required property int index
                 readonly property bool isUser: role === "user"
                 // Turn hierarchy: the first row of a speaker group carries an identity header and a
@@ -942,6 +988,76 @@ ApplicationWindow {
                         }
                     }
 
+                    // Ring-1 mutation pills: `[ op path ] [ Undo ]`, unboxed slate, one per file change.
+                    Flow {
+                        id: mutationRow
+                        objectName: "mutationRow"
+                        visible: row.role === "assistant" && mutationRepeater.count > 0
+                        width: parent.width
+                        spacing: 6
+                        Repeater {
+                            id: mutationRepeater
+                            model: !bridge || row.role !== "assistant" || row.mutations.length === 0 ? [] : bridge.mutationRecords(row.mutations)
+                            delegate: Row {
+                                id: mutationPill
+                                required property var modelData
+                                readonly property string op: modelData.op
+                                readonly property bool reverted: bridge ? bridge.revertedBackups.indexOf(modelData.backup_id) >= 0 : false
+                                readonly property var glyphs: ({ created: "\uD83D\uDCC4 Created", modified: "\uD83D\uDCDD Modified", patched: "\u2702 Patched", moved: "\uD83D\uDCE6 Moved", removed: "\uD83D\uDDD1 Removed" })
+                                spacing: 4
+                                Rectangle {
+                                    objectName: "mutationLabel"
+                                    height: 22
+                                    width: Math.min(mutationRow.width - undoPill.width - 4, pathLabel.implicitWidth + 20)
+                                    radius: 11
+                                    color: Qt.rgba(1, 1, 1, 0.04)
+                                    border.color: root.codeBorder
+                                    border.width: 1
+                                    Label {
+                                        id: pathLabel
+                                        anchors.left: parent.left
+                                        anchors.right: parent.right
+                                        anchors.margins: 10
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: mutationPill.glyphs[mutationPill.op] + ": " + mutationPill.modelData.path
+                                        elide: Text.ElideMiddle
+                                        maximumLineCount: 1
+                                        color: root.dim
+                                        font.family: root.monoFamily
+                                        font.pixelSize: 10
+                                    }
+                                }
+                                Rectangle {
+                                    id: undoPill
+                                    objectName: "undoPill"
+                                    height: 22
+                                    width: undoLabel.implicitWidth + 20
+                                    radius: 11
+                                    color: undoArea.containsMouse && !mutationPill.reverted ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(1, 1, 1, 0.04)
+                                    border.color: root.codeBorder
+                                    border.width: 1
+                                    Label {
+                                        id: undoLabel
+                                        anchors.centerIn: parent
+                                        text: mutationPill.reverted ? "\u21BA Reverted" : "\u21B6 Undo"
+                                        color: mutationPill.reverted ? root.dim : root.textColor
+                                        opacity: mutationPill.reverted ? 0.6 : 1.0
+                                        font.family: root.monoFamily
+                                        font.pixelSize: 10
+                                    }
+                                    MouseArea {
+                                        id: undoArea
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        enabled: !mutationPill.reverted
+                                        cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                        onClicked: if (bridge) bridge.revertBackup(mutationPill.modelData.backup_id)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     Repeater {
                         model: !bridge || !row.flowMode ? [] : bridge.blocks(row.body)
                         delegate: Loader {
@@ -977,7 +1093,8 @@ ApplicationWindow {
                 radius: 14
                 color: theme.dockSurface
                 border.width: 1
-                border.color: input.activeFocus ? theme.cyan : theme.dockBorder
+                border.color: dropArea.containsDrag ? Qt.rgba(0.220, 0.741, 0.973, 0.3)
+                              : (input.activeFocus ? theme.cyan : theme.dockBorder)
                 Behavior on height { NumberAnimation { duration: 90; easing.type: Easing.OutQuad } }
 
                 Flickable {
@@ -1036,6 +1153,17 @@ ApplicationWindow {
                     }
                 }
 
+                DropArea {
+                    id: dropArea
+                    objectName: "dropArea"
+                    anchors.fill: parent
+                    keys: ["text/uri-list"]
+                    onDropped: function(drop) {
+                        if (drop.hasUrls)
+                            root.attachDropped(drop.urls)
+                    }
+                }
+
                 Label {
                     id: modelWatermark
                     objectName: "modelWatermark"
@@ -1053,6 +1181,71 @@ ApplicationWindow {
                     opacity: input.text.length === 0 ? 1 : 0
                     Behavior on opacity { NumberAnimation { duration: 120 } }
                 }
+            }
+
+            // Attached-file chips and drop warning float above the dock (never resize it).
+            Row {
+                id: chipRow
+                objectName: "attachedChips"
+                anchors.left: dock.left
+                anchors.bottom: dock.top
+                anchors.bottomMargin: 6
+                width: dock.width
+                spacing: 6
+                visible: attachedFiles.count > 0 || dropWarning.visible
+                Repeater {
+                    model: attachedFiles
+                    delegate: Rectangle {
+                        height: 24
+                        width: chipLabel.implicitWidth + closeLabel.implicitWidth + 22
+                        radius: 12
+                        color: Qt.rgba(1, 1, 1, 0.06)
+                        border.width: 1
+                        border.color: Qt.rgba(1, 1, 1, 0.1)
+                        Label {
+                            id: chipLabel
+                            anchors.left: parent.left
+                            anchors.leftMargin: 10
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: (model.isImage ? "\uD83D\uDDBC " : "\uD83D\uDCC4 ") + model.name + " \u2022 " + root.formatTokens(model.tokens)
+                            color: model.tokens > 50000 ? "#f59e0b" : "#8b949e"
+                            font.family: root.monoFamily
+                            font.pixelSize: 11
+                        }
+                        Label {
+                            id: closeLabel
+                            anchors.right: parent.right
+                            anchors.rightMargin: 8
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "\u2715"
+                            color: closeMouse.containsMouse ? root.textColor : "#8b949e"
+                            font.pixelSize: 11
+                            MouseArea {
+                                id: closeMouse
+                                objectName: "chipRemove"
+                                anchors.fill: parent
+                                anchors.margins: -4
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: attachedFiles.remove(index)
+                            }
+                        }
+                    }
+                }
+                Label {
+                    id: dropWarning
+                    objectName: "dropWarning"
+                    visible: false
+                    anchors.verticalCenter: undefined
+                    text: "Path outside workspace roots"
+                    color: "#f59e0b"
+                    font.pixelSize: 11
+                }
+            }
+            Timer {
+                id: dropWarningTimer
+                interval: 2000
+                onTriggered: dropWarning.visible = false
             }
 
             // Corner controls: bottom-right, below the dock, over the seamless background.

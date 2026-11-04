@@ -142,10 +142,95 @@ def ensure_stdio() -> None:
             setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))  # noqa: SIM115
 
 
+TRAY_TOOLTIP = "Strand — Working Memory Companion"
+
+
+class TrayController:
+    """System tray presence: toggles the window and owns the tray context menu (UI-3).
+
+    Purely event-driven (Qt signals only): no timers or polling, so it idles at 0% CPU.
+    """
+
+    def __init__(self, app, window, bridge, tray, menu, actions) -> None:
+        self.app = app
+        self.window = window
+        self.bridge = bridge
+        self.tray = tray
+        self.menu = menu
+        self.actions = actions
+
+    def is_foreground(self) -> bool:
+        from PySide6.QtGui import QWindow
+
+        w = self.window
+        return bool(w.isVisible() and w.isActive() and w.visibility() != QWindow.Visibility.Minimized)
+
+    def show_window(self) -> None:
+        from PySide6.QtGui import QWindow
+
+        if self.window.visibility() == QWindow.Visibility.Minimized:
+            self.window.showNormal()
+        else:
+            self.window.show()
+        self.window.raise_()
+        self.window.requestActivate()
+
+    def toggle_window(self) -> None:
+        if self.is_foreground():
+            self.window.hide()
+        else:
+            self.show_window()
+
+    def on_activated(self, reason) -> None:
+        from PySide6.QtWidgets import QSystemTrayIcon
+
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.toggle_window()
+
+    def new_session(self) -> None:
+        from PySide6.QtCore import QMetaObject, QObject
+
+        # Same path as Ctrl+L: the QML `newSession()` rotates the session and clears the input.
+        if not (isinstance(self.window, QObject) and QMetaObject.invokeMethod(self.window, "newSession")):
+            self.bridge.newConversation()
+
+    def quit(self) -> None:
+        self.bridge.shutdown()
+        self.app.quit()
+
+
+def install_tray(app, window, bridge, icon) -> TrayController | None:
+    """Create the tray icon and menu; None (window-close quits) if no system tray exists."""
+    from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        return None
+    menu = QMenu()
+    open_action = menu.addAction("Open Strand")
+    session_action = menu.addAction("New Session")
+    menu.addSeparator()
+    quit_action = menu.addAction("Quit Strand UI")
+    tray = QSystemTrayIcon(icon, app)
+    tray.setToolTip(TRAY_TOOLTIP)
+    tray.setContextMenu(menu)
+    controller = TrayController(
+        app, window, bridge, tray, menu, {"open": open_action, "new": session_action, "quit": quit_action}
+    )
+    open_action.triggered.connect(lambda: controller.show_window())
+    session_action.triggered.connect(lambda: controller.new_session())
+    quit_action.triggered.connect(lambda: controller.quit())
+    tray.activated.connect(controller.on_activated)
+    tray.show()
+    window.setProperty("hideOnClose", True)  # QML onClosing vetoes the close and hides instead
+    app.setQuitOnLastWindowClosed(False)  # a hidden window must not end app.exec()
+    return controller
+
+
 def main(argv: list[str] | None = None) -> int:
     ensure_stdio()
     from PySide6.QtCore import QTimer, QUrl
-    from PySide6.QtGui import QGuiApplication, QIcon
+    from PySide6.QtGui import QIcon
+    from PySide6.QtWidgets import QApplication
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
 
@@ -153,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = sys.argv if argv is None else argv
     QQuickStyle.setStyle("Basic")  # fully custom-styled controls; no native-style overrides
-    app = QGuiApplication(args)
+    app = QApplication(args)  # QSystemTrayIcon requires the widgets application class
     app.setApplicationName("Strand")
     app.setDesktopFileName("strand")  # Wayland app_id -> strand.desktop and its icon
     app.setWindowIcon(QIcon.fromTheme("strand", QIcon(fallback_icon_path())))
@@ -186,8 +271,15 @@ def main(argv: list[str] | None = None) -> int:
     app.aboutToQuit.connect(bridge.shutdown)  # cancel and join every strand-ui-io worker
     # Qt Quick's `closing` carries a QQuickCloseEvent* PySide cannot convert; a lambda that
     # accepts arguments (even `*_`) still receives it and raises TypeError, so take none.
-    window.closing.connect(lambda: bridge.shutdown())
-    window.closing.connect(lambda: app.quit())
+    tray = install_tray(app, window, bridge, QIcon.fromTheme("strand", QIcon(fallback_icon_path())))
+
+    def on_closing() -> None:
+        if tray is not None and window.property("hideOnClose"):
+            return  # QML hides the window; the tray keeps the process alive
+        bridge.shutdown()
+        app.quit()
+
+    window.closing.connect(on_closing)
     bridge.checkConnection()
     code = app.exec()
     bridge.shutdown()  # idempotent; guarantees no worker thread outlives exec()
