@@ -507,7 +507,9 @@ def test_size_persistence_roundtrip_and_clamp(qapp, tmp_path):
 
     path = str(tmp_path / "size.ini")
     settings = QSettings(path, QSettings.Format.IniFormat)
-    assert app_mod.restore_size(Win(), settings) is False  # nothing saved
+    blank = Win(1, 1)
+    assert app_mod.restore_size(blank, settings) is False  # nothing saved
+    assert (blank.w, blank.h) == (780, 1020)
     app_mod.save_size(Win(910, 730), settings)
     reopened = QSettings(path, QSettings.Format.IniFormat)  # proves the sync() flush
     fresh = Win(1, 1)
@@ -1193,6 +1195,7 @@ def test_qml_welcome_card_provider_selector(qapp, home):
     box = win.findChild(object, "welcomeProviderBox")
     assert box is not None and box.property("count") == 6 and box.property("currentIndex") == 0
     assert win.findChild(object, "welcomeOllama") is None  # old static buttons are gone
+    win.setProperty("wizardStep", 2)  # the engine picker lives on Plate 2
     key = win.findChild(object, "welcomeKeyEdit")
     assert key.property("visible") is True and key.property("placeholderText") == "API key"
     model = win.findChild(object, "welcomeModelBox")
@@ -1302,7 +1305,7 @@ def test_conduit_glyph_wired_in_qml(qapp):
     qml = (MAIN_QML.parent / "ConduitGlyph.qml").read_text()
     assert "layer.enabled: true" in qml and "layer.smooth: true" in qml
     assert glyph.property("active") is False  # idle: nothing animating
-    assert win.findChild(object, "weaveGlyph").property("visible") is False
+    assert win.findChild(object, "weaveGlyph") is None  # corner buttons stay static
     b.streamFinished.emit()
     assert glyph.property("ingress") is True and glyph.property("active") is True
     assert glyph.property("tint").name() == "#f59e0b"
@@ -1581,6 +1584,78 @@ def test_tray_controller_toggle_menu_and_quit():
     assert fake.calls == ["new", "shutdown", "quit"]
 
 
+def test_tray_teardown_hides_and_unparents_once():
+    from strand.ui import app as app_mod
+
+    class FakeTray:
+        def __init__(self):
+            self.calls = []
+
+        def hide(self):
+            self.calls.append("hide")
+
+        def setParent(self, parent):  # noqa: N802 - Qt API
+            self.calls.append(("parent", parent))
+
+    tray = FakeTray()
+    ctl = app_mod.TrayController(None, None, None, tray, None, {})
+    ctl.teardown()
+    assert tray.calls == ["hide", ("parent", None)]
+    assert ctl.tray is None
+    ctl.teardown()  # idempotent
+    assert tray.calls == ["hide", ("parent", None)]
+
+
+def test_signal_handlers_quit_app_and_restore(qapp):
+    import signal
+
+    from strand.ui import app as app_mod
+
+    class FakeApp:
+        quits = 0
+
+        def quit(self):
+            self.quits += 1
+
+    before = signal.getsignal(signal.SIGTERM)
+    fake = FakeApp()
+    handle = app_mod.install_signal_handlers(fake)
+    try:
+        assert signal.getsignal(signal.SIGTERM) is not before
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert _wait(lambda: (QCoreApplication.processEvents() or True) and fake.quits == 1)
+    finally:
+        handle.restore()
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_single_instance_collision_wakes_primary(qapp):
+    from strand.ui import app as app_mod
+
+    name = f"strand-gui-test-{os.getpid()}"
+    primary = app_mod.SingleInstance(name)
+    woken = []
+    assert primary.acquire() is True
+    primary.on_activate = lambda: woken.append(1)
+    import threading
+
+    result = []
+    t = threading.Thread(target=lambda: result.append(app_mod.notify_existing_instance(name, 2000)))
+    t.start()
+    assert _wait(lambda: (QCoreApplication.processEvents() or True) and bool(woken))
+    t.join(5)
+    assert result == [True]
+    second = app_mod.SingleInstance(name)
+    result.clear()
+    t = threading.Thread(target=lambda: result.append(second.acquire()))
+    t.start()
+    assert _wait(lambda: (QCoreApplication.processEvents() or True) and not t.is_alive())
+    t.join(5)
+    assert result == [False]
+    primary.close()
+    assert app_mod.notify_existing_instance(name, 50) is False
+
+
 # ---- Ring-1 mutation & rollback pills ----
 
 
@@ -1745,3 +1820,76 @@ def test_send_message_prepends_attachment_context(qapp, tmp_path):
     assert str(f.resolve()) in pre and "read_file" in pre
     assert str(out.resolve()) not in pre
     assert b._attachment_preamble([]) == ""
+
+
+# -- 4-step setup wizard ---------------------------------------------------------------
+def test_qml_wizard_steps_and_copy(qapp, home):
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    assert win.property("wizardStep") == 1
+    assert win.findChild(object, "wizardPlate1").property("visible") is True
+    assert win.findChild(object, "wizardPlate2").property("visible") is False
+    assert win.findChild(object, "wizardLogo") is not None
+    assert win.findChild(object, "welcomeCard").property("width") <= 680
+    from PySide6.QtCore import QMetaObject, Qt
+
+    QMetaObject.invokeMethod(win, "wizardNext", Qt.DirectConnection)
+    assert win.property("wizardStep") == 2
+    # Engine step blocks Next without an API key.
+    QMetaObject.invokeMethod(win, "wizardNext", Qt.DirectConnection)
+    assert win.property("wizardStep") == 2 and win.property("welcomeError")
+    win.findChild(object, "welcomeKeyEdit").setProperty("text", "k" * 24)
+    QMetaObject.invokeMethod(win, "wizardNext", Qt.DirectConnection)
+    QMetaObject.invokeMethod(win, "wizardNext", Qt.DirectConnection)
+    assert win.property("wizardStep") == 4
+    assert win.property("wizardRoots") == ["~/Projects"]
+    assert win.findChild(object, "wizardFinish").property("visible") is True
+    QMetaObject.invokeMethod(win, "wizardBack", Qt.DirectConnection)
+    assert win.property("wizardStep") == 3
+    engine.deleteLater()
+
+
+def test_complete_setup_writes_everything(qapp, home, monkeypatch):
+    import asyncio
+    import stat
+
+    from strand.db import DatabaseManager
+
+    monkeypatch.setattr(bridge_mod, "get_host_context", lambda: {"user": "nic", "hostname": "ONYX", "os": "Linux"})
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    result = b.completeSetup({
+        "provider": "gemini", "api_key": "AIza-test", "model": "gemini-3.6-flash", "endpoint_url": "",
+        "operator": "Nic", "telemetry": True, "roots": ["~/Projects", "~/Work Dir", "~/Projects"],
+    })
+    assert result["ok"] is True
+    assert result["ready"] == "Systems ready, Nic. Anchored to ONYX with ~/Projects and ~/Work Dir in view. What are we getting into?"
+    path = home / ".config" / "strand" / "config.json"
+    data = json.loads(path.read_text())
+    assert data["operator_name"] == "Nic" and data["enable_host_telemetry"] is True
+    assert data["workspace_roots"] == ["~/Projects", "~/Work Dir"]
+    assert data["upstream_api_key"] == "AIza-test"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    dropin = home / ".config" / "systemd" / "user" / "strand.service.d" / "override.conf"
+    text = dropin.read_text()
+    assert "[Service]" in text and f'"-{home}/Work Dir"' in text and f"-{home}/Projects" in text
+    assert b.operatorName == "Nic" and b.isConfigured is True
+
+    async def edge():
+        async with DatabaseManager(home / ".config" / "strand" / "memory.db") as db:
+            async with db.conn.execute(
+                "SELECT s.name, t.name, e.origin, e.confidence FROM edges e "
+                "JOIN entities s ON s.id = e.source_id JOIN entities t ON t.id = e.target_id "
+                "WHERE e.relation = 'operates_host'"
+            ) as cur:
+                return await cur.fetchall()
+
+    assert [tuple(r) for r in asyncio.run(edge())] == [("Nic", "ONYX", "user_explicit", 1.0)]
+
+
+def test_complete_setup_validation_leaves_config_untouched(qapp, home):
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    base = {"provider": "gemini", "api_key": "k", "model": "m", "operator": "Nic", "roots": ["~/Projects"]}
+    assert b.completeSetup({**base, "api_key": " "})["step"] == 2
+    assert b.completeSetup({**base, "roots": []})["step"] == 4
+    assert not (home / ".config" / "strand" / "config.json").exists()
+    assert not (home / ".config" / "systemd").exists()

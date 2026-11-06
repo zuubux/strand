@@ -40,10 +40,12 @@ from strand.config import (
     load_config,
     save_config,
 )
-from strand.db import _ACTIVE, PRIVATE_ENTITY_SQL
+from strand.db import _ACTIVE, PRIVATE_ENTITY_SQL, DatabaseManager
+from strand.host import get_host_context
 from strand.perms import secure_parent_dir
 from strand.tools.workspace import IMAGE_MIME_TYPES, MAX_BATCH_FILE_BYTES, is_safe_path
-from strand.onboarding import ONBOARD_TRIGGER, ONBOARDING_HEADER, ONBOARDING_MODE
+from strand.onboarding import seed_operator_anchor
+from strand.onboarding import operator_name as anchor_operator_name
 
 DEFAULT_MODEL = "gpt-4o-mini"
 UDS_BASE_URL = "http://strand"
@@ -67,6 +69,7 @@ SETTINGS_KEYS: dict[str, str] = {
     "decay_half_life_days": "float",
     "redact_secrets": "bool",
     "enable_host_telemetry": "bool",
+    "web_search_enabled": "bool",
 }
 # Client-side presentation pacing (OBS-ERG-003): the socket is never throttled, only the
 # drain of the in-memory buffer into the transcript.
@@ -92,7 +95,7 @@ FENCE_RE = re.compile(r"^[ \t]{0,3}```[ \t]*([\w+.#-]*)[ \t]*$")
 IMAGE_RE = re.compile(r"!\[([^\]]*)\](?:\((?:[^()]|\([^()]*\))*\)|\[[^\]]*\])?")
 HELP_TEXT = (
     "Commands: /new (fresh session), /private on|off (send X-Strand-Allow-Private), "
-    "/model <name> (switch model), /onboard (fresh session, Strand opens the grounding conversation), /help. Ctrl+L new session, Ctrl+D diagnostics, Esc stop/clear."
+    "/model <name> (switch model), /help. Ctrl+L new session, Ctrl+D diagnostics, Esc stop/clear."
 )
 
 
@@ -170,6 +173,46 @@ def operator_name(env: Mapping[str, str] | None = None) -> str:
             name = ""
         name = name[:1].upper() + name[1:]
     return name or "Operator"
+
+
+def _tilde(path: str) -> str:
+    """Collapse the home directory prefix to `~` and drop a trailing slash."""
+    home = str(Path.home())
+    path = path.rstrip("/") or "/"
+    if path == home:
+        return "~"
+    return "~" + path[len(home):] if path.startswith(home + "/") else path
+
+
+DROPIN_MARKER = "# Managed by Strand setup"
+
+
+def _write_systemd_dropin(roots: list[str]) -> Path:
+    """Write `strand.service.d/override.conf` adding the workspace roots to `ReadWritePaths=`.
+
+    The list directive appends to the packaged unit's paths. The `-` prefix keeps the service
+    starting if a root is missing. A pre-existing override that Strand did not write is kept as
+    `override.conf.strand-bak`.
+    """
+    path = Path.home() / ".config" / "systemd" / "user" / "strand.service.d" / "override.conf"
+    entries = []
+    for root in roots:
+        token = "-" + str(Path(root).expanduser()).replace("%", "%%")
+        entries.append(f'"{token}"' if " " in token else token)
+    text = f"{DROPIN_MARKER}\n[Service]\nReadWritePaths={' '.join(entries)}\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and DROPIN_MARKER not in path.read_text(encoding="utf-8", errors="replace"):
+        os.replace(path, path.with_name(path.name + ".strand-bak"))
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".override-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return path
 
 
 def parse_command(text: str) -> tuple[str, str] | None:
@@ -382,6 +425,7 @@ class Bridge(QObject):
     modelChanged = Signal()
     sessionChanged = Signal()
     privateChanged = Signal()
+    webSearchEnabledChanged = Signal()
     diagnosticsChanged = Signal()
     streamAborted = Signal()
     conversationReset = Signal()
@@ -391,6 +435,7 @@ class Bridge(QObject):
     backupReverted = Signal(str)
     revertedBackupsChanged = Signal()
     configuredChanged = Signal()
+    operatorChanged = Signal()
     availableModelsChanged = Signal()
     availableExtractorModelsChanged = Signal()
     extractorProbeStatusChanged = Signal()
@@ -451,6 +496,7 @@ class Bridge(QObject):
         self._extractor_probe_seq = 0
         self._extractorModelsResult.connect(self._on_extractor_models_result)
         self._config = config if config is not None else load_config()
+        self._operator_override = str(_read_file(default_config_path()).get("operator_name") or "").strip()
         self._stance_nodes: list[str] = []
         self._stance_count = 0
         self._model = resolve_model(self._config, explicit=model)
@@ -462,7 +508,7 @@ class Bridge(QObject):
         self._busy = False
         self._lock = threading.Lock()
         self._private = False
-        self._onboarding = False
+        self._web_search_enabled = bool(getattr(self._config, "web_search_enabled", False))
         self._generation = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[None] | None = None
@@ -532,10 +578,46 @@ class Bridge(QObject):
     def privateMode(self) -> bool:
         return self._private
 
-    @Property(str, constant=True)
+    @Property(bool, notify=webSearchEnabledChanged)
+    def webSearchEnabled(self) -> bool:
+        return bool(self._web_search_enabled)
+
+    @Slot(bool)
+    def setWebSearchEnabled(self, enabled: bool) -> None:
+        """Persist `web_search_enabled` (Google Search grounding for Gemini upstreams)."""
+        enabled = bool(enabled)
+        if self.saveConfig({"web_search_enabled": enabled}) and enabled != self._web_search_enabled:
+            self._web_search_enabled = enabled
+            self.webSearchEnabledChanged.emit()
+
+    @Property(str, notify=operatorChanged)
     def operatorName(self) -> str:
-        """Display name for the user identity header (`$STRAND_UI_OPERATOR`, login name, `Operator`)."""
+        """Display name for the identity header: `$STRAND_UI_OPERATOR`, the name chosen in setup, login name, `Operator`."""
+        if self._operator_override and not os.environ.get("STRAND_UI_OPERATOR", "").strip():
+            return self._operator_override
         return operator_name()
+
+    @Property(str, constant=True)
+    def logoUrl(self) -> str:
+        """file:// URL of the Strand logo for the Welcome wizard."""
+        from PySide6.QtCore import QUrl
+
+        from strand.ui.app import fallback_icon_path
+
+        return QUrl.fromLocalFile(fallback_icon_path()).toString()
+
+    @Property(str, constant=True)
+    def hostName(self) -> str:
+        return str(get_host_context().get("hostname") or "workstation")
+
+    @Property(list, constant=True)
+    def workspaceRoots(self) -> list[str]:
+        """Currently configured workspace roots (default `~/Projects`)."""
+        return list(self._config.workspace_roots)
+
+    @Property(bool, constant=True)
+    def hostTelemetryDefault(self) -> bool:
+        return bool(self._config.enable_host_telemetry)
 
     @Property(str, constant=True)
     def transport(self) -> str:
@@ -844,8 +926,6 @@ class Bridge(QObject):
         headers = {"Content-Type": "application/json", "X-Session-Id": self._session_id}
         if self._private:
             headers[PRIVATE_HEADER] = "true"
-        if self._onboarding:
-            headers[ONBOARDING_HEADER] = ONBOARDING_MODE
         if self._config.api_key:
             headers["Authorization"] = f"Bearer {self._config.api_key}"
         return headers
@@ -1131,6 +1211,7 @@ class Bridge(QObject):
             "upstream_api_key_set": bool(cfg.upstream_api_key),
             "redact_secrets": _as_bool(file_values.get("redact_secrets", True)),
             "enable_host_telemetry": cfg.enable_host_telemetry,
+            "web_search_enabled": cfg.web_search_enabled,
         }
 
     @Slot("QVariantMap", result=bool)
@@ -1192,11 +1273,94 @@ class Bridge(QObject):
         self.diagnosticsChanged.emit()
         return True
 
+    @Slot(str, result=str)
+    def folderPath(self, file_url: str) -> str:
+        """Local path (home collapsed to `~`) for a FolderDialog `file://` URL; "" if not a local file URL."""
+        parsed = urlparse(file_url)
+        if parsed.scheme != "file" or not parsed.path:
+            return ""
+        return _tilde(unquote(parsed.path))
+
+    @Slot("QVariantMap", result="QVariantMap")
+    def completeSetup(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Finish the first-run wizard.
+
+        Validates everything first, anchors `(Operator) -[operates_host]-> (Host)` in the graph
+        (user_explicit, 1.0; no schema change), writes engine, operator name, telemetry flag and
+        workspace roots to config.json in one atomic write (0600), writes the systemd user
+        drop-in and reloads the service in the background. Returns `{ok, ready, ...}` or
+        `{ok: False, step, error}`; on failure config.json is untouched.
+        """
+        try:
+            updates = engine_updates(
+                str(data.get("provider") or ""),
+                str(data.get("api_key") or ""),
+                str(data.get("model") or ""),
+                str(data.get("endpoint_url") or ""),
+            )
+        except ValueError as exc:
+            return {"ok": False, "step": 2, "error": str(exc)}
+        name = " ".join(str(data.get("operator") or "").split())[:64]
+        if any(ord(c) < 32 for c in name):
+            return {"ok": False, "step": 3, "error": "The name contains invalid characters."}
+        name = anchor_operator_name({"user": name or operator_name()})
+        roots: list[str] = []
+        for raw in data.get("roots") or []:
+            root = str(raw).strip()
+            if any(ord(c) < 32 for c in root):
+                return {"ok": False, "step": 4, "error": "A folder path contains invalid characters."}
+            if root and all(Path(root).expanduser() != Path(r).expanduser() for r in roots):
+                roots.append(root)
+        if not roots:
+            return {"ok": False, "step": 4, "error": "Add at least one folder Strand may read."}
+        host = get_host_context()
+        hostname = str(host.get("hostname") or "workstation")
+
+        async def _anchor() -> None:
+            async with DatabaseManager(self._config.db_path) as db:
+                await seed_operator_anchor(
+                    db, {"user": name, "hostname": hostname, "os": host.get("os", "")}
+                )
+
+        try:
+            asyncio.run(_anchor())
+            save_config(
+                {
+                    **updates,
+                    "operator_name": name,
+                    "enable_host_telemetry": _as_bool(data.get("telemetry", False)),
+                    "workspace_roots": roots,
+                }
+            )
+            self._config = load_config()
+            _write_systemd_dropin(roots)
+        except (OSError, ValueError, RuntimeError) as exc:
+            return {"ok": False, "step": 4, "error": f"Could not save setup: {exc}"}
+        self._operator_override = name
+        self.setModel(resolve_model(self._config))
+        self.operatorChanged.emit()
+        self.configuredChanged.emit()
+        self.diagnosticsChanged.emit()
+        if self._client_factory is None:  # injected transport (tests): no real service
+            threading.Thread(target=self._reload_service, name="strand-reload", daemon=True).start()
+        shown = [_tilde(str(Path(r).expanduser())) for r in roots]
+        view = shown[0] if len(shown) == 1 else " and ".join(shown) if len(shown) == 2 else f"{len(shown)} folders"
+        ready = f"Systems ready, {name}. Anchored to {hostname} with {view} in view. What are we getting into?"
+        return {"ok": True, "ready": ready, "operator": name, "hostname": hostname}
+
+    def _reload_service(self) -> None:
+        """Background: pick up the new drop-in (`daemon-reload`), then restart onto the new config."""
+        try:
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return
+        self._reload_daemon()
+
     def _reload_daemon(self) -> None:
-        """Make the running daemon pick up the freshly written config before onboarding starts.
+        """Make the running daemon pick up the freshly written config before the first chat.
 
         The daemon reads config.json once at startup, so a service started before first-run
-        setup would answer the onboarding turn with 401. Restart the systemd user service (only
+        setup would answer the first chat turn with 401. Restart the systemd user service (only
         when it is active and the bridge talks to the real transport), then wait for `/health`.
         """
         if self._client_factory is not None:
@@ -1388,7 +1552,6 @@ class Bridge(QObject):
         self._set_grounding(False, "")
         self._history.clear()
         self._turn = {}
-        self._onboarding = False
         self._session_id = f"ui-{uuid.uuid4().hex[:12]}"
         self.sessionChanged.emit()
         self.diagnosticsChanged.emit()
@@ -1423,12 +1586,6 @@ class Bridge(QObject):
         if name == "new":
             self.newConversation()
             return "Started a new session."
-        if name == "onboard":
-            self.newConversation()
-            self._onboarding = True
-            self.diagnosticsChanged.emit()
-            self._start_turn(ONBOARD_TRIGGER)
-            return "Onboarding session started."
         if name == "private":
             value = arg.lower()
             if value not in ("on", "off"):

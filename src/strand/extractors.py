@@ -71,15 +71,8 @@ SYSTEM_PROMPT = (
     "(User) --[concerned_about]--> (Battery Life). Never create generic intermediate container "
     "entities such as \"User's Preference\", \"User's Concern\" or \"User Settings\"; no two-hop "
     "chains like (User) --[has]--> (User's Preference) --[includes]--> (AWD). "
-    "Operator identity: when the exchange identifies or confirms the operator's preferred conversational "
-    "name (for example an answer to 'What should I call you?' such as 'Alice', 'Just Alice', 'Alice works', "
-    "'Alicia is fine', or a statement like 'Call me Alice' or 'I'm Alice'), emit an entity with name set to "
-    'the declared name, archetype "person", origin "user_explicit" and confidence 1.0, and emit the edge '
-    '(<Declared Name>) --[operates_host]--> (<Hostname>) using the hostname given in the Host line. '
-    "Use the declared name instead of User as the source of the operator's other edges. "
-    "Questions, refusals and non-names (e.g. 'why?', 'nothing', 'stop') declare no name. "
     "Host telemetry preference: when the operator answers a question about whether the assistant may "
-    "inspect their hardware specs (CPU/RAM/OS), in onboarding or later chat, emit one edge from the "
+    "inspect their hardware specs (CPU/RAM/OS), emit one edge from the "
     "operator (the declared name, else User) with relation prefers: agreement (e.g. 'yeah, check it "
     "out', 'tune into the iron') is (<Operator>) --[prefers]--> (Host Telemetry Enabled); a decline "
     "or on-demand answer (e.g. 'keep it on-demand', 'leave it local') is (<Operator>) --[prefers]--> "

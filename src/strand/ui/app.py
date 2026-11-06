@@ -14,8 +14,10 @@ SETTINGS_APP = "strand-gui"
 GEOMETRY_KEY = "window/geometry"
 WIDTH_KEY = "window/width"
 HEIGHT_KEY = "window/height"
-MIN_WIDTH = 480
-MIN_HEIGHT = 500
+MIN_WIDTH = 540
+MIN_HEIGHT = 640
+DEFAULT_WIDTH = 780
+DEFAULT_HEIGHT = 1020
 SAVE_DELAY_MS = 300
 LOCAL_SCHEMES = ("file", "qrc", "data")
 
@@ -68,6 +70,8 @@ def restore_size(window, settings) -> bool:
         width = int(settings.value(WIDTH_KEY))
         height = int(settings.value(HEIGHT_KEY))
     except (TypeError, ValueError):
+        window.setWidth(DEFAULT_WIDTH)
+        window.setHeight(DEFAULT_HEIGHT)
         return False
     window.setWidth(max(width, MIN_WIDTH))
     window.setHeight(max(height, MIN_HEIGHT))
@@ -143,6 +147,122 @@ def ensure_stdio() -> None:
 
 
 TRAY_TOOLTIP = "Strand — Working Memory Companion"
+WAKE_COMMAND = b"ACTIVATE"
+WAKE_TIMEOUT_MS = 500
+
+
+def instance_name() -> str:
+    """Per-user local-socket name guarding against concurrent `strand-gui` instances."""
+    import os
+
+    return f"strand-gui-{os.getuid()}"
+
+
+def notify_existing_instance(name: str, timeout_ms: int = WAKE_TIMEOUT_MS) -> bool:
+    """Send ACTIVATE to a live primary instance; False if nobody is listening on `name`."""
+    from PySide6.QtNetwork import QLocalSocket
+
+    sock = QLocalSocket()
+    sock.connectToServer(name)
+    if not sock.waitForConnected(timeout_ms):
+        return False
+    sock.write(WAKE_COMMAND)
+    sock.waitForBytesWritten(timeout_ms)
+    sock.disconnectFromServer()
+    if sock.state() != QLocalSocket.LocalSocketState.UnconnectedState:
+        sock.waitForDisconnected(timeout_ms)
+    return True
+
+
+class SingleInstance:
+    """Primary-instance guard: a QLocalServer that relays wake messages to `on_activate`."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.server = None
+        self.on_activate = None
+        self._sockets: list = []
+
+    def acquire(self) -> bool:
+        """True if this process is now the primary instance; False if another one answered."""
+        from PySide6.QtNetwork import QLocalServer
+
+        if notify_existing_instance(self.name):
+            return False
+        QLocalServer.removeServer(self.name)  # nobody answered: clear a stale socket file
+        server = QLocalServer()
+        server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        if not server.listen(self.name):
+            return False
+        server.newConnection.connect(self._on_connection)
+        self.server = server
+        return True
+
+    def _on_connection(self) -> None:
+        while self.server is not None and self.server.hasPendingConnections():
+            sock = self.server.nextPendingConnection()
+            self._sockets.append(sock)
+            sock.readyRead.connect(lambda s=sock: self._on_ready(s))
+            sock.disconnected.connect(lambda s=sock: self._drop(s))
+            if sock.bytesAvailable():
+                self._on_ready(sock)
+
+    def _on_ready(self, sock) -> None:
+        data = bytes(sock.readAll().data())
+        if data.strip() == WAKE_COMMAND and self.on_activate is not None:
+            self.on_activate()
+
+    def _drop(self, sock) -> None:
+        if sock in self._sockets:
+            self._sockets.remove(sock)
+        sock.deleteLater()
+
+    def close(self) -> None:
+        if self.server is not None:
+            self.server.close()
+            self.server = None
+
+
+def install_signal_handlers(app):
+    """Route SIGINT/SIGTERM to `app.quit()` without timers (wakeup fd + QSocketNotifier).
+
+    Returns a handle with `.restore()`; keep it alive as long as the app runs.
+    """
+    import signal
+    import socket
+
+    from PySide6.QtCore import QSocketNotifier
+
+    rsock, wsock = socket.socketpair()
+    rsock.setblocking(False)
+    wsock.setblocking(False)
+    previous_fd = signal.set_wakeup_fd(wsock.fileno())
+    sigs = (signal.SIGINT, signal.SIGTERM)
+    previous = {s: signal.signal(s, lambda *_: None) for s in sigs}  # non-default handler -> fd write
+    notifier = QSocketNotifier(rsock.fileno(), QSocketNotifier.Type.Read)
+
+    def on_signal() -> None:
+        try:
+            rsock.recv(64)
+        except OSError:
+            pass
+        app.quit()
+
+    notifier.activated.connect(on_signal)
+
+    class _Handle:
+        def restore(self) -> None:
+            notifier.setEnabled(False)
+            signal.set_wakeup_fd(previous_fd)
+            for s, h in previous.items():
+                signal.signal(s, h)
+            rsock.close()
+            wsock.close()
+
+    handle = _Handle()
+    handle.notifier = notifier  # keep alive
+    handle.trigger = on_signal
+    return handle
 
 
 class TrayController:
@@ -198,6 +318,14 @@ class TrayController:
         self.bridge.shutdown()
         self.app.quit()
 
+    def teardown(self) -> None:
+        """Hide and orphan the tray icon so Qt unregisters the SNI D-Bus item before exit."""
+        tray, self.tray = self.tray, None
+        if tray is None:
+            return
+        tray.hide()
+        tray.setParent(None)
+
 
 def install_tray(app, window, bridge, icon) -> TrayController | None:
     """Create the tray icon and menu; None (window-close quits) if no system tray exists."""
@@ -220,6 +348,8 @@ def install_tray(app, window, bridge, icon) -> TrayController | None:
     session_action.triggered.connect(lambda: controller.new_session())
     quit_action.triggered.connect(lambda: controller.quit())
     tray.activated.connect(controller.on_activated)
+    app.aboutToQuit.connect(controller.teardown)
+    controller.signal_handle = install_signal_handlers(app)
     tray.show()
     window.setProperty("hideOnClose", True)  # QML onClosing vetoes the close and hides instead
     app.setQuitOnLastWindowClosed(False)  # a hidden window must not end app.exec()
@@ -243,6 +373,9 @@ def main(argv: list[str] | None = None) -> int:
     app.setDesktopFileName("strand")  # Wayland app_id -> strand.desktop and its icon
     app.setWindowIcon(QIcon.fromTheme("strand", QIcon(fallback_icon_path())))
     app.setQuitOnLastWindowClosed(True)  # closing the window ends app.exec()
+    guard = SingleInstance(instance_name())
+    if not guard.acquire():
+        return 0  # another instance was woken; exit before creating a second tray icon
     bridge = Bridge()
     engine = QQmlApplicationEngine()
     egress_guard = install_egress_guard(engine)  # noqa: F841 - kept alive with the engine
@@ -280,8 +413,19 @@ def main(argv: list[str] | None = None) -> int:
         app.quit()
 
     window.closing.connect(on_closing)
+
+    def wake() -> None:
+        if tray is not None:
+            tray.show_window()
+        else:
+            window.show()
+            window.raise_()
+            window.requestActivate()
+
+    guard.on_activate = wake
     bridge.checkConnection()
     code = app.exec()
+    guard.close()
     bridge.shutdown()  # idempotent; guarantees no worker thread outlives exec()
     engine.deleteLater()
     return int(code)

@@ -19,6 +19,9 @@ if [ "$(id -u)" -eq 0 ]; then
     exit 1
 fi
 
+echo "==> Terminating running strand-gui instances..."
+pkill -u "$USER" -f "strand-gui" 2>/dev/null || true
+
 info "Stopping systemd user service"
 systemctl --user stop strand 2>/dev/null || true
 systemctl --user disable strand 2>/dev/null || true

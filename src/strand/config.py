@@ -60,6 +60,7 @@ ENV_VARS = {
     "workspace_roots": "STRAND_WORKSPACE_ROOTS",
     "tools_enabled": "STRAND_TOOLS_ENABLED",
     "enable_host_telemetry": "STRAND_ENABLE_HOST_TELEMETRY",
+    "web_search_enabled": "STRAND_WEB_SEARCH_ENABLED",
 }
 
 
@@ -147,6 +148,8 @@ class Config:
     enable_host_telemetry: bool = False
     # SEC-PRIV-007: scrub secrets from tool output before it is sent upstream (config.json key).
     redact_secrets: bool = True
+    # Ground Google Gemini upstream calls with native Google Search (results stay ephemeral).
+    web_search_enabled: bool = False
     # True when host or port came from the environment or config.json (forces TCP).
     tcp_explicit: bool = field(default=False, compare=False)
 
@@ -234,6 +237,7 @@ class Config:
             tools_enabled=_as_bool(pick("tools_enabled", True)),
             enable_host_telemetry=_as_bool(pick("enable_host_telemetry", False)),
             redact_secrets=_as_bool(file_values.get("redact_secrets", True)),
+            web_search_enabled=_as_bool(pick("web_search_enabled", False)),
             tcp_explicit=bool(pick("host", "") or pick("port", "")),
         )
 
@@ -289,7 +293,7 @@ def save_config_value(key: str, value: Any, config_path: Path | None = None) -> 
         "continuity_horizon_days",
     ):
         value = float(value)
-    elif key in ("decay_enabled", "tools_enabled", "enable_host_telemetry"):
+    elif key in ("decay_enabled", "tools_enabled", "enable_host_telemetry", "web_search_enabled"):
         value = _as_bool(value)
     elif key == "workspace_roots":
         value = _as_roots(value)

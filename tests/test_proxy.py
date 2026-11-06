@@ -18,7 +18,7 @@ def run(coro):
 
 
 @asynccontextmanager
-async def proxy_client(db_path, upstream_handler):
+async def proxy_client(db_path, upstream_handler, **config_kwargs):
     """Yield (client, seen_upstream_requests); ASGITransport skips lifespan, so manage the DB here."""
     seen: list[httpx.Request] = []
 
@@ -30,7 +30,8 @@ async def proxy_client(db_path, upstream_handler):
     async with DatabaseManager(db_path) as db:
         await db.upsert_entity("Marcus", "person", "Staff engineer")
         resolver = ContextResolver(db, SessionLedger())
-        config = Config(upstream_url="http://upstream.test/v1", upstream_api_key="sk-test")
+        config_kwargs.setdefault("upstream_url", "http://upstream.test/v1")
+        config = Config(upstream_api_key="sk-test", **config_kwargs)
         app = create_app(config, resolver, upstream)
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://strand") as client:
@@ -271,103 +272,21 @@ async def _post_chat(client, text, headers=None, history=()):
     return await client.post("/v1/chat/completions", json={"messages": messages, "session_id": "s"}, headers=headers or {})
 
 
-def _onboard_scenario(tmp_path, monkeypatch, persons, headers=None, text="hello there"):
-    import strand.proxy as proxy_mod
-
-    monkeypatch.setattr(proxy_mod, "get_host_context", lambda: dict(HOST))
-
+def test_fresh_session_has_no_onboarding_directive(tmp_path):
     async def scenario():
         seen: list[httpx.Request] = []
         upstream = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: (seen.append(r), ok_json(r))[1]))
         async with DatabaseManager(tmp_path / "m.db") as db:
-            for name, origin in persons:
-                await db.upsert_entity(name, "person", "x", origin=origin, confidence=1.0 if origin == "user_explicit" else 0.6)
             app = create_app(Config(upstream_url="http://upstream.test/v1"), ContextResolver(db, SessionLedger()), upstream)
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://strand") as client:
-                await _post_chat(client, text, headers)
+                await _post_chat(client, "hello there", {"X-Strand-Mode": "onboarding"})
                 await asyncio.gather(*app.state.background_tasks)
             await upstream.aclose()
         return _systems(seen)
 
-    return run(scenario())
-
-
-def test_day_zero_triggers_without_user_explicit_person(tmp_path, monkeypatch):
-    (system,) = _onboard_scenario(tmp_path, monkeypatch, [("Inferred Ian", "model_inferred")])
-    assert "[Onboarding Directive" in system
-    assert "Intent Triage" not in system
-
-
-def test_day_zero_does_not_trigger_with_user_explicit_person(tmp_path, monkeypatch):
-    (system,) = _onboard_scenario(tmp_path, monkeypatch, [("Alice", "user_explicit")], text="Tell me about Alice")
-    assert "[Onboarding Directive" not in system
-
-
-def test_graduated_database_boots_new_sessions_without_onboarding(tmp_path, monkeypatch):
-    import strand.proxy as proxy_mod
-
-    monkeypatch.setattr(proxy_mod, "get_host_context", lambda: dict(HOST))
-
-    async def scenario():
-        seen: list[httpx.Request] = []
-        upstream = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: (seen.append(r), ok_json(r))[1]))
-        async with DatabaseManager(tmp_path / "m.db") as db:
-            alice = await db.upsert_entity("Alice", "person", "x", origin="user_explicit", confidence=1.0)
-            pref = await db.upsert_entity("Host Telemetry On-Demand", "preference", "x")
-            await db.upsert_edge(alice, pref, "prefers")
-            app = create_app(Config(upstream_url="http://upstream.test/v1"), ContextResolver(db, SessionLedger()), upstream)
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://strand") as client:
-                await _post_chat(client, "hello there")
-                await _post_chat(client, "fix the bug in foo.py", headers={"X-Strand-Mode": "onboarding"})
-                await asyncio.gather(*app.state.background_tasks)
-            await upstream.aclose()
-        return _systems(seen)
-
-    ambient, explicit = run(scenario())
-    assert "[Onboarding Directive" not in ambient
-    assert "Hi, I'm Strand" not in ambient
-    assert "TASK-YIELD CONSTRAINT" not in ambient
-    assert "Intent Triage" in explicit  # explicit /onboard still works
-
-
-def test_directive_envelope_has_task_yield_and_question_budget(tmp_path, monkeypatch):
-    (system,) = _onboard_scenario(tmp_path, monkeypatch, [])
-    assert "TASK-YIELD CONSTRAINT" in system
-    assert "Default question budget = 0." in system
-
-
-def test_turn_one_directive_forces_name_question_and_softens_user_fallback(tmp_path, monkeypatch):
-    (system,) = _onboard_scenario(tmp_path, monkeypatch, [])
-    assert "Hi, I'm Strand. What should I call you?" in system
-    assert "Do not reflexively default to the local account username ($USER)" in system
-    assert "if the operator is coy, deflects, or expresses indifference" in system
-    assert "Ask for their preferred name rather than assuming the Linux account name" in system
-    assert "host workstation-01" in system  # specs stay ambient
-
-
-def test_later_turn_directive_covers_greeting_hostname_and_mission(tmp_path, monkeypatch):
-    from strand.onboarding import onboarding_directive
-
-    text = onboarding_directive(HOST, first_turn=False)
-    assert "running locally on workstation-01" in text
-    assert "In 1-2 plain sentences, explain what you do" in text
-    assert "you keep memory and context locally on this computer" in text
-    assert "strip out sensitive info before anything goes out" in text
-    assert "mission" not in text.lower()
-    assert "sovereign" not in text.lower()
-    assert "What should I call you?" not in text
-
-
-def test_onboard_on_existing_database_triggers_intent_triage(tmp_path, monkeypatch):
-    (system,) = _onboard_scenario(
-        tmp_path, monkeypatch, [("Alice", "user_explicit")], headers={"X-Strand-Mode": "onboarding"}
-    )
-    assert "Intent Triage" in system
-    assert "1. Update their name/identity." in system
-    assert "2. Recalibrate communication directives, tone, and formatting." in system
-    assert "3. Re-run the full onboarding dialogue." in system
-    assert "handled in Settings" in system
-    assert "What should I call you?" not in system
+    (system,) = run(scenario())
+    for text in ("Onboarding Directive", "What should I call you?", "TASK-YIELD", "Intent Triage"):
+        assert text not in system
 
 
 def _model_b_operator(request):
@@ -392,14 +311,12 @@ def _model_b_operator(request):
     )
 
 
-def test_model_b_operator_completes_day_zero_and_folds_generic_user(tmp_path, monkeypatch):
+def test_model_b_operator_folds_generic_user(tmp_path, monkeypatch):
     import strand.extractors as ex
-    import strand.proxy as proxy_mod
     from strand.distill import DistillationEngine
     from strand.extractors import LLMExtractor
     from strand.onboarding import count_operators
 
-    monkeypatch.setattr(proxy_mod, "get_host_context", lambda: dict(HOST))
     monkeypatch.setattr(ex, "get_host_context", lambda: dict(HOST))
 
     async def scenario():
@@ -419,8 +336,8 @@ def test_model_b_operator_completes_day_zero_and_folds_generic_user(tmp_path, mo
             )
             history = [
                 {"role": "user", "content": "hello there"},
-                {"role": "assistant", "content": "Hi, I'm Strand. What should I call you?"},
-                {"role": "user", "content": "Alicia is fine"},
+                {"role": "assistant", "content": "Hello."},
+                {"role": "user", "content": "Call me Alice"},
             ]
             before = await count_operators(db)
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://strand") as client:
@@ -463,55 +380,6 @@ FULL_HOST = {
 SPEC_TOKENS = ("Fedora", "Test CPU 9000X", "32 GB", "KDE", "wayland")
 
 
-def _telemetry_system(tmp_path, monkeypatch, config=None, headers=None):
-    import strand.proxy as proxy_mod
-
-    monkeypatch.setattr(proxy_mod, "get_host_context", lambda: dict(FULL_HOST))
-    config = config or Config(upstream_url="http://upstream.test/v1")
-
-    async def scenario():
-        seen: list[httpx.Request] = []
-        upstream = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: (seen.append(r), ok_json(r))[1]))
-        async with DatabaseManager(tmp_path / "m.db") as db:
-            app = create_app(config, ContextResolver(db, SessionLedger()), upstream)
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://strand") as client:
-                for hdrs in headers or [{}]:
-                    await _post_chat(client, "hello there", hdrs)
-                await asyncio.gather(*app.state.background_tasks)
-            await upstream.aclose()
-        return _systems(seen)
-
-    return run(scenario())
-
-
-def test_host_telemetry_off_omits_specs_but_keeps_hostname(tmp_path, monkeypatch):
-    (system,) = _telemetry_system(tmp_path, monkeypatch)
-    assert "[Onboarding Directive" in system
-    assert "host workstation-01" in system
-    for token in SPEC_TOKENS:
-        assert token not in system
-    assert "CPU" not in system and "RAM" not in system
-
-
-def test_host_telemetry_config_true_injects_full_specs(tmp_path, monkeypatch):
-    config = Config(upstream_url="http://upstream.test/v1", enable_host_telemetry=True)
-    (system,) = _telemetry_system(tmp_path, monkeypatch, config=config)
-    for token in SPEC_TOKENS:
-        assert token in system
-    assert "host workstation-01" in system
-
-
-def test_host_telemetry_session_override_activates_mid_session(tmp_path, monkeypatch):
-    first, second, third = _telemetry_system(
-        tmp_path,
-        monkeypatch,
-        headers=[{}, {"X-Strand-Host-Telemetry": "true"}, {}],
-    )
-    assert "Test CPU 9000X" not in first
-    assert "Test CPU 9000X" in second and "Fedora Linux 44" in second
-    assert "Test CPU 9000X" in third  # the override persists for the session
-
-
 def test_session_ledger_host_telemetry_override_is_per_session_and_reset():
     ledger = SessionLedger()
     assert ledger.allow_host_telemetry("a") is False
@@ -523,74 +391,6 @@ def test_session_ledger_host_telemetry_override_is_per_session_and_reset():
     ledger.set_allow_host_telemetry("a", True)
     ledger.reset("a")
     assert ledger.allow_host_telemetry("a") is False
-
-
-def _telemetry_choice_scenario(tmp_path, monkeypatch, target):
-    """Onboarding session where Model B distills a hardware choice; then one more turn."""
-    import strand.proxy as proxy_mod
-    from strand.distill import DistillationEngine
-    from strand.extractors import LLMExtractor
-
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(proxy_mod, "get_host_context", lambda: dict(FULL_HOST))
-    payload = {
-        "entities": [
-            {"name": "Alice", "archetype": "person", "summary": "Operator", "origin": "user_explicit"},
-            {"name": target, "archetype": "preference", "summary": "Hardware telemetry stance"},
-        ],
-        "edges": [{"source": "Alice", "target": target, "relation": "prefers"}],
-    }
-
-    async def scenario():
-        seen: list[httpx.Request] = []
-        answer = httpx.Response(
-            200, json={"choices": [{"message": {"role": "assistant", "content": "Understood, tuning the rig settings now."}}]}
-        )
-        upstream = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: (seen.append(r), answer)[1]))
-        slm = httpx.AsyncClient(
-            transport=httpx.MockTransport(
-                lambda r: httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
-            )
-        )
-        ledger = SessionLedger()
-        async with DatabaseManager(tmp_path / "m.db") as db:
-            engine = DistillationEngine(db, extractor=LLMExtractor("http://slm.test/v1", "tiny", client=slm))
-            app = create_app(Config(upstream_url="http://upstream.test/v1"), ContextResolver(db, ledger), upstream, engine)
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://strand") as client:
-                history = [{"role": "user", "content": "Alice"}]
-                for text in ("Yeah, check it out", "anything else?"):
-                    history.append({"role": "user", "content": text})
-                    await client.post("/v1/chat/completions", json={"messages": list(history), "session_id": "s"})
-                    await asyncio.gather(*app.state.background_tasks)
-            await upstream.aclose()
-            await slm.aclose()
-        return seen, ledger
-
-    seen, ledger = run(scenario())
-    config_path = tmp_path / ".config" / "strand" / "config.json"
-    return _systems(seen), ledger, config_path
-
-
-def test_conversational_hardware_opt_in_activates_session_and_persists(tmp_path, monkeypatch):
-    systems, ledger, config_path = _telemetry_choice_scenario(tmp_path, monkeypatch, "Host Telemetry Enabled")
-    assert "Test CPU 9000X" not in systems[0]  # Turn 1/2: no eager hardware dump
-    assert ledger.allow_host_telemetry("s") is True
-    assert "Test CPU 9000X" in systems[1] and "32 GB" in systems[1]  # very next turn carries specs
-    assert json.loads(config_path.read_text()) == {"enable_host_telemetry": True}
-    assert config_path.stat().st_mode & 0o777 == 0o600
-
-
-def test_conversational_hardware_decline_keeps_specs_redacted_and_persists_false(tmp_path, monkeypatch):
-    systems, ledger, config_path = _telemetry_choice_scenario(tmp_path, monkeypatch, "Host Telemetry On-Demand")
-    assert ledger.allow_host_telemetry("s") is False
-    assert all("Test CPU 9000X" not in s for s in systems)
-    assert json.loads(config_path.read_text()) == {"enable_host_telemetry": False}
-
-
-def test_no_telemetry_edge_writes_no_config(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    _telemetry_system(tmp_path, monkeypatch)
-    assert not (tmp_path / ".config" / "strand" / "config.json").exists()
 
 
 def test_upstream_failure_masks_url_credentials_in_response_and_log(tmp_path, caplog):
@@ -617,3 +417,108 @@ def test_upstream_failure_masks_url_credentials_in_response_and_log(tmp_path, ca
     assert response.status_code == 502
     assert "hunter2" not in response.text and "hunter2" not in caplog.text
     assert "user:********@up.test" in response.json()["error"]["message"]
+
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+def _post_with_search(tmp_path, tools_enabled=True, body_extra=None, **config_kwargs):
+    async def scenario():
+        async with proxy_client(tmp_path / "m.db", ok_json, tools_enabled=tools_enabled, **config_kwargs) as (client, seen):
+            body = {"messages": [{"role": "user", "content": "hello"}], **(body_extra or {})}
+            await client.post("/v1/chat/completions", json=body)
+            return seen
+
+    (request,) = run(scenario())
+    return body_of(request)
+
+
+GS = {"google_search": {}}
+
+
+def test_web_search_adds_top_level_google_search_for_gemini(tmp_path):
+    payload = _post_with_search(tmp_path, upstream_url=GEMINI_URL, web_search_enabled=True)
+    assert payload["tools"] == [GS]  # no function tools: Gemini rejects the mix
+    assert "extra_body" not in payload  # Gemini rejects a literal extra_body field
+
+
+def test_web_search_disabled_on_gemini_keeps_workspace_tools(tmp_path):
+    payload = _post_with_search(tmp_path, upstream_url=GEMINI_URL, web_search_enabled=False)
+    assert "extra_body" not in payload
+    names = {t["function"]["name"] for t in payload["tools"]}
+    assert {"list_directory", "read_file"} <= names
+
+
+def test_web_search_keeps_client_tools_clean_and_no_duplicates(tmp_path):
+    client_tool = {"type": "function", "function": {"name": "mine", "parameters": {}}}
+    payload = _post_with_search(
+        tmp_path,
+        tools_enabled=False,
+        body_extra={"tools": [client_tool, {"type": "google_search"}], "extra_body": {"tools": [GS], "other": 1}},
+        upstream_url=GEMINI_URL,
+        web_search_enabled=True,
+    )
+    assert payload["tools"] == [client_tool, GS]
+    assert payload["extra_body"] == {"other": 1}
+
+
+def test_web_search_only_search_tool_when_workspace_tools_disabled(tmp_path):
+    payload = _post_with_search(tmp_path, tools_enabled=False, upstream_url=GEMINI_URL, web_search_enabled=True)
+    assert payload["tools"] == [GS]
+    assert "extra_body" not in payload
+
+
+def test_web_search_disabled_omits_google_search(tmp_path):
+    payload = _post_with_search(
+        tmp_path,
+        body_extra={"extra_body": {"tools": [GS]}},
+        upstream_url=GEMINI_URL,
+        web_search_enabled=False,
+    )
+    assert "extra_body" not in payload
+    assert all("google_search" not in t for t in payload.get("tools", []))
+
+
+def test_web_search_not_added_for_non_google_upstream(tmp_path):
+    payload = _post_with_search(tmp_path, web_search_enabled=True)
+    assert all("google_search" not in t for t in payload.get("tools", []))
+    assert "extra_body" not in payload
+    payload = _post_with_search(
+        tmp_path, upstream_url="https://evil.test/generativelanguage.googleapis.com/v1", web_search_enabled=True
+    )
+    assert all("google_search" not in t for t in payload.get("tools", []))
+
+
+def test_config_file_toggles_apply_to_subsequent_requests(tmp_path):
+    cfg_path = tmp_path / "config.json"
+
+    async def scenario():
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return ok_json(request)
+
+        upstream = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            resolver = ContextResolver(db, SessionLedger())
+            config = Config(upstream_api_key="sk-test", upstream_url=GEMINI_URL)
+            app = create_app(config, resolver, upstream, config_path=cfg_path)
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://strand") as client:
+                body = {"messages": [{"role": "user", "content": "hello"}]}
+                await client.post("/v1/chat/completions", json=body)  # no file: boot config
+                cfg_path.write_text(json.dumps({"web_search_enabled": True}))
+                await client.post("/v1/chat/completions", json=body)
+                cfg_path.write_text(json.dumps({"web_search_enabled": False, "tools_enabled": False}))
+                await client.post("/v1/chat/completions", json=body)
+                cfg_path.write_text("{not json")
+                await client.post("/v1/chat/completions", json=body)  # bad file keeps last good
+            await upstream.aclose()
+        return [body_of(r) for r in seen]
+
+    first, second, third, fourth = run(scenario())
+    assert "extra_body" not in first and first["tools"]
+    assert second["tools"] == [GS] and "extra_body" not in second
+    assert "extra_body" not in third and "tools" not in third
+    assert "extra_body" not in fourth and "tools" not in fourth

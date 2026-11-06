@@ -203,14 +203,12 @@ def test_name_heuristics_are_gone():
         assert not hasattr(ex, attr), attr
 
 
-def test_system_prompt_delegates_name_semantics_to_model_b():
+def test_system_prompt_has_no_onboarding_name_instructions():
     from strand.extractors import SYSTEM_PROMPT
 
-    assert "What should I call you?" in SYSTEM_PROMPT
-    for variant in ("'Alice'", "'Just Alice'", "'Alice works'", "'Alicia is fine'"):
-        assert variant in SYSTEM_PROMPT, variant
-    assert 'archetype "person", origin "user_explicit" and confidence 1.0' in SYSTEM_PROMPT
-    assert "(<Declared Name>) --[operates_host]--> (<Hostname>)" in SYSTEM_PROMPT
+    for text in ("What should I call you?", "Call me Alice", "Just Alice", "onboarding", "Operator identity"):
+        assert text not in SYSTEM_PROMPT, text
+    assert "Host telemetry preference" in SYSTEM_PROMPT
 
 
 def test_model_b_operator_persists_and_reanchors_generic_user(tmp_path, monkeypatch):

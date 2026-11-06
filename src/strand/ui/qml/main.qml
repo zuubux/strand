@@ -1,12 +1,13 @@
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Dialogs
 
 ApplicationWindow {
     id: root
     visible: true
-    width: 760
-    height: 640
+    width: 780
+    height: 1020
     minimumWidth: 420
     minimumHeight: 360
     title: "Strand"
@@ -257,6 +258,12 @@ ApplicationWindow {
     property var welcomeModels: []
     property bool welcomeProbed: false
     property string welcomeError: ""
+    // Setup wizard: step 1 Welcome, 2 Engine, 3 Identity, 4 Workspace roots.
+    property int wizardStep: 1
+    property string wizardName: bridge && bridge.operatorName ? bridge.operatorName : "Operator"
+    property bool wizardTelemetry: bridge ? bridge.hostTelemetryDefault : false
+    property var wizardRoots: bridge ? bridge.workspaceRoots : ["~/Projects"]
+    property bool wizardBusy: false
     property string extractorMessage: ""
     property bool extractorOk: false
     property string routingMessage: ""
@@ -421,28 +428,75 @@ ApplicationWindow {
         welcomeModelBox.editText = welcomeModel
     }
 
-    // Welcome Card: persist the chosen engine, fade the card out, then start Day Zero onboarding.
-    function connectEngine() {
-        welcomeError = ""
+    function wizardCanAdvanceEngine() {
         var local = welcomePreset.provider === "ollama"
         var model = (welcomeModelBox.editText || welcomeModel).trim()
-        var ok = bridge.configureEngine(welcomePreset.provider, local ? "" : welcomeKeyEdit.text, model, welcomeEndpoint())
-        if (!ok) {
-            welcomeError = local ? "No local Ollama model found at http://127.0.0.1:11434."
-                : welcomePreset.custom ? "Enter a valid endpoint URL, API key and model name."
-                : "Enter a valid API key and model name."
+        if (!local && welcomeKeyEdit.text.trim().length === 0) {
+            welcomeError = "Enter an API key to continue."
+            return false
+        }
+        if (welcomePreset.custom && welcomeEndpointEdit.text.trim().length === 0) {
+            welcomeError = "Enter an endpoint URL to continue."
+            return false
+        }
+        if (!local && model.length === 0) {
+            welcomeError = "Enter a model name to continue."
+            return false
+        }
+        welcomeError = ""
+        return true
+    }
+
+    function wizardNext() {
+        if (wizardStep === 2 && !wizardCanAdvanceEngine())
+            return
+        welcomeError = ""
+        if (wizardStep < 4)
+            wizardStep += 1
+    }
+
+    function wizardBack() {
+        welcomeError = ""
+        if (wizardStep > 1)
+            wizardStep -= 1
+    }
+
+    function addWizardRoot(path) {
+        if (path.length === 0 || wizardRoots.indexOf(path) >= 0)
+            return
+        wizardRoots = wizardRoots.concat([path])
+    }
+
+    function removeWizardRoot(index) {
+        var copy = wizardRoots.slice()
+        copy.splice(index, 1)
+        wizardRoots = copy
+    }
+
+    // Finish & Anchor: one atomic save (engine, name, telemetry, roots), operator anchor, drop-in.
+    function finishSetup() {
+        welcomeError = ""
+        var local = welcomePreset.provider === "ollama"
+        var result = bridge.completeSetup({
+            provider: welcomePreset.provider,
+            api_key: local ? "" : welcomeKeyEdit.text,
+            model: (welcomeModelBox.editText || welcomeModel).trim(),
+            endpoint_url: welcomeEndpoint(),
+            operator: wizardName.trim(),
+            telemetry: wizardTelemetry,
+            roots: wizardRoots
+        })
+        if (!result.ok) {
+            welcomeError = result.error
+            if (result.step)
+                wizardStep = result.step
             return false
         }
         welcomeKeyEdit.text = ""
         welcomeDismissed = true
-        beginOnboarding()
+        transcript.append({ role: "assistant", body: result.ready, pending: false, trail: "", mutations: "" })
+        Qt.callLater(function() { input.forceActiveFocus() })
         return true
-    }
-
-    function beginOnboarding() {
-        var feedback = bridge.runCommand("/onboard")
-        if (feedback.length > 0 && bridge.busy)
-            transcript.append({ role: "assistant", body: "", pending: true, trail: "", mutations: "" })
     }
 
     function closeSettings() {
@@ -519,8 +573,6 @@ ApplicationWindow {
             if (feedback.length > 0) {
                 input.text = ""
                 note(feedback)
-                if (bridge.busy)  // /onboard: Strand opens, so show its streaming reply
-                    transcript.append({ role: "assistant", body: "", pending: true, trail: "", mutations: "" })
                 return
             }
         }
@@ -599,8 +651,12 @@ ApplicationWindow {
             id: pb
             readonly property real hPad: 14
             readonly property real vPad: 10
+            readonly property real minBubbleWidth: 56
+            readonly property real maxBubbleWidth: parent ? parent.width : 0
+            // Natural unwrapped text width (+ padding); `prose` wraps to pb.width, so only the
+            // invisible no-wrap `measure` twin feeds the width (one-way, no binding loop).
             readonly property real natural: Math.ceil(measure.implicitWidth) + 2 * hPad + 2
-            width: Math.min(natural, parent ? parent.width : natural)
+            width: Math.min(maxBubbleWidth, Math.max(minBubbleWidth, natural))
             implicitWidth: width
             implicitHeight: prose.implicitHeight + 2 * vPad
             height: implicitHeight
@@ -788,7 +844,8 @@ ApplicationWindow {
             clip: true
             spacing: 0
             topMargin: 14
-            bottomMargin: 14
+            // Headroom: last bubble rests clear of the floating input dock.
+            bottomMargin: dock.height + 32
             boundsBehavior: Flickable.StopAtBounds
             ScrollBar.vertical: ScrollBar { }
 
@@ -807,7 +864,7 @@ ApplicationWindow {
             }
 
             // Asymmetric turn geometry: the user is a compact, recessed, right-aligned card;
-            // Strand is a left-aligned slate card (max 85% / 820px); notes are dim local asides.
+            // Strand is a left-aligned slate card (max 80% / 760px; prose hugs its text, code spans the flow); notes are dim local asides.
             delegate: Item {
                 id: row
                 required property string role
@@ -820,13 +877,17 @@ ApplicationWindow {
                 // Turn hierarchy: the first row of a speaker group carries an identity header and a
                 // wide gap above it (30px); rows continuing a turn sit tight (6px).
                 readonly property string prevRole: index > 0 ? transcript.get(index - 1).role : ""
-                readonly property bool showHeader: (isUser || role === "assistant") && prevRole !== role
+                // A finished assistant turn with no text (tool iteration limit) gets a dim notice
+                // instead of an empty card or an orphan speaker header.
+                readonly property bool emptyTurn: role === "assistant" && !pending && body.trim().length === 0
+                readonly property string emptyNotice: "Unable to complete request within tool iteration limits."
+                readonly property bool showHeader: (isUser || role === "assistant") && !emptyTurn && prevRole !== role
                 readonly property real headerHeight: showHeader ? 24 : 0
                 readonly property real topGap: index === 0 ? 0 : (prevRole === role ? 6 : (role === "note" || prevRole === "note" ? 12 : 30))
                 readonly property real bodyTop: topGap + headerHeight
                 // Assistant answers flow as bubbles + canvas payloads; the thinking pill, user
                 // cards and notes keep the single bubble.
-                readonly property bool flowMode: role === "assistant" && !(pending && body.length === 0)
+                readonly property bool flowMode: role === "assistant" && !emptyTurn && !(pending && body.length === 0)
                 width: list.width
                 height: bodyTop + (flowMode ? flow.height : bubble.height)
 
@@ -881,21 +942,21 @@ ApplicationWindow {
                     id: bubble
                     objectName: "bubble"
                     visible: !row.flowMode
-                    readonly property bool isNote: row.role === "note"
+                    readonly property bool isNote: row.role === "note" || row.emptyTurn
                     // One-way geometry: bubble.width derives only from row.width and text metrics,
                     // never from `content` (which wraps to bubble.width), so there are no layout loops.
                     readonly property bool isThinking: row.pending && row.body.length === 0
                     readonly property bool isAssistant: row.role === "assistant"
-                    readonly property bool boxed: row.isUser || isAssistant
+                    readonly property bool boxed: row.isUser || (isAssistant && !row.emptyTurn)
                     readonly property real hPad: boxed ? root.bodyPixelSize : 0
                     readonly property real vPad: boxed ? Math.round(root.bodyPixelSize * 0.7) : 2
                     readonly property real edge: Math.round(root.bodyPixelSize * 8 / 7)
                     readonly property real maxWidth: row.isUser ? row.width * 0.72
-                        : (isAssistant ? Math.min(row.width * 0.85, 820, row.width - 2 * edge) : row.width - 2 * edge)
+                        : (isAssistant ? Math.min(row.width * 0.80, 760, row.width - 2 * edge) : row.width - 2 * edge)
                     TextMetrics {
                         id: textMetrics
                         font.pixelSize: root.bodyPixelSize
-                        text: (bubble.isThinking ? "\u2026" : row.body)
+                        text: (bubble.isThinking ? "\u2026" : (row.emptyTurn ? row.emptyNotice : row.body))
                     }
                     readonly property real naturalWidth: (isThinking ? 24 : Math.ceil(textMetrics.advanceWidth)) + 2 * hPad + 2
                     x: row.isUser ? row.width - width - edge : edge
@@ -932,7 +993,7 @@ ApplicationWindow {
                             selectByMouse: true
                             wrapMode: TextEdit.Wrap
                             textFormat: TextEdit.PlainText
-                            text: row.body
+                            text: row.emptyTurn ? row.emptyNotice : row.body
                             color: bubble.isNote ? root.dim : root.textColor
                             font.family: root.userFamily
                             font.italic: bubble.isNote
@@ -1091,6 +1152,11 @@ ApplicationWindow {
                 // Tracks the wrapped text height: one line (44) up to 180, then scrolls inside.
                 height: Math.min(Math.max(input.contentHeight + verticalPadding, 44), 180)
                 radius: 14
+                // First-run: hidden and inert until setup completes, then fades in.
+                visible: bridge ? bridge.isConfigured : false
+                enabled: bridge ? (bridge.isConfigured && !bridge.busy) : false
+                opacity: visible ? 1 : 0
+                Behavior on opacity { NumberAnimation { duration: 220; easing.type: Easing.OutQuad } }
                 color: theme.dockSurface
                 border.width: 1
                 border.color: dropArea.containsDrag ? Qt.rgba(0.220, 0.741, 0.973, 0.3)
@@ -1125,7 +1191,9 @@ ApplicationWindow {
                         // once typing starts the full dock width is available, so no phantom wall
                         // forces a premature wrap (BUG-UI-001).
                         rightPadding: text.length > 0 ? 14 : modelWatermark.width + 20
-                        enabled: bridge ? !bridge.busy : false
+                        enabled: bridge ? (bridge.isConfigured && !bridge.busy) : false
+                        focus: false
+                        activeFocusOnTab: bridge ? bridge.isConfigured : false
                         onTextChanged: if (text.length === 0) root.browsingHistory = false
                         background: null
 
@@ -1266,20 +1334,9 @@ ApplicationWindow {
                     Behavior on color { ColorAnimation { duration: 120 } }
                     Label {
                         anchors.centerIn: parent
-                        visible: !weaveGlyph.visible
                         text: "\u223F"
                         color: root.drawerOpen ? root.accent : root.dim
                         font.pixelSize: 14
-                    }
-                    // Mirrors the conduit state (busy / Model B weaving) with a subtle pulse.
-                    ConduitGlyph {
-                        id: weaveGlyph
-                        objectName: "weaveGlyph"
-                        anchors.centerIn: parent
-                        width: 18
-                        height: 18
-                        visible: bridge ? (bridge.busy || bridge.distilling) : false
-                        opacity: 0.8
                     }
                     MouseArea {
                         id: telemetryButtonMouse
@@ -1482,17 +1539,53 @@ ApplicationWindow {
         }
     }
 
-    // First-run Welcome Card: centered over the chat view until an engine is connected.
+    // First-run setup wizard: four plates (Welcome, Engine, Identity, Workspace), centered until finished.
+    component WizardButton: Rectangle {
+        id: wb
+        property string label: ""
+        property bool primary: true
+        signal clicked()
+        implicitHeight: 40
+        implicitWidth: wbText.implicitWidth + 36
+        radius: 8
+        color: primary ? (wbMouse.containsMouse ? Qt.lighter(theme.accent, 1.1) : theme.accent)
+                       : (wbMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : "transparent")
+        border.color: primary ? "transparent" : root.codeBorder
+        border.width: 1
+        Behavior on color { ColorAnimation { duration: 120 } }
+        Label {
+            id: wbText
+            anchors.centerIn: parent
+            text: wb.label
+            color: wb.primary ? "#0b0e12" : root.textColor
+            font.pixelSize: 14
+            font.weight: Font.DemiBold
+        }
+        MouseArea {
+            id: wbMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: wb.clicked()
+        }
+    }
+
+    FolderDialog {
+        id: wizardFolderDialog
+        title: "Add a workspace folder"
+        onAccepted: root.addWizardRoot(bridge.folderPath(selectedFolder.toString()))
+    }
+
     Rectangle {
         id: welcomeCard
         objectName: "welcomeCard"
         z: 90
         anchors.centerIn: parent
-        width: Math.min(parent.width - 64, 460)
-        height: welcomeColumn.implicitHeight + 48
+        width: Math.min(parent.width - 48, 680)
+        height: welcomeColumn.implicitHeight + 72
         radius: 16
-        color: Qt.rgba(root.panel.r, root.panel.g, root.panel.b, 0.97)
-        border.color: Qt.rgba(1, 1, 1, 0.10)
+        color: theme.cardSurface
+        border.color: Qt.rgba(1, 1, 1, 0.08)
         border.width: 1
         opacity: root.welcomeActive ? 1 : 0
         visible: opacity > 0
@@ -1503,106 +1596,301 @@ ApplicationWindow {
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.top: parent.top
-            anchors.margins: 24
-            spacing: 12
+            anchors.margins: 36
+            spacing: 14
 
             Label {
-                text: "Welcome to Strand"
-                color: root.textColor
-                font.pixelSize: 22
-                font.weight: Font.DemiBold
-                Layout.alignment: Qt.AlignHCenter
-            }
-            Label {
-                text: "Connect an inference engine to begin our onboarding conversation."
-                color: root.dim
-                font.pixelSize: 13
-                wrapMode: Text.WordWrap
-                horizontalAlignment: Text.AlignHCenter
-                Layout.fillWidth: true
-            }
-
-            ComboBox {
-                id: welcomeProviderBox
-                objectName: "welcomeProviderBox"
-                Layout.fillWidth: true
-                model: root.welcomePresets
-                textRole: "label"
-                currentIndex: 0
-                font.pixelSize: 13
-                onActivated: root.selectWelcomeProvider(currentIndex)
-            }
-
-            TextField {
-                id: welcomeEndpointEdit
-                objectName: "welcomeEndpointEdit"
-                visible: root.welcomePreset.custom === true
-                Layout.fillWidth: true
-                placeholderText: "Endpoint URL (e.g. http://127.0.0.1:8000/v1)"
-                color: root.textColor
-                selectionColor: root.accent
-                font.family: root.monoFamily
-                font.pixelSize: 12
-                leftPadding: 10
-                rightPadding: 10
-                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
-                onTextChanged: root.scheduleWelcomeProbe()
-                onAccepted: root.connectEngine()
-            }
-
-            TextField {
-                id: welcomeKeyEdit
-                objectName: "welcomeKeyEdit"
-                visible: root.welcomePreset.provider !== "ollama"
-                Layout.fillWidth: true
-                echoMode: TextInput.Password
-                placeholderText: "API key"
-                color: root.textColor
-                selectionColor: root.accent
-                font.family: root.monoFamily
-                font.pixelSize: 12
-                leftPadding: 10
-                rightPadding: 10
-                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
-                onTextChanged: root.scheduleWelcomeProbe()
-                onAccepted: root.connectEngine()
-            }
-
-            ComboBox {
-                id: welcomeModelBox
-                objectName: "welcomeModelBox"
-                Layout.fillWidth: true
-                editable: true
-                model: root.welcomeModels
-                font.family: root.monoFamily
-                font.pixelSize: 12
-                onActivated: root.welcomeModel = currentText
-                onEditTextChanged: if (activeFocus) root.welcomeModel = editText
-                Component.onCompleted: editText = root.welcomeModel
-            }
-
-            Label {
-                objectName: "welcomeProbeStatus"
-                visible: text.length > 0
-                text: !root.welcomeProbed ? ""
-                    : bridge.isProbingModels ? "Probing available models..."
-                    : bridge.probeStatus === "success" ? "\u2713 Found " + bridge.availableModels.length + " models"
-                    : bridge.probeStatus === "failed" ? "Could not auto-detect models (enter manually)"
-                    : ""
+                objectName: "wizardStepLabel"
+                visible: root.wizardStep > 1
+                text: "STEP " + root.wizardStep + " OF 4"
                 color: root.dim
                 font.pixelSize: 11
-                Layout.fillWidth: true
+                font.bold: true
+                font.letterSpacing: 1.2
             }
 
-            Timer {
-                id: welcomeProbeTimer
-                interval: 400
-                repeat: false
-                onTriggered: root.probeWelcomeModels()
+            // ---- Plate 1: Welcome ----
+            ColumnLayout {
+                id: plateWelcome
+                objectName: "wizardPlate1"
+                visible: root.wizardStep === 1
+                Layout.fillWidth: true
+                spacing: 14
+
+                Image {
+                    objectName: "wizardLogo"
+                    source: bridge ? bridge.logoUrl : ""
+                    sourceSize.width: 192
+                    sourceSize.height: 192
+                    Layout.preferredWidth: 96
+                    Layout.preferredHeight: 96
+                    Layout.alignment: Qt.AlignHCenter
+                    fillMode: Image.PreserveAspectFit
+                    smooth: true
+                    mipmap: true
+                }
+                Label {
+                    text: "Hi, I'm Strand."
+                    color: root.textColor
+                    font.pixelSize: 28
+                    font.weight: Font.DemiBold
+                    Layout.alignment: Qt.AlignHCenter
+                }
+                Label {
+                    text: "A local, private memory companion for your workstation."
+                    color: root.textColor
+                    font.pixelSize: 15
+                    wrapMode: Text.WordWrap
+                    horizontalAlignment: Text.AlignHCenter
+                    Layout.fillWidth: true
+                }
+                Label {
+                    text: "Let's set a few things up so we can get right to work."
+                    color: root.dim
+                    font.pixelSize: 13
+                    wrapMode: Text.WordWrap
+                    horizontalAlignment: Text.AlignHCenter
+                    Layout.fillWidth: true
+                }
+                WizardButton {
+                    objectName: "wizardStart"
+                    label: "Get Started \u2192"
+                    Layout.alignment: Qt.AlignHCenter
+                    Layout.topMargin: 10
+                    Layout.preferredWidth: 220
+                    onClicked: root.wizardNext()
+                }
             }
-            Connections {
-                target: bridge
-                function onAvailableModelsChanged() { root.applyWelcomeModels() }
+
+            // ---- Plate 2: Inference engine ----
+            ColumnLayout {
+                id: plateEngine
+                objectName: "wizardPlate2"
+                visible: root.wizardStep === 2
+                Layout.fillWidth: true
+                spacing: 12
+
+                Label {
+                    text: "Choose an inference engine"
+                    color: root.textColor
+                    font.pixelSize: 22
+                    font.weight: Font.DemiBold
+                }
+                Label {
+                    text: "Strand sends your prompts to this model. Local Ollama keeps everything on this machine."
+                    color: root.dim
+                    font.pixelSize: 13
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+
+                ComboBox {
+                    id: welcomeProviderBox
+                    objectName: "welcomeProviderBox"
+                    Layout.fillWidth: true
+                    model: root.welcomePresets
+                    textRole: "label"
+                    currentIndex: 0
+                    font.pixelSize: 13
+                    onActivated: root.selectWelcomeProvider(currentIndex)
+                }
+
+                TextField {
+                    id: welcomeEndpointEdit
+                    objectName: "welcomeEndpointEdit"
+                    visible: root.welcomePreset.custom === true
+                    Layout.fillWidth: true
+                    placeholderText: "Endpoint URL (e.g. http://127.0.0.1:8000/v1)"
+                    color: root.textColor
+                    selectionColor: root.accent
+                    font.family: root.monoFamily
+                    font.pixelSize: 12
+                    leftPadding: 10
+                    rightPadding: 10
+                    background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
+                    onTextChanged: root.scheduleWelcomeProbe()
+                    onAccepted: root.wizardNext()
+                }
+
+                TextField {
+                    id: welcomeKeyEdit
+                    objectName: "welcomeKeyEdit"
+                    visible: root.welcomePreset.provider !== "ollama"
+                    Layout.fillWidth: true
+                    echoMode: TextInput.Password
+                    placeholderText: "API key"
+                    color: root.textColor
+                    selectionColor: root.accent
+                    font.family: root.monoFamily
+                    font.pixelSize: 12
+                    leftPadding: 10
+                    rightPadding: 10
+                    background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
+                    onTextChanged: root.scheduleWelcomeProbe()
+                    onAccepted: root.wizardNext()
+                }
+
+                ComboBox {
+                    id: welcomeModelBox
+                    objectName: "welcomeModelBox"
+                    Layout.fillWidth: true
+                    editable: true
+                    model: root.welcomeModels
+                    font.family: root.monoFamily
+                    font.pixelSize: 12
+                    onActivated: root.welcomeModel = currentText
+                    onEditTextChanged: if (activeFocus) root.welcomeModel = editText
+                    Component.onCompleted: editText = root.welcomeModel
+                }
+
+                Label {
+                    objectName: "welcomeProbeStatus"
+                    visible: text.length > 0
+                    text: !root.welcomeProbed ? ""
+                        : bridge.isProbingModels ? "Probing available models..."
+                        : bridge.probeStatus === "success" ? "\u2713 Found " + bridge.availableModels.length + " models"
+                        : bridge.probeStatus === "failed" ? "Could not auto-detect models (enter manually)"
+                        : ""
+                    color: root.dim
+                    font.pixelSize: 11
+                    Layout.fillWidth: true
+                }
+
+                Timer {
+                    id: welcomeProbeTimer
+                    interval: 400
+                    repeat: false
+                    onTriggered: root.probeWelcomeModels()
+                }
+                Connections {
+                    target: bridge
+                    function onAvailableModelsChanged() { root.applyWelcomeModels() }
+                }
+            }
+
+            // ---- Plate 3: Operator identity & telemetry ----
+            ColumnLayout {
+                id: plateIdentity
+                objectName: "wizardPlate3"
+                visible: root.wizardStep === 3
+                Layout.fillWidth: true
+                spacing: 12
+
+                Label {
+                    text: "What should Strand call you?"
+                    color: root.textColor
+                    font.pixelSize: 22
+                    font.weight: Font.DemiBold
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+                TextField {
+                    id: wizardNameEdit
+                    objectName: "wizardNameEdit"
+                    Layout.fillWidth: true
+                    placeholderText: "Your name"
+                    color: root.textColor
+                    selectionColor: root.accent
+                    font.pixelSize: 14
+                    leftPadding: 10
+                    rightPadding: 10
+                    maximumLength: 64
+                    background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
+                    Component.onCompleted: text = root.wizardName
+                    onTextChanged: root.wizardName = text
+                    onAccepted: root.wizardNext()
+                }
+                CheckBox {
+                    id: wizardTelemetryBox
+                    objectName: "wizardTelemetryBox"
+                    text: "Share local hardware specs with model"
+                    checked: root.wizardTelemetry
+                    onToggled: root.wizardTelemetry = checked
+                    contentItem: Label {
+                        text: wizardTelemetryBox.text
+                        color: root.textColor
+                        font.pixelSize: 14
+                        leftPadding: wizardTelemetryBox.indicator.width + 8
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+                Label {
+                    text: "Off by default. When off, the model only sees your hostname, not your OS, CPU or RAM."
+                    color: root.dim
+                    font.pixelSize: 12
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+            }
+
+            // ---- Plate 4: Approved workspace roots ----
+            ColumnLayout {
+                id: plateRoots
+                objectName: "wizardPlate4"
+                visible: root.wizardStep === 4
+                Layout.fillWidth: true
+                spacing: 10
+
+                Label {
+                    text: "Where may Strand read?"
+                    color: root.textColor
+                    font.pixelSize: 22
+                    font.weight: Font.DemiBold
+                }
+                Label {
+                    text: "Strand only looks at files inside these folders, and only when you ask."
+                    color: root.dim
+                    font.pixelSize: 13
+                    wrapMode: Text.WordWrap
+                    Layout.fillWidth: true
+                }
+                Repeater {
+                    model: root.wizardRoots
+                    delegate: Rectangle {
+                        required property int index
+                        required property string modelData
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 38
+                        radius: 6
+                        color: theme.fieldSurface
+                        border.color: root.codeBorder
+                        border.width: 1
+                        RowLayout {
+                            anchors.fill: parent
+                            anchors.leftMargin: 10
+                            anchors.rightMargin: 6
+                            Label {
+                                Layout.fillWidth: true
+                                text: modelData
+                                elide: Text.ElideMiddle
+                                color: root.textColor
+                                font.family: root.monoFamily
+                                font.pixelSize: 12
+                            }
+                            Rectangle {
+                                objectName: "wizardRemoveRoot"
+                                Layout.preferredWidth: 26
+                                Layout.preferredHeight: 26
+                                radius: 13
+                                color: removeMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : "transparent"
+                                Label { anchors.centerIn: parent; text: "\u2715"; color: root.dim; font.pixelSize: 12 }
+                                MouseArea {
+                                    id: removeMouse
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: root.removeWizardRoot(index)
+                                }
+                            }
+                        }
+                    }
+                }
+                WizardButton {
+                    objectName: "wizardAddFolder"
+                    label: "[+ Add Folder]"
+                    primary: false
+                    onClicked: wizardFolderDialog.open()
+                }
             }
 
             Label {
@@ -1615,26 +1903,31 @@ ApplicationWindow {
                 Layout.fillWidth: true
             }
 
-            Rectangle {
-                id: connectButton
-                objectName: "welcomeConnect"
+            // Navigation for plates 2-4.
+            RowLayout {
+                objectName: "wizardNav"
+                visible: root.wizardStep > 1
                 Layout.fillWidth: true
-                Layout.preferredHeight: 40
-                radius: 8
-                color: connectMouse.containsMouse ? Qt.lighter(theme.accent, 1.1) : theme.accent
-                Behavior on color { ColorAnimation { duration: 120 } }
-                Label {
-                    anchors.centerIn: parent
-                    text: "Connect & Begin"
-                    color: "#0b0e12"
-                    font.pixelSize: 14
-                    font.weight: Font.DemiBold
+                Layout.topMargin: 6
+                spacing: 10
+                WizardButton {
+                    objectName: "wizardBack"
+                    label: "\u2190 Back"
+                    primary: false
+                    onClicked: root.wizardBack()
                 }
-                MouseArea {
-                    id: connectMouse
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    onClicked: root.connectEngine()
+                Item { Layout.fillWidth: true }
+                WizardButton {
+                    objectName: "wizardNext"
+                    visible: root.wizardStep < 4
+                    label: "Next \u2192"
+                    onClicked: root.wizardNext()
+                }
+                WizardButton {
+                    objectName: "wizardFinish"
+                    visible: root.wizardStep === 4
+                    label: "Finish & Anchor"
+                    onClicked: root.finishSetup()
                 }
             }
         }
@@ -1823,6 +2116,22 @@ ApplicationWindow {
                                 warnUnchecked: true
                                 checkedText: "Scrub API keys, passwords, and tokens before sending prompts."
                                 uncheckedText: "Warning: Credentials and tokens are stored raw and may reach external models."
+                            }
+                            CompactCheckBox {
+                                id: webSearchBox
+                                objectName: "webSearchBox"
+                                text: "Ground with Live Web Search"
+                                checked: bridge.webSearchEnabled
+                                onToggled: bridge.setWebSearchEnabled(checked)
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                Layout.leftMargin: 24
+                                text: "Allow models to consult Google Search for real-time facts. Increases latency; search snippets are never saved to memory."
+                                wrapMode: Text.WordWrap
+                                color: root.dim
+                                font.family: root.uiFamily
+                                font.pixelSize: 11
                             }
                             Label {
                                 Layout.topMargin: 8

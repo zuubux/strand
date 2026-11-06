@@ -935,13 +935,19 @@ def _schema(name: str, description: str, props: dict[str, str], required: list[s
     }
 
 
+SCOPE_NOTE = (
+    " Scope: project files and source trees inside approved workspace roots only. These tools cannot "
+    "run shell commands, inspect /proc or query host hardware; answer questions about host hardware "
+    "(CPU, RAM, GPU) directly from the ambient host context instead of calling tools."
+)
+
 WORKSPACE_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
             "name": "list_directory",
             "description": "List one directory level inside an approved workspace root "
-            "(names, file/directory type, size in bytes).",
+            "(names, file/directory type, size in bytes)." + SCOPE_NOTE,
             "parameters": {
                 "type": "object",
                 "properties": {"path": {"type": "string", "description": "Directory path."}},
@@ -954,7 +960,7 @@ WORKSPACE_TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "read_file",
             "description": "Read a window of lines from a text file inside an approved workspace "
-            f"root. Max {MAX_READ_LINES} lines or {MAX_READ_BYTES} bytes per call.",
+            f"root. Max {MAX_READ_LINES} lines or {MAX_READ_BYTES} bytes per call." + SCOPE_NOTE,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -969,7 +975,7 @@ WORKSPACE_TOOLS: list[dict[str, Any]] = [
     _schema(
         "grep_workspace",
         f"Regex search for text inside approved workspace roots (ripgrep when available). Returns at "
-        f"most {GREP_MAX_RESULTS} matches / {GREP_MAX_BYTES} bytes as path, line_number, line_text.",
+        f"most {GREP_MAX_RESULTS} matches / {GREP_MAX_BYTES} bytes as path, line_number, line_text." + SCOPE_NOTE,
         {
             "pattern": "Regular expression to find.",
             "path": "File or directory to search (default: workspace root).",
@@ -999,7 +1005,7 @@ WORKSPACE_TOOLS: list[dict[str, Any]] = [
     _schema(
         "glob_files",
         f"Find files by glob pattern (e.g. '**/*.py', 'tests/test_*.py') inside approved workspace roots. "
-        f"Returns at most {GLOB_MAX_RESULTS} paths; sensitive files and .git are skipped.",
+        f"Returns at most {GLOB_MAX_RESULTS} paths; sensitive files and .git are skipped." + SCOPE_NOTE,
         {
             "pattern": "Glob pattern relative to the base directory.",
             "path": "Base directory (default: primary workspace root).",

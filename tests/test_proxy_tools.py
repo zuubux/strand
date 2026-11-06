@@ -211,6 +211,37 @@ def test_loop_guard_caps_iterations(tmp_path):
     assert "final answer" in response.json()["choices"][0]["message"]["content"]
 
 
+def test_loop_guard_empty_final_answer_falls_back_cleanly(tmp_path):
+    def responder(n, payload):
+        if payload.get("tool_choice") == "none":
+            return httpx.Response(200, json=text_body(""))
+        return httpx.Response(200, json=tool_call_body(arguments={"path": str(tmp_path / "ws" / "notes.txt")}, call_id=f"c{n}"))
+
+    async def scenario():
+        async with tool_proxy(tmp_path, responder) as (client, seen, *_):
+            response = await client.post(
+                "/v1/chat/completions", json={"messages": [{"role": "user", "content": QUESTION}]}
+            )
+            return response, seen
+
+    response, seen = run(scenario())
+    assert len(seen) == MAX_TOOL_ITERATIONS + 1
+    assert seen[-1]["tool_choice"] == "none"
+    assert response.status_code == 200
+    message = response.json()["choices"][0]["message"]
+    assert message["role"] == "assistant"
+    assert (message["content"] or "").strip() == ""
+    assert not message.get("tool_calls")
+
+
+def test_workspace_tool_descriptions_state_scope():
+    from strand.tools.workspace import WORKSPACE_TOOLS
+
+    by_name = {t["function"]["name"]: t["function"]["description"] for t in WORKSPACE_TOOLS}
+    for name in ("list_directory", "read_file", "grep_workspace", "glob_files"):
+        assert "/proc" in by_name[name] and "ambient host context" in by_name[name]
+
+
 def test_path_outside_workspace_denied(tmp_path):
     outside = tmp_path / "outside.txt"
     outside.write_text("OUTSIDE_SECRET")

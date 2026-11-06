@@ -16,7 +16,7 @@ from pathlib import Path
 
 import uvicorn
 
-from .config import Config, load_config
+from .config import Config, default_config_path, load_config
 from .db import DatabaseManager
 from .distill import DistillationEngine
 from .embed import create_embedder
@@ -54,7 +54,7 @@ def build_app(config: Config):
         dedup_distance_threshold=config.dedup_distance_threshold,
         ledger=resolver.ledger,
     )
-    return create_app(config, resolver, distill_engine=engine)
+    return create_app(config, resolver, distill_engine=engine, config_path=default_config_path())
 
 
 def notify_ready() -> None:

@@ -3,11 +3,13 @@
 import asyncio
 import copy
 import hmac
+import dataclasses
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
@@ -15,21 +17,10 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
 from .common import safe_exc, strip_think
-from .config import Config, save_config_value
+from .config import Config, load_config
 from .distill import DistillationEngine
-from .host import get_host_context, redact_host_context
 from .logging import get_logger
-from .onboarding import (
-    ONBOARD_TRIGGER,
-    MODE_DAY_ZERO,
-    MODE_TRIAGE,
-    ONBOARDING_MODE,
-    count_operators,
-    is_onboarding_completed,
-    onboarding_directive,
-    reanchor_generic_user,
-    telemetry_preference,
-)
+from .onboarding import reanchor_generic_user
 from .resolver import ContextResolver
 from .sanitize import sanitize_text
 from .session import IMAGE_PART_PREFIX, MAX_SESSION_ID_LEN
@@ -39,7 +30,6 @@ logger = get_logger("proxy")
 DEFAULT_SESSION_ID = "default"
 _UPSTREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 MAX_CONCURRENT_DISTILLATIONS = 4
-MAX_ONBOARDING_SESSIONS = 1000
 MAX_REQUEST_BYTES = 10 * 1024 * 1024  # POST /v1/chat/completions body cap (HTTP 413 beyond this)
 MAX_TOOL_ITERATIONS = 5  # local tool rounds per request before a final answer is forced
 _LOCAL_TOOL_NAMES = frozenset(t["function"]["name"] for t in WORKSPACE_TOOLS)
@@ -223,6 +213,45 @@ def _merge_tools(existing: Any) -> list[Any]:
     return merged + [t for t in WORKSPACE_TOOLS if t["function"]["name"] not in declared]
 
 
+GOOGLE_HOST = "generativelanguage.googleapis.com"
+
+
+def _is_google_upstream(url: str) -> bool:
+    """True when `url` targets Google's Gemini API host."""
+    return (urlsplit(url).hostname or "").lower() == GOOGLE_HOST
+
+
+def _is_search_tool(tool: Any) -> bool:
+    return isinstance(tool, dict) and (tool.get("type") == "google_search" or "google_search" in tool)
+
+
+def _apply_google_search(payload: dict[str, Any], enabled: bool) -> None:
+    """Toggle Gemini search grounding as a top-level `tools` entry.
+
+    The OpenAI SDK flattens `extra_body` into the body; over raw HTTP a literal `extra_body`
+    key is rejected by Gemini ("Unknown name tools at 'extra_body'"), so it is never emitted.
+    """
+    tools = [t for t in payload.get("tools", []) if not _is_search_tool(t)] if isinstance(payload.get("tools"), list) else []
+    extra_body = payload.get("extra_body")
+    if isinstance(extra_body, dict):  # drop stale/literal search wiring from the client
+        extra_body = dict(extra_body)
+        stale = [t for t in extra_body.get("tools", []) if not _is_search_tool(t)] if isinstance(extra_body.get("tools"), list) else []
+        if stale:
+            extra_body["tools"] = stale
+        else:
+            extra_body.pop("tools", None)
+        if extra_body:
+            payload["extra_body"] = extra_body
+        else:
+            payload.pop("extra_body", None)
+    if enabled:
+        tools.append({"google_search": {}})
+    if tools:
+        payload["tools"] = tools
+    else:
+        payload.pop("tools", None)
+
+
 _MESSAGE_CORE_KEYS = ("role", "content", "tool_calls", "index")
 
 
@@ -393,8 +422,14 @@ def create_app(
     resolver: ContextResolver,
     client: httpx.AsyncClient | None = None,
     distill_engine: DistillationEngine | None = None,
+    config_path: Path | None = None,
 ) -> FastAPI:
-    """Build the proxy app. The lifespan connects/closes the resolver's DB and the HTTP client."""
+    """Build the proxy app. The lifespan connects/closes the resolver's DB and the HTTP client.
+
+    With `config_path`, the user-toggled settings (`tools_enabled`, `redact_secrets`,
+    `web_search_enabled`) are re-read from that file whenever it changes, so GUI toggles apply
+    without a daemon restart. Without it, the boot `config` is used as-is.
+    """
     http = client if client is not None else httpx.AsyncClient(timeout=_UPSTREAM_TIMEOUT)
     chat_url = config.upstream_url.rstrip("/") + "/chat/completions"
     engine = (
@@ -403,8 +438,32 @@ def create_app(
         else DistillationEngine(resolver.db, ledger=resolver.ledger)
     )
     background_tasks: set[asyncio.Task[Any]] = set()
-    onboarding_sessions: dict[str, str] = {}  # session -> onboarding mode; insertion-ordered, bounded
-    telemetry_choices: dict[str, bool] = {}  # session -> applied onboarding hardware choice; bounded
+    live = {"stamp": None, "config": config}
+
+    def live_config() -> Config:
+        """Boot config overlaid with the on-disk toggles; a bad or missing file keeps the last good one."""
+        if config_path is None:
+            return config
+        try:
+            st = config_path.stat()
+        except OSError:
+            return live["config"]
+        stamp = (st.st_mtime_ns, st.st_size)
+        if stamp != live["stamp"]:
+            live["stamp"] = stamp
+            try:
+                fresh = load_config(config_path=config_path, strict=True)
+            except (ValueError, OSError):
+                logger.warning("Config reload failed; keeping previous settings", exc_info=True)
+            else:
+                live["config"] = dataclasses.replace(
+                    config,
+                    tools_enabled=fresh.tools_enabled,
+                    redact_secrets=fresh.redact_secrets,
+                    web_search_enabled=fresh.web_search_enabled,
+                )
+        return live["config"]
+
     distill_slots = asyncio.Semaphore(MAX_CONCURRENT_DISTILLATIONS)
 
     async def _distill(session_id: str, query: str, response: str) -> None:
@@ -414,28 +473,6 @@ def create_app(
                 await reanchor_generic_user(resolver.db)
             except Exception:
                 logger.warning("Operator re-anchor failed session=%r", session_id, exc_info=True)
-            if session_id in onboarding_sessions:
-                await _apply_telemetry_choice(session_id)
-
-    async def _apply_telemetry_choice(session_id: str) -> None:
-        """SEC-PRIV-002: honour the operator's conversational hardware opt-in / opt-out.
-
-        Model B distills `(<Operator>) --[prefers]--> (Host Telemetry Enabled | On-Demand)`. The
-        choice is applied to the live session (so the very next turn carries, or withholds, the
-        specs) and persisted as `enable_host_telemetry` in config.json (atomic, 0600).
-        """
-        try:
-            choice = await telemetry_preference(resolver.db)
-            if choice is None or telemetry_choices.get(session_id) is choice:
-                return
-            telemetry_choices[session_id] = choice
-            while len(telemetry_choices) > MAX_ONBOARDING_SESSIONS:
-                del telemetry_choices[next(iter(telemetry_choices))]
-            resolver.ledger.set_allow_host_telemetry(session_id, choice)
-            await asyncio.to_thread(save_config_value, "enable_host_telemetry", choice)
-            logger.info("Host telemetry choice session=%r enabled=%s", session_id, choice)
-        except Exception:
-            logger.warning("Host telemetry choice failed session=%r", session_id, exc_info=True)
 
     def schedule_distillation(session_id: str, query: str, response: str, allow_private: bool = False) -> None:
         """Fire-and-forget; process_exchange swallows its own errors.
@@ -446,7 +483,7 @@ def create_app(
         if allow_private:
             logger.info("Skipping distillation session=%r: private context allowed for this exchange", session_id)
             return
-        if not query or not response or query == ONBOARD_TRIGGER:
+        if not query or not response:
             return
         task = asyncio.create_task(_distill(session_id, query, response))
         background_tasks.add(task)
@@ -484,7 +521,11 @@ def create_app(
         return await http.send(request, stream=True)
 
     async def run_tool_loop(
-        payload: dict[str, Any], headers: dict[str, str], streaming: bool, mutations: list[dict[str, str]]
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        streaming: bool,
+        mutations: list[dict[str, str]],
+        redact: bool = True,
     ) -> httpx.Response:
         """JIT tool loop: run workspace tool calls locally and re-post until a final answer.
 
@@ -520,7 +561,7 @@ def create_app(
             convo.append({**extras, "role": "assistant", "content": text or None, "tool_calls": calls})
             images: list[dict[str, Any]] = []
             for call in calls:
-                tool_message, followup = await _run_tool_call_full(call, roots, config.redact_secrets)
+                tool_message, followup = await _run_tool_call_full(call, roots, redact)
                 convo.append(tool_message)
                 try:
                     record = mutation_record(call["function"]["name"], json.loads(tool_message["content"]))
@@ -614,42 +655,10 @@ def create_app(
                 delta = "\n\n".join([*replay, delta] if delta else replay)
                 logger.info("Replayed %d context block(s) session=%r", len(replay), session_id)
         logger.info("Resolved delta session=%r %s", session_id, grounding)
-        mode = request.headers.get("x-strand-mode", "").strip().lower()
-        try:
-            explicit = mode == ONBOARDING_MODE
-            telemetry = request.headers.get("x-strand-host-telemetry", "").strip().lower()
-            if telemetry in ("1", "true", "yes", "on", "0", "false", "no", "off"):
-                resolver.ledger.set_allow_host_telemetry(session_id, telemetry in ("1", "true", "yes", "on"))
-            graduated = not resolution_failed and not explicit and session_id not in onboarding_sessions and await is_onboarding_completed(resolver.db)
-            if resolution_failed or graduated:
-                pass  # fail open / already onboarded: no directive, no onboarding flag
-            elif session_id not in onboarding_sessions and (explicit or await count_operators(resolver.db) == 0):
-                # No explicit operator yet: Day Zero. /onboard with one on record: intent triage.
-                has_operator = await count_operators(resolver.db) > 0
-                onboarding_sessions[session_id] = MODE_TRIAGE if has_operator else MODE_DAY_ZERO
-                logger.info("Onboarding session=%r mode=%s", session_id, onboarding_sessions[session_id])
-            while len(onboarding_sessions) > MAX_ONBOARDING_SESSIONS:
-                del onboarding_sessions[next(iter(onboarding_sessions))]
-            if session_id in onboarding_sessions and not resolution_failed:
-                host_info = get_host_context()
-                if not (config.enable_host_telemetry is True or resolver.ledger.allow_host_telemetry(session_id)):
-                    host_info = redact_host_context(host_info)  # SEC-PRIV-002: fail closed
-                user_turns = sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "user")
-                decision: bool | None = None
-                if user_turns >= 4 and onboarding_sessions[session_id] == MODE_DAY_ZERO:
-                    if config.enable_host_telemetry is True or resolver.ledger.allow_host_telemetry(session_id):
-                        decision = True
-                    else:
-                        decision = await telemetry_preference(resolver.db)
-                directive = onboarding_directive(
-                    host_info, onboarding_sessions[session_id], user_turns <= 1, user_turns, decision
-                )
-                delta = f"{directive}\n\n{delta}" if delta else directive
-        except Exception:
-            logger.error("Onboarding setup failed session=%r; continuing without it", session_id, exc_info=True)
         if delta:
             payload["messages"] = _inject_delta(messages, delta)
 
+        cfg = live_config()
         headers = {"Content-Type": "application/json"}
         api_key = config.upstream_api_key
         if api_key:
@@ -665,9 +674,14 @@ def create_app(
         payload["messages"] = resolver.ledger.compact_history(payload["messages"])
         mutations: list[dict[str, str]] = []
         try:
-            if config.tools_enabled:
+            search = cfg.web_search_enabled and _is_google_upstream(chat_url)
+            # Gemini rejects google_search grounding combined with function tools: search wins.
+            use_workspace_tools = cfg.tools_enabled and not search
+            if use_workspace_tools:
                 payload["tools"] = _merge_tools(payload.get("tools"))
-                upstream = await run_tool_loop(payload, headers, streaming, mutations)
+            _apply_google_search(payload, search)
+            if use_workspace_tools:
+                upstream = await run_tool_loop(payload, headers, streaming, mutations, cfg.redact_secrets)
             else:
                 upstream = await post_upstream(payload, headers)
         except httpx.HTTPError as exc:
