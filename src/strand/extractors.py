@@ -14,6 +14,7 @@ from .common import extract_json, safe_exc, strip_think
 from .distill import USER_CONFIDENCE, USER_ORIGIN, Extraction
 from .host import get_host_context
 from .logging import get_logger
+from .prompts import EXTRACTOR_SYSTEM_PROMPT
 
 logger = get_logger("extractors")
 
@@ -21,68 +22,7 @@ DEFAULT_EXTRACTOR_URL = "http://127.0.0.1:11434/v1"
 _TIMEOUT = httpx.Timeout(60.0, connect=5.0)
 _MAX_INPUT_CHARS = 6000
 
-SYSTEM_PROMPT = (
-    "You extract a knowledge graph from a conversation turn. Reply with strict JSON only, "
-    'shaped as {"entities": [{"name": str, "archetype": one of person|project|system|vehicle|concept|trait|directive|preference, '
-    '"summary": str}], "edges": [{"source": str, "target": str, "relation": str}], '
-    '"deprecated_edges": [{"source": str, "target": str, "relation": str, "reason": str}]}. '
-    "Only include durable facts; edge endpoints must be entity names. "
-    "Use deprecated_edges only when the user explicitly states an existing relationship has ended, "
-    "been replaced, sold, stopped or invalidated (e.g. 'I sold X', 'I switched from A to B', "
-    "'I no longer work at Y', 'I no longer use Z'); state transitions matter: replacement, disposal or "
-    "discontinuation (sold, switched from A to B, got rid of, quit, no longer using) must emit a "
-    "deprecated_edges entry for the superseded relationship, plus the new fact as a normal edge. "
-    "Name the same source, target and relation the relationship had. "
-    "Strict boundary for deprecated_edges: emit an edge there only when the user explicitly states that "
-    "a fact or preference was WRONG, cancelled or should be forgotten, or that a current relationship "
-    "has ended. Biographical history is never a deprecation: past possessions, previous employment and "
-    "earlier life facts (e.g. 'I used to own an W34', 'My previous car was a Cruiser') must be emitted "
-    "as an ACTIVE edge (previously_owned or owned) at normal weight, e.g. (User) --[previously_owned]--> "
-    "(W34), and NEVER placed in deprecated_edges. "
-    "Optionally add forgotten_entities: [entity_name, ...]. Use it only when the user explicitly "
-    "commands the system to forget, delete, scrub or erase an entity, concept or record "
-    "(e.g. 'Forget my old address', 'Delete the entity for Project Titan', 'Forget X'); list the "
-    "target entity names. Never also list a forgotten entity in entities or as an edge endpoint. "
-    "Also capture interaction updates: conversational adjustments, behavioral critiques and style "
-    "instructions the user gives about how the assistant should behave (e.g. 'be more terse', "
-    "'stop apologizing', 'give me unified diffs') are never physical concepts. "
-    'Tone or character critiques become archetype "trait"; hard rules and invariants become '
-    'archetype "directive"; formatting or style requests become archetype "preference". '
-    "Name each one with a short descriptive identifier and put the full rule in its summary. "
-    "Link each to the entity User with an edge (source User, target the rule) using relation "
-    "prefers for a preference, demands for a directive, or enforces for a trait or a standing rule. "
-    "If the user changes or contradicts an earlier preference, rule or trait (e.g. 'actually, "
-    "stop using diffs, send full files'), emit a deprecated_edges entry naming the same source, "
-    "target and relation of the old rule so it is cleanly deprecated, and add the new rule as "
-    "a new entity and edge. "
-    "Permanence guardrail: distinguish PERMANENT DIRECTIVES from TRANSIENT STEERING. A permanent "
-    "directive needs an explicit permanence marker such as 'from now on', 'always', 'never', "
-    "'stop doing X', 'switch to Y' or 'going forward'. Transient steering is immediate or one-off "
-    "context such as 'right now', 'just for this' or 'give me the diff' with no marker; it must NOT "
-    "create a permanent directive or preference and must NOT deprecate any standing edge, so return "
-    "nothing for it. When a permanent behavioral correction is detected (e.g. 'Stop summarizing "
-    "diffs from now on'): 1) identify the obsolete directive, preference or trait and emit it in "
-    "deprecated_edges with the operator as source and the old rule's target and relation; 2) emit the "
-    "replacement behavior as an active entity with archetype \"directive\" or \"preference\" and "
-    "connect it to the operator with an edge (the model_inferred origin is applied to it automatically). "
-    "Deprecation only severs edges; never list entities for deletion because of a critique. "
-    "Attach traits, concerns and preferences directly between the subject and the concrete "
-    "noun or entity through the edge relation, e.g. (User) --[prefers]--> (AWD) or "
-    "(User) --[concerned_about]--> (Battery Life). Never create generic intermediate container "
-    "entities such as \"User's Preference\", \"User's Concern\" or \"User Settings\"; no two-hop "
-    "chains like (User) --[has]--> (User's Preference) --[includes]--> (AWD). "
-    "Host telemetry preference: when the operator answers a question about whether the assistant may "
-    "inspect their hardware specs (CPU/RAM/OS), emit one edge from the "
-    "operator (the declared name, else User) with relation prefers: agreement (e.g. 'yeah, check it "
-    "out', 'tune into the iron') is (<Operator>) --[prefers]--> (Host Telemetry Enabled); a decline "
-    "or on-demand answer (e.g. 'keep it on-demand', 'leave it local') is (<Operator>) --[prefers]--> "
-    "(Host Telemetry On-Demand). Use archetype \"preference\" for that entity. Only deprecate the "
-    "opposite Host Telemetry edge when the operator reverses this choice; this preference never "
-    "deprecates or replaces unrelated directives, traits, preferences or person attributes, and a "
-    "turn without a clear hardware answer emits no Host Telemetry edge. "
-    'If nothing is worth keeping return {"entities": [], "edges": [], "deprecated_edges": [], '
-    '"forgotten_entities": []}.'
-)
+SYSTEM_PROMPT = EXTRACTOR_SYSTEM_PROMPT  # backwards-compatible alias (prompt lives in prompts.py)
 
 
 OPERATES_HOST = "operates_host"

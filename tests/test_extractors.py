@@ -149,11 +149,11 @@ def test_container_with_no_children_is_dropped_and_real_entities_untouched():
     assert parse_extraction(json.dumps(GOOD))["edges"] == GOOD["edges"]
 
 
-def test_system_prompt_forbids_intermediate_containers():
+def test_system_prompt_models_direct_predicates_and_leaves_containers_to_code():
     from strand.extractors import SYSTEM_PROMPT
 
     assert "(User) --[prefers]--> (AWD)" in SYSTEM_PROMPT
-    assert "Never create generic intermediate container" in SYSTEM_PROMPT
+    assert "User's Preference" not in SYSTEM_PROMPT  # collapse_containers() enforces this in Python
 
 
 def _operator_payload(name="Alice", host="workstation-01"):
@@ -208,7 +208,7 @@ def test_system_prompt_has_no_onboarding_name_instructions():
 
     for text in ("What should I call you?", "Call me Alice", "Just Alice", "onboarding", "Operator identity"):
         assert text not in SYSTEM_PROMPT, text
-    assert "Host telemetry preference" in SYSTEM_PROMPT
+    assert "Host Telemetry" not in SYSTEM_PROMPT  # provenance is enforced by onboarding.telemetry_preference
 
 
 def test_model_b_operator_persists_and_reanchors_generic_user(tmp_path, monkeypatch):
@@ -315,9 +315,9 @@ def test_prompt_documents_permanence_guardrail():
         "from now on",
         "going forward",
         "right now",
-        "just for this",
+        "just for this turn",
         "must NOT deprecate any standing edge",
-        "model_inferred",
+        "a critique wins even without a marker",
     ):
         assert token in SYSTEM_PROMPT, token
 
@@ -339,7 +339,7 @@ def test_transient_phrase_does_not_deprecate_but_permanent_phrase_does():
 def test_prompt_separates_biography_from_deprecation():
     from strand.extractors import SYSTEM_PROMPT
 
-    for token in ("WRONG, cancelled or should be forgotten", "I used to own an W34", "previously_owned", "NEVER placed in deprecated_edges"):
+    for token in ("WRONG, cancelled or should be forgotten", "I used to own an E30", "previously_owned", "NEVER placed in deprecated_edges"):
         assert token in SYSTEM_PROMPT, token
 
 
@@ -392,12 +392,10 @@ def test_assistant_only_assertion_stays_untagged_for_model_clamp():
     assert "origin" not in edge and "confidence" not in edge
 
 
-def test_system_prompt_documents_host_telemetry_preference_without_collision():
+def test_system_prompt_leaves_host_telemetry_to_code():
     from strand.extractors import SYSTEM_PROMPT
 
-    assert "(<Operator>) --[prefers]--> (Host Telemetry Enabled)" in SYSTEM_PROMPT
-    assert "(<Operator>) --[prefers]--> (Host Telemetry On-Demand)" in SYSTEM_PROMPT
-    assert "never deprecates or replaces unrelated directives" in SYSTEM_PROMPT
+    assert "Host Telemetry" not in SYSTEM_PROMPT  # telemetry provenance lives in onboarding.telemetry_preference
     assert "Biographical history is never a deprecation" in SYSTEM_PROMPT  # existing rules intact
 
 
