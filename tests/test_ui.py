@@ -674,6 +674,44 @@ def test_qml_note_bubbles_do_not_collapse(qapp):
     engine.deleteLater()
 
 
+def test_qml_assistant_prose_bubble_hugs_content(qapp):
+    """Short replies shrink to a pill; long ones clamp to 78% of the list and wrap."""
+    import time
+
+    from PySide6.QtCore import QMetaObject
+
+    def widths(reply):
+        b = make_bridge(lambda r: httpx.Response(200, content=sse(reply)))
+        engine, win = _load_window(b)
+        win.setWidth(1100)
+        win.setHeight(900)
+        win.show()
+        win.findChild(object, "messageInput").setProperty("text", "hi")
+        QMetaObject.invokeMethod(win, "send")
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            QCoreApplication.processEvents()
+            time.sleep(0.01)
+
+        def walk(item):
+            for child in item.childItems():
+                yield child
+                yield from walk(child)
+
+        found = [i.width() for i in walk(win.contentItem()) if i.objectName() == "assistantBubble"]
+        win.hide()
+        engine.deleteLater()
+        return found
+
+    (short,) = widths("Ok")
+    (medium,) = widths("Abraham Lincoln was born in 1809.")
+    (long_,) = widths("word " * 200)
+    assert short < 100
+    assert short < medium < long_
+    assert medium < 400
+    assert 700 < long_ <= 1100 * 0.78
+
+
 def test_shutdown_cancels_hanging_stream_and_joins_worker(qapp):
     class Hang(httpx.AsyncByteStream):
         async def __aiter__(self):

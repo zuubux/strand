@@ -643,57 +643,62 @@ ApplicationWindow {
         }
     }
 
-    // Assistant dialogue bubble: hugs its content (an invisible no-wrap twin measures the
-    // natural width) up to the flow width; the visible text wraps inside it, one-way.
+    // Assistant dialogue bubble: hugs its content (an unbound TextMetrics gives the natural
+    // single-line width) up to the flow width; the visible text wraps inside it, one-way.
     Component {
         id: proseBubble
+        // The Loader forces its item to the flow width, so this root fills it and the inner
+        // `pb` item (which hugs the text) is positioned inside; pb never reads the root width
+        // except through the fixed maxBubbleWidth ceiling.
         Item {
-            id: pb
-            readonly property real hPad: 16
-            readonly property real vPad: 12
-            readonly property real minBubbleWidth: 56
-            readonly property real maxBubbleWidth: parent ? parent.width : 0
-            // Natural unwrapped text width (+ padding); `prose` wraps to pb.width, so only the
-            // invisible no-wrap `measure` twin feeds the width (one-way, no binding loop).
-            readonly property real natural: Math.ceil(measure.implicitWidth) + 2 * hPad + 2
-            width: Math.min(maxBubbleWidth, Math.max(minBubbleWidth, natural))
-            implicitWidth: width
-            implicitHeight: prose.implicitHeight + 2 * vPad
-            height: implicitHeight
-            Text {
-                id: measure
-                visible: false
-                wrapMode: Text.NoWrap
-                textFormat: Text.MarkdownText
-                text: segment.text
-                font.family: root.assistantFamily
-                font.pixelSize: root.bodyPixelSize
-                font.letterSpacing: root.narrativeLetterSpacing
-            }
-            Rectangle {
-                objectName: "assistantBubble"
-                anchors.fill: parent
-                radius: 12
-                color: root.assistantSurface
-                border.color: root.assistantBorder
-                border.width: 1
-            }
-            Text {
-                id: prose
-                x: pb.hPad
-                y: pb.vPad
-                width: pb.width - 2 * pb.hPad
-                wrapMode: Text.Wrap
-                textFormat: Text.MarkdownText
-                text: segment.text
-                color: theme.assistantText
-                linkColor: root.accent
-                font.family: root.assistantFamily
-                font.pixelSize: root.bodyPixelSize
-                font.kerning: true
-                font.letterSpacing: root.narrativeLetterSpacing
-                lineHeightMode: Text.ProportionalHeight
-                lineHeight: root.narrativeLineHeight
+            id: pbRoot
+            implicitHeight: pb.height
+            height: pb.height
+            Item {
+                id: pb
+                readonly property real hPad: 16
+                readonly property real vPad: 12
+                readonly property real minBubbleWidth: 56
+                // Proportional reading ceiling (78% of the transcript list); the flow width is the guard.
+                readonly property real maxBubbleWidth: parent ? Math.min(list.width * 0.78, parent.width) : 0
+                // True single-line text width via TextMetrics: it reads only the font and the text,
+                // never pb.width or any layout size, so the chain is strictly one-way (no loops).
+                // Short replies hug their content; long ones clamp to maxBubbleWidth and wrap.
+                TextMetrics {
+                    id: tm
+                    font: prose.font
+                    text: segment.text
+                }
+                readonly property real naturalWidth: Math.ceil(tm.advanceWidth) + 2 + 2 * hPad
+                width: Math.min(maxBubbleWidth, Math.max(minBubbleWidth, naturalWidth))
+                implicitWidth: width
+                implicitHeight: prose.implicitHeight + 2 * vPad
+                height: implicitHeight
+                Rectangle {
+                    objectName: "assistantBubble"
+                    anchors.fill: parent
+                    radius: 12
+                    color: root.assistantSurface
+                    border.color: root.assistantBorder
+                    border.width: 1
+                }
+                Text {
+                    id: prose
+                    x: pb.hPad
+                    y: pb.vPad
+                    width: pb.width - 2 * pb.hPad
+                    wrapMode: Text.Wrap
+                    textFormat: Text.MarkdownText
+                    text: segment.text
+                    color: theme.assistantText
+                    linkColor: root.accent
+                    font.family: root.assistantFamily
+                    font.pixelSize: root.bodyPixelSize
+                    font.kerning: true
+                    font.letterSpacing: root.narrativeLetterSpacing
+                    lineHeightMode: Text.ProportionalHeight
+                    lineHeight: root.narrativeLineHeight
+                }
             }
         }
     }
@@ -864,7 +869,7 @@ ApplicationWindow {
             }
 
             // Asymmetric turn geometry: the user is a compact, recessed, right-aligned card;
-            // Strand is a left-aligned slate card (max 80% / 760px; prose hugs its text, code spans the flow); notes are dim local asides.
+            // Strand is a left-aligned slate card (max 78% of the list; prose hugs its text, code/diffs/tables span the full 78% flow); notes are dim local asides.
             delegate: Item {
                 id: row
                 required property string role
@@ -952,7 +957,7 @@ ApplicationWindow {
                     readonly property real vPad: boxed ? Math.round(root.bodyPixelSize * 0.7) : 2
                     readonly property real edge: Math.round(root.bodyPixelSize * 8 / 7)
                     readonly property real maxWidth: row.isUser ? row.width * 0.72
-                        : (isAssistant ? Math.min(row.width * 0.80, 760, row.width - 2 * edge) : row.width - 2 * edge)
+                        : (isAssistant ? Math.min(list.width * 0.78, row.width - 2 * edge) : row.width - 2 * edge)
                     TextMetrics {
                         id: textMetrics
                         font.pixelSize: root.bodyPixelSize

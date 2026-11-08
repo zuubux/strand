@@ -255,3 +255,13 @@ This document tracks real-world friction points, visual bugs, design observation
 ### `OBS-POL-013`: Model B Extractor Prompt Tiered Into Schema, Rules and Examples (Audit R5) — **Resolved**
 * **Component:** `src/strand/prompts.py`, `src/strand/extractors.py`, `src/strand/common.py`
 * **Resolution:** The 5.2 KB extractor literal (about 19 stacked negations) moved to `prompts.py` as `EXTRACTOR_SYSTEM_PROMPT` (about 3.1 KB, 425 words, roughly 40% smaller) in three tiers: a strict JSON contract, four positive rules (A facts vs. interaction rules, B permanence and critiques, C history vs. invalidation, D forgetting) and three worked triples. The permanence-vs-critique ambiguity is resolved: a direct critique ("actually, stop using diffs") has the same effect as an explicit permanence marker, emitting the new edge plus a `deprecated_edges` entry for the old rule, while transient steering is ignored. Container-noun and telemetry-provenance prose was dropped because `collapse_containers` and `onboarding.telemetry_preference` enforce them in Python. `PERSONALITY_ARCHETYPES` / `FACTUAL_ARCHETYPES` now live in `prompts.py` (re-exported by `common.py`); `extractors.SYSTEM_PROMPT` stays as an alias. Five prompt-text assertions in `tests/test_extractors.py` were updated to the new contract (removed prose is now asserted absent); no behavior tests changed. No schema change. 797 tests pass with `-W error`.
+
+### `OBS-UI-014`: Rigid Assistant Bubble Width — **Resolved**
+* **Component:** `src/strand/ui/qml/main.qml` (`proseBubble`), `tests/test_ui.py`
+* **Root cause:** The transcript delegate's `Loader` overrides the width of the item it loads. That override squashed the inner component's own width bindings, so the prose card took the slot width instead of hugging its text.
+* **Resolution:** `proseBubble` is split into an outer `pbRoot` slot that takes the full available width, and an inner `pb` card that sizes itself from `TextMetrics`. The card width is clamped between `minBubbleWidth` (56px) and `maxBubbleWidth` (`list.width * 0.78`). Short replies are compact pills and long replies wrap at the ceiling.
+* **Test:** `test_qml_assistant_prose_bubble_hugs_content` added to `tests/test_ui.py`.
+
+### `OBS-UI-015`: Input Dock Gating During Onboarding — **Resolved**
+* **Component:** `src/strand/ui/qml/main.qml` (input dock, first-run setup)
+* **Resolution:** The dock is hidden until setup completes (`visible: bridge.isConfigured`), so it cannot take input over the setup wizard. Tab isolation: the input has `activeFocusOnTab` and `enabled` bound to `bridge.isConfigured`, so Tab cannot reach it during setup. On completion, focus is deferred with `Qt.callLater` and then moved to the input via `forceActiveFocus()`, after the dock is visible.
