@@ -433,60 +433,35 @@ def _post_with_search(tmp_path, tools_enabled=True, body_extra=None, **config_kw
     return body_of(request)
 
 
-GS = {"google_search": {}}
+def _tool_names(payload):
+    return [t["function"]["name"] for t in payload.get("tools", [])]
 
 
-def test_web_search_adds_top_level_google_search_for_gemini(tmp_path):
+def test_web_search_function_tool_added_for_gemini_with_workspace_tools(tmp_path):
     payload = _post_with_search(tmp_path, upstream_url=GEMINI_URL, web_search_enabled=True)
-    assert payload["tools"] == [GS]  # no function tools: Gemini rejects the mix
-    assert "extra_body" not in payload  # Gemini rejects a literal extra_body field
-
-
-def test_web_search_disabled_on_gemini_keeps_workspace_tools(tmp_path):
-    payload = _post_with_search(tmp_path, upstream_url=GEMINI_URL, web_search_enabled=False)
+    assert {"web_search", "list_directory", "read_file"} <= set(_tool_names(payload))
     assert "extra_body" not in payload
-    names = {t["function"]["name"] for t in payload["tools"]}
-    assert {"list_directory", "read_file"} <= names
+    assert all("google_search" not in t for t in payload["tools"])
 
 
-def test_web_search_keeps_client_tools_clean_and_no_duplicates(tmp_path):
+def test_web_search_added_for_every_provider(tmp_path):
+    for url in ("https://api.openai.com/v1", "http://127.0.0.1:11434/v1"):
+        payload = _post_with_search(tmp_path, upstream_url=url, web_search_enabled=True)
+        assert "web_search" in _tool_names(payload)
+
+
+def test_web_search_disabled_omits_tool(tmp_path):
+    payload = _post_with_search(tmp_path, upstream_url=GEMINI_URL, web_search_enabled=False)
+    assert "web_search" not in _tool_names(payload)
+    assert {"list_directory", "read_file"} <= set(_tool_names(payload))
+
+
+def test_web_search_alone_when_workspace_tools_disabled(tmp_path):
     client_tool = {"type": "function", "function": {"name": "mine", "parameters": {}}}
     payload = _post_with_search(
-        tmp_path,
-        tools_enabled=False,
-        body_extra={"tools": [client_tool, {"type": "google_search"}], "extra_body": {"tools": [GS], "other": 1}},
-        upstream_url=GEMINI_URL,
-        web_search_enabled=True,
+        tmp_path, tools_enabled=False, body_extra={"tools": [client_tool]}, web_search_enabled=True
     )
-    assert payload["tools"] == [client_tool, GS]
-    assert payload["extra_body"] == {"other": 1}
-
-
-def test_web_search_only_search_tool_when_workspace_tools_disabled(tmp_path):
-    payload = _post_with_search(tmp_path, tools_enabled=False, upstream_url=GEMINI_URL, web_search_enabled=True)
-    assert payload["tools"] == [GS]
-    assert "extra_body" not in payload
-
-
-def test_web_search_disabled_omits_google_search(tmp_path):
-    payload = _post_with_search(
-        tmp_path,
-        body_extra={"extra_body": {"tools": [GS]}},
-        upstream_url=GEMINI_URL,
-        web_search_enabled=False,
-    )
-    assert "extra_body" not in payload
-    assert all("google_search" not in t for t in payload.get("tools", []))
-
-
-def test_web_search_not_added_for_non_google_upstream(tmp_path):
-    payload = _post_with_search(tmp_path, web_search_enabled=True)
-    assert all("google_search" not in t for t in payload.get("tools", []))
-    assert "extra_body" not in payload
-    payload = _post_with_search(
-        tmp_path, upstream_url="https://evil.test/generativelanguage.googleapis.com/v1", web_search_enabled=True
-    )
-    assert all("google_search" not in t for t in payload.get("tools", []))
+    assert _tool_names(payload) == ["mine", "web_search"]
 
 
 def test_config_file_toggles_apply_to_subsequent_requests(tmp_path):
@@ -518,7 +493,7 @@ def test_config_file_toggles_apply_to_subsequent_requests(tmp_path):
         return [body_of(r) for r in seen]
 
     first, second, third, fourth = run(scenario())
-    assert "extra_body" not in first and first["tools"]
-    assert second["tools"] == [GS] and "extra_body" not in second
+    assert "extra_body" not in first and "web_search" in _tool_names(first)  # default on
+    assert "web_search" in _tool_names(second) and "extra_body" not in second
     assert "extra_body" not in third and "tools" not in third
     assert "extra_body" not in fourth and "tools" not in fourth

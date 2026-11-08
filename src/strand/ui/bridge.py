@@ -508,7 +508,7 @@ class Bridge(QObject):
         self._busy = False
         self._lock = threading.Lock()
         self._private = False
-        self._web_search_enabled = bool(getattr(self._config, "web_search_enabled", False))
+        self._web_search_enabled = bool(getattr(self._config, "web_search_enabled", True))
         self._generation = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[None] | None = None
@@ -584,7 +584,7 @@ class Bridge(QObject):
 
     @Slot(bool)
     def setWebSearchEnabled(self, enabled: bool) -> None:
-        """Persist `web_search_enabled` (Google Search grounding for Gemini upstreams)."""
+        """Persist `web_search_enabled` (local sovereign `web_search` tool for all upstreams)."""
         enabled = bool(enabled)
         if self.saveConfig({"web_search_enabled": enabled}) and enabled != self._web_search_enabled:
             self._web_search_enabled = enabled

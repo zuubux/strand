@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from strand.common import BEDROCK_INVARIANT
 from strand.db import DatabaseManager
 from strand.resolver import ContextResolver
 from strand.session import SessionLedger
@@ -250,6 +251,7 @@ def test_resolve_renders_compact_markdown(db_path):
     assert turn == "\n".join(
         [
             "## Strand Memory",
+            BEDROCK_INVARIANT,
             "Entities:",
             "- Priya (person): Finance lead",
             "- Billing Audit (project): Quarterly audit",
@@ -277,7 +279,7 @@ def test_resolve_emits_only_new_edge_between_already_seen_entities(db_path):
 # --- ContextResolver: empty paths, sessions, validation ----------------------------
 
 
-def test_resolve_returns_empty_string_without_touching_ledger_when_nothing_matches(db_path):
+def test_resolve_returns_empty_string_after_bedrock_when_nothing_matches(db_path):
     async def scenario():
         async with DatabaseManager(db_path) as db:
             resolver = ContextResolver(db)
@@ -288,8 +290,10 @@ def test_resolve_returns_empty_string_without_touching_ledger_when_nothing_match
             return on_empty_db, no_match, blank, len(resolver.ledger)
 
     on_empty_db, no_match, blank, sessions = run(scenario())
-    assert (on_empty_db, no_match, blank) == ("", "", "")
-    assert sessions == 0  # no overhead: no session state was even created
+    # Bedrock is always Turn 1 (C3); later turns of the session add nothing.
+    assert on_empty_db == f"## Strand Memory\n{BEDROCK_INVARIANT}"
+    assert (no_match, blank) == ("", "")
+    assert sessions == 1
 
 
 def test_resolve_entity_without_edges_renders_entities_only(db_path):
@@ -302,7 +306,7 @@ def test_resolve_entity_without_edges_renders_entities_only(db_path):
 
     first, second = run(scenario())
     assert first == "\n".join(
-        ["## Strand Memory", "Entities:", "- Loner (concept): Line one line two !", "- Blank (concept)"]
+        ["## Strand Memory", BEDROCK_INVARIANT, "Entities:", "- Loner (concept): Line one line two !", "- Blank (concept)"]
     )
     assert "Relations:" not in first
     assert second == ""

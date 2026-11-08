@@ -1,5 +1,6 @@
 import asyncio
 
+from strand.common import BEDROCK_INVARIANT
 from strand.db import DatabaseManager
 from strand.resolver import ContextResolver
 from strand.session import SessionLedger
@@ -34,8 +35,7 @@ def test_private_entities_and_edges_excluded_by_default(tmp_path):
     assert "Marcus (person)" in mixed
     for leaked in ("Vault", "Diary", "guards", "writes", "Secret"):
         assert leaked not in mixed
-    assert vault_only == ""
-    assert diary_only == ""
+    assert vault_only == diary_only == f"## Strand Memory\n{BEDROCK_INVARIANT}"
 
 
 def test_allow_private_returns_private_entities(tmp_path):

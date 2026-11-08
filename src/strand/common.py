@@ -1,13 +1,15 @@
 """Shared constants and small helpers used across Strand modules.
 
-This module must not import from other `strand` modules (it sits at the bottom of the
-dependency graph).
+This module imports only the stdlib-only leaf `strand.prompts` (re-exported below); it must
+not import from any other `strand` module (it sits at the bottom of the dependency graph).
 """
 
 import json
 import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+
+from strand.prompts import BEDROCK_INVARIANT  # noqa: F401  (re-export; prompts.py is the source)
 
 EMBEDDING_DIM = 384
 
@@ -49,10 +51,6 @@ def safe_exc(exc: BaseException) -> str:
 
 # Personality Matrix archetypes: interaction rules stored as ordinary entity rows.
 PERSONALITY_ARCHETYPES = frozenset({"trait", "directive", "preference"})
-BEDROCK_INVARIANT = (
-    "You are Strand, running locally on the operator's machine. "
-    "Be direct, plain-spoken, and technically sharp. Never apologize. Never use corporate filler or polite fluff."
-)
 FACTUAL_ARCHETYPES = frozenset({"person", "project", "system", "vehicle", "concept"})
 VALID_ARCHETYPES = FACTUAL_ARCHETYPES | PERSONALITY_ARCHETYPES
 MIN_EDGE_CONFIDENCE = 0.2  # edges below this are treated as deprecated and never recalled

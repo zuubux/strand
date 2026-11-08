@@ -2127,7 +2127,7 @@ ApplicationWindow {
                             Label {
                                 Layout.fillWidth: true
                                 Layout.leftMargin: 24
-                                text: "Allow models to consult Google Search for real-time facts. Increases latency; search snippets are never saved to memory."
+                                text: "Allow models to consult a local web search tool (DuckDuckGo) for real-time facts. Increases latency; search snippets are never saved to memory."
                                 wrapMode: Text.WordWrap
                                 color: root.dim
                                 font.family: root.uiFamily

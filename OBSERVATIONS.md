@@ -124,6 +124,10 @@ This document tracks real-world friction points, visual bugs, design observation
 * **Root Cause:** Retaining content previews at standard operational log levels.
 * **Resolution:** `INFO` logs `Incoming query length=%d session=%r`; the sanitized 80-character preview is `DEBUG` only. Tests: `tests/test_config_logging.py`, `tests/test_final_hardening.py`.
 
+### `OBS-POL-010`: Conditional Bedrock (C3), `persona_prompt` Suppression (C1) & Prompt Centralization (R1, R2) — **Resolved**
+* **Component:** `src/strand/prompts.py` (new), `src/strand/common.py`, `src/strand/resolver.py`
+* **Resolution:** `BEDROCK_INVARIANT` moved to the new stdlib-only `prompts.py` (single source of truth for prompt contracts) and rewritten as a positive peer-level register (conversational cadence, prose over lists, task discipline); `common.py` re-exports it, so existing imports keep working. `ContextResolver.resolve` no longer gates the Bedrock on `stance or anchor`: it is queued on Turn 1 of every session, including fresh installs with an empty personality graph and no `persona_prompt`. `config.persona_prompt` is no longer suppressed when learned `trait`/`directive`/`preference` nodes exist; it stays as the baseline anchor at the top of `[Persona Stance]`. Side effects: the first resolve of a session is never `""`, and the proxy log `traits=` count includes the anchor line. Tests updated to the new text and behavior, plus new tests for Bedrock with an empty graph and with `format_context_delta` given no personality entities. No schema change; `SessionLedger` and `session.py` untouched. 795 tests pass with `-W error`.
+
 ### `OBS-POL-005`: Dynamic Persona Refinement & Long-Term Compaction (Phase 2)
 * **Component:** `src/strand/proxy.py`, `distill.py`, `compactor.py`
 * **Status:** Phase 1 complete (bedrock anchor, dynamic graph precedence, critique deprecation with permanence markers).

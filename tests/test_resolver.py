@@ -24,8 +24,11 @@ async def _seed_stance(db):
 
 
 def test_bedrock_text_is_the_permanent_identity():
-    assert BEDROCK_INVARIANT.startswith("You are Strand, running locally on the operator's machine.")
-    assert BEDROCK_INVARIANT.endswith("Never use corporate filler or polite fluff.")
+    from strand import prompts
+
+    assert BEDROCK_INVARIANT is prompts.BEDROCK_INVARIANT
+    assert BEDROCK_INVARIANT.startswith("You are Strand, a local peer and technical collaborator")
+    assert BEDROCK_INVARIANT.endswith("state the result plainly and stop.")
 
 
 def test_cold_boot_injects_bedrock_and_factory_persona(tmp_path):
@@ -38,7 +41,7 @@ def test_cold_boot_injects_bedrock_and_factory_persona(tmp_path):
     assert out.index(BEDROCK_INVARIANT) < out.index(FACTORY)
 
 
-def test_dynamic_stance_keeps_bedrock_and_suppresses_factory_persona(tmp_path):
+def test_dynamic_stance_keeps_bedrock_and_retains_factory_persona(tmp_path):
     async def scenario():
         async with DatabaseManager(tmp_path / "m.db") as db:
             await _seed_stance(db)
@@ -46,8 +49,7 @@ def test_dynamic_stance_keeps_bedrock_and_suppresses_factory_persona(tmp_path):
 
     out = run(scenario())
     assert BEDROCK_INVARIANT in out
-    assert FACTORY not in out
-    assert "[Persona Stance]\n- Dry Wit: Dry wit, unhurried" in out
+    assert f"[Persona Stance]\n{FACTORY}\n- Dry Wit: Dry wit, unhurried" in out
     assert "[Operational Directives]\n- no-filler: No conversational filler" in out
 
 
@@ -303,3 +305,22 @@ def test_out_of_process_mark_private_invalidates_cache(tmp_path):
             return await resolver.match_entities("Atlas")
 
     assert run(scenario()) == []
+
+
+def test_bedrock_injected_with_empty_graph_and_no_persona(tmp_path):
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            resolver = ContextResolver(db)
+            return await resolver.resolve("hello", "s"), await resolver.resolve("hello", "s")
+
+    first, second = run(scenario())
+    assert first == f"## Strand Memory\n{BEDROCK_INVARIANT}"
+    assert second == ""
+
+
+def test_format_context_delta_includes_bedrock_with_no_personality_entities():
+    from strand.resolver import BEDROCK_ID, format_context_delta
+    from strand.session import SessionDelta
+
+    out = format_context_delta([], [], SessionDelta([BEDROCK_ID], []))
+    assert out == f"## Strand Memory\n{BEDROCK_INVARIANT}"

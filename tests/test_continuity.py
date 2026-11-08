@@ -4,6 +4,7 @@ import time
 import pytest
 
 from strand.config import ENV_VARS, Config
+from strand.common import BEDROCK_INVARIANT
 from strand.db import DatabaseManager
 from strand.resolver import ContextResolver
 from strand.session import SessionLedger
@@ -67,7 +68,7 @@ def test_resolver_injects_then_dedupes_per_session(tmp_path):
 
     t1, t2, other, same = run(scenario())
     today = time.strftime("%Y-%m-%d", time.gmtime())
-    assert t1.startswith("## Strand Memory\n[Recent Continuity]\n")
+    assert t1.startswith(f"## Strand Memory\n{BEDROCK_INVARIANT}\n[Recent Continuity]\n")
     assert f"- {today}: Re-pinned the connector block." in t1
     assert t1.index("[Recent Continuity]") < t1.index("Entities:")
     assert t2 == ""
@@ -89,7 +90,7 @@ def test_resolver_omits_when_unmatched_or_expired(tmp_path):
             return miss, expired, wide
 
     miss, expired, wide = run(scenario())
-    assert miss == ""
+    assert miss == f"## Strand Memory\n{BEDROCK_INVARIANT}"
     assert "[Recent Continuity]" not in expired and "Kiln" in expired
     assert "[Recent Continuity]" in wide
 

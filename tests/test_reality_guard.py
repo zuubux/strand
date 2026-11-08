@@ -2,6 +2,7 @@
 
 import asyncio
 
+from strand.common import BEDROCK_INVARIANT
 from strand.db import DatabaseManager
 from strand.proxy import _delta_log_fields
 from strand.resolver import ContextResolver
@@ -112,10 +113,10 @@ def test_format_keeps_personality_sections_and_places_check_first(tmp_path):
         )
     ]
     assert order == sorted(order)
-    assert "Calm peer." not in delta  # factory persona superseded by graph stance nodes
+    assert "Calm peer." in delta  # persona_prompt is retained as the baseline anchor (C1)
     assert "- Dry Wit: Dry Wit rule" in delta
     assert "- W34 -has_engine-> X60 V8" in delta
-    assert _delta_log_fields(delta) == "entities=2 edges=1 traits=1 directives=1 preferences=1 discrepancies=1"
+    assert _delta_log_fields(delta) == "entities=2 edges=1 traits=2 directives=1 preferences=1 discrepancies=1"
 
 
 def test_no_discrepancy_omits_section_and_log_field(tmp_path):

@@ -61,7 +61,7 @@ def sse_text(text):
 
 
 @asynccontextmanager
-async def tool_proxy(tmp_path, responder, tools_enabled=True):
+async def tool_proxy(tmp_path, responder, tools_enabled=True, web_search_enabled=True):
     seen: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -81,6 +81,7 @@ async def tool_proxy(tmp_path, responder, tools_enabled=True):
             upstream_api_key="sk-test",
             workspace_roots=[str(workspace)],
             tools_enabled=tools_enabled,
+            web_search_enabled=web_search_enabled,
         )
         app = create_app(config, ContextResolver(db, SessionLedger()), upstream)
         transport = httpx.ASGITransport(app=app)
@@ -138,7 +139,7 @@ def test_read_file_loop_nonstreaming(tmp_path):
     assert response.status_code == 200
     assert "Here is the file content" in response.json()["choices"][0]["message"]["content"]
     assert len(seen) == 2
-    assert {t["function"]["name"] for t in seen[0]["tools"]} == {"read_file", "list_directory", "grep_workspace", "write_file", "patch_file", "restore_backup", "make_directory", "move_file", "remove_file", "read_image", "get_file_info", "read_multiple_files", "glob_files"}
+    assert {t["function"]["name"] for t in seen[0]["tools"]} == {"read_file", "list_directory", "grep_workspace", "write_file", "patch_file", "restore_backup", "make_directory", "move_file", "remove_file", "read_image", "get_file_info", "read_multiple_files", "glob_files", "web_search"}
     roles = [m["role"] for m in seen[1]["messages"]]
     assert roles[-2:] == ["assistant", "tool"]
     assistant, tool = seen[1]["messages"][-2:]
@@ -181,7 +182,7 @@ def test_tools_disabled_not_attached_or_executed(tmp_path):
         return httpx.Response(200, json=tool_call_body(arguments={"path": str(tmp_path / "ws" / "notes.txt")}))
 
     async def scenario():
-        async with tool_proxy(tmp_path, responder, tools_enabled=False) as (client, seen, *_):
+        async with tool_proxy(tmp_path, responder, tools_enabled=False, web_search_enabled=False) as (client, seen, *_):
             response = await client.post(
                 "/v1/chat/completions", json={"messages": [{"role": "user", "content": QUESTION}]}
             )

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from ..perms import secure_parent_dir
+from .search import web_search
 
 MAX_READ_BYTES = 8 * 1024
 MAX_READ_LINES = 200
@@ -1074,6 +1075,12 @@ WORKSPACE_TOOLS: list[dict[str, Any]] = [
     ),
 ]
 
+def _web_search_handler(roots: list[Path], **kwargs: Any) -> dict[str, Any]:
+    """Ephemeral Ring-egress search; the result list is wrapped so the dispatcher stays dict-typed."""
+    result = web_search(**kwargs)
+    return result if isinstance(result, dict) else {"results": result}
+
+
 _HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "list_directory": list_directory,
     "read_file": read_file,
@@ -1088,8 +1095,10 @@ _HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "move_file": move_file,
     "remove_file": remove_file,
     "restore_backup": restore_backup,
+    "web_search": _web_search_handler,
 }
 _ALLOWED_ARGS = {
+    "web_search": ("query", "max_results"),
     "list_directory": ("path",),
     "read_file": ("path", "offset", "limit"),
     "read_image": ("path",),
@@ -1105,6 +1114,7 @@ _ALLOWED_ARGS = {
     "restore_backup": ("backup",),
 }
 _REQUIRED_ARGS = {
+    "web_search": ("query",),
     "list_directory": ("path",),
     "read_file": ("path",),
     "read_image": ("path",),

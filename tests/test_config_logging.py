@@ -322,7 +322,7 @@ def test_web_search_enabled_default_env_file_and_cli(home, capsys):
     from strand.config import ENV_VARS
 
     assert ENV_VARS["web_search_enabled"] == "STRAND_WEB_SEARCH_ENABLED"
-    assert Config().web_search_enabled is False
+    assert Config().web_search_enabled is True
     for raw in ("1", "true", "YES", "On"):
         assert Config.from_env({"STRAND_WEB_SEARCH_ENABLED": raw}, {}).web_search_enabled is True
     assert Config.from_env({"STRAND_WEB_SEARCH_ENABLED": "0"}, {"web_search_enabled": True}).web_search_enabled is False

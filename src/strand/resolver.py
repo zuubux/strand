@@ -740,18 +740,15 @@ class ContextResolver:
         discrepancies = detect_discrepancies(entities, edges, query)
         known = {e.id for e in entities}
         entities += [e for e in await self.personality_entities(allow_private) if e.id not in known]
-        if not entities and not self.persona_prompt:
-            return ""
         if entities:
             try:
                 await self.db.touch_access([e.id for e in entities], [e.id for e in edges])
             except Exception:
                 logger.warning("touch_access failed; recall continues", exc_info=True)
-        # The factory persona is the cold-boot fallback: once the graph holds operator stance
-        # nodes it is superseded and suppressed.
-        stance = any(e.archetype in PERSONALITY_ARCHETYPES for e in entities)
-        anchor = [PERSONA_ANCHOR_ID] if self.persona_prompt and not stance else []
-        bedrock = [BEDROCK_ID] if stance or anchor else []
+        # Bedrock is unconditional on Turn 1 (C3); persona_prompt stays as the baseline anchor
+        # alongside learned stance nodes (C1).
+        anchor = [PERSONA_ANCHOR_ID] if self.persona_prompt else []
+        bedrock = [BEDROCK_ID]
         delta = self.ledger.filter_new(
             session_id, [*bedrock, *anchor, *(e.id for e in entities)], (e.id for e in edges)
         )

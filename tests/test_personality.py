@@ -198,7 +198,7 @@ def test_empty_sections_are_omitted_and_plain_output_unchanged(tmp_path):
     only_rule, plain = run(scenario())
     assert only_rule == f"## Strand Memory\n{BEDROCK_INVARIANT}\n[Operational Directives]\n- no-filler: No conversational filler"
     assert "[Persona Stance]" not in only_rule and "[Interaction Preferences]" not in only_rule
-    assert plain.startswith("## Strand Memory\nEntities:") and "[Working Memory]" not in plain
+    assert plain.startswith(f"## Strand Memory\n{BEDROCK_INVARIANT}\nEntities:") and "[Working Memory]" not in plain
 
 
 def test_persona_prompt_anchor_injected_once_per_session(tmp_path):
@@ -224,7 +224,7 @@ def test_private_personality_nodes_hidden_unless_allowed(tmp_path):
             return hidden, shown
 
     hidden, shown = run(scenario())
-    assert hidden == ""
+    assert hidden == f"## Strand Memory\n{BEDROCK_INVARIANT}"
     assert "secret-rule" in shown
 
 

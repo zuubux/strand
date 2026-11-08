@@ -9,7 +9,6 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, Request
@@ -24,6 +23,7 @@ from .onboarding import reanchor_generic_user
 from .resolver import ContextResolver
 from .sanitize import sanitize_text
 from .session import IMAGE_PART_PREFIX, MAX_SESSION_ID_LEN
+from .tools.search import WEB_SEARCH_TOOL
 from .tools.workspace import WORKSPACE_TOOLS, dispatch_tool_call, mutation_record, restore_backup
 
 logger = get_logger("proxy")
@@ -32,7 +32,7 @@ _UPSTREAM_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 MAX_CONCURRENT_DISTILLATIONS = 4
 MAX_REQUEST_BYTES = 10 * 1024 * 1024  # POST /v1/chat/completions body cap (HTTP 413 beyond this)
 MAX_TOOL_ITERATIONS = 5  # local tool rounds per request before a final answer is forced
-_LOCAL_TOOL_NAMES = frozenset(t["function"]["name"] for t in WORKSPACE_TOOLS)
+_LOCAL_TOOL_NAMES = frozenset(t["function"]["name"] for t in [*WORKSPACE_TOOLS, WEB_SEARCH_TOOL])
 _QUERY_LOG_CHARS = 80
 _CONTEXT_ROLES = ("system", "developer")
 
@@ -206,50 +206,12 @@ def _delta_log_fields(delta: str) -> str:
     return " ".join(fields)
 
 
-def _merge_tools(existing: Any) -> list[Any]:
-    """Client-declared tools plus WORKSPACE_TOOLS (client definitions win on name clashes)."""
+def _merge_tools(existing: Any, workspace: bool = True, web_search: bool = False) -> list[Any]:
+    """Client-declared tools plus the enabled local tools (client definitions win on name clashes)."""
     merged = list(existing) if isinstance(existing, list) else []
     declared = {t["function"].get("name") for t in merged if isinstance(t, dict) and isinstance(t.get("function"), dict)}
-    return merged + [t for t in WORKSPACE_TOOLS if t["function"]["name"] not in declared]
-
-
-GOOGLE_HOST = "generativelanguage.googleapis.com"
-
-
-def _is_google_upstream(url: str) -> bool:
-    """True when `url` targets Google's Gemini API host."""
-    return (urlsplit(url).hostname or "").lower() == GOOGLE_HOST
-
-
-def _is_search_tool(tool: Any) -> bool:
-    return isinstance(tool, dict) and (tool.get("type") == "google_search" or "google_search" in tool)
-
-
-def _apply_google_search(payload: dict[str, Any], enabled: bool) -> None:
-    """Toggle Gemini search grounding as a top-level `tools` entry.
-
-    The OpenAI SDK flattens `extra_body` into the body; over raw HTTP a literal `extra_body`
-    key is rejected by Gemini ("Unknown name tools at 'extra_body'"), so it is never emitted.
-    """
-    tools = [t for t in payload.get("tools", []) if not _is_search_tool(t)] if isinstance(payload.get("tools"), list) else []
-    extra_body = payload.get("extra_body")
-    if isinstance(extra_body, dict):  # drop stale/literal search wiring from the client
-        extra_body = dict(extra_body)
-        stale = [t for t in extra_body.get("tools", []) if not _is_search_tool(t)] if isinstance(extra_body.get("tools"), list) else []
-        if stale:
-            extra_body["tools"] = stale
-        else:
-            extra_body.pop("tools", None)
-        if extra_body:
-            payload["extra_body"] = extra_body
-        else:
-            payload.pop("extra_body", None)
-    if enabled:
-        tools.append({"google_search": {}})
-    if tools:
-        payload["tools"] = tools
-    else:
-        payload.pop("tools", None)
+    local = [*(WORKSPACE_TOOLS if workspace else []), *([WEB_SEARCH_TOOL] if web_search else [])]
+    return merged + [t for t in local if t["function"]["name"] not in declared]
 
 
 _MESSAGE_CORE_KEYS = ("role", "content", "tool_calls", "index")
@@ -674,13 +636,8 @@ def create_app(
         payload["messages"] = resolver.ledger.compact_history(payload["messages"])
         mutations: list[dict[str, str]] = []
         try:
-            search = cfg.web_search_enabled and _is_google_upstream(chat_url)
-            # Gemini rejects google_search grounding combined with function tools: search wins.
-            use_workspace_tools = cfg.tools_enabled and not search
-            if use_workspace_tools:
-                payload["tools"] = _merge_tools(payload.get("tools"))
-            _apply_google_search(payload, search)
-            if use_workspace_tools:
+            if cfg.tools_enabled or cfg.web_search_enabled:
+                payload["tools"] = _merge_tools(payload.get("tools"), cfg.tools_enabled, cfg.web_search_enabled)
                 upstream = await run_tool_loop(payload, headers, streaming, mutations, cfg.redact_secrets)
             else:
                 upstream = await post_upstream(payload, headers)

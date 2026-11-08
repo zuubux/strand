@@ -149,7 +149,7 @@ class Config:
     # SEC-PRIV-007: scrub secrets from tool output before it is sent upstream (config.json key).
     redact_secrets: bool = True
     # Ground Google Gemini upstream calls with native Google Search (results stay ephemeral).
-    web_search_enabled: bool = False
+    web_search_enabled: bool = True
     # True when host or port came from the environment or config.json (forces TCP).
     tcp_explicit: bool = field(default=False, compare=False)
 
@@ -237,7 +237,7 @@ class Config:
             tools_enabled=_as_bool(pick("tools_enabled", True)),
             enable_host_telemetry=_as_bool(pick("enable_host_telemetry", False)),
             redact_secrets=_as_bool(file_values.get("redact_secrets", True)),
-            web_search_enabled=_as_bool(pick("web_search_enabled", False)),
+            web_search_enabled=_as_bool(pick("web_search_enabled", True)),
             tcp_explicit=bool(pick("host", "") or pick("port", "")),
         )
 
