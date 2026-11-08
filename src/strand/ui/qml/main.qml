@@ -27,37 +27,37 @@ ApplicationWindow {
     QtObject {
         id: theme
         // Surfaces
-        readonly property color canvas: "#090b0e"
+        readonly property color canvas: Theme.canvasBackground
         readonly property color panel: "#1E2228"
         readonly property color border: "#2C323A"
         // User voice: deep slate-indigo bubble, indigo hairline, clean sans.
-        readonly property color userSurface: "#141c2b"
-        readonly property color userBorder: Qt.rgba(99 / 255, 102 / 255, 241 / 255, 0.20)
+        readonly property color userSurface: Theme.userBubbleBackground
+        readonly property color userBorder: Theme.userBubbleBorder
         // Assistant voice: dark carbon bubble, cyan hairline, high-contrast text.
-        readonly property color assistantSurface: "#11161d"
-        readonly property color assistantBorder: Qt.rgba(56 / 255, 189 / 255, 248 / 255, 0.18)
-        readonly property color assistantText: "#f1f5f9"
+        readonly property color assistantSurface: Theme.assistantBubbleBackground
+        readonly property color assistantBorder: Theme.assistantBubbleBorder
+        readonly property color assistantText: Theme.assistantText
         // Cards / code / tables: recessed monospace substrate.
-        readonly property color cardSurface: "#0c0f14"
-        readonly property color cardHeader: "#10141a"
-        readonly property color cardBorder: Qt.rgba(1, 1, 1, 0.06)
-        readonly property color codeText: "#D6DEE7"
+        readonly property color cardSurface: Theme.artifactBackground
+        readonly property color cardHeader: Theme.artifactHeaderBackground
+        readonly property color cardBorder: Theme.canvasBorder
+        readonly property color codeText: Theme.codeText
         // Text & accents
         readonly property color text: "#E6E9ED"
         readonly property color dim: "#7F8A96"
         readonly property color accent: "#3DAEE9"
-        readonly property color cyan: "#38bdf8"
+        readonly property color cyan: Theme.brandAccent
         readonly property color cyanSoft: "#7dd3fc"
-        readonly property color amber: "#f59e0b"
+        readonly property color amber: Theme.distillationAccent
         readonly property color warn: "#fbbf24"
-        readonly property color diffAdded: "#34d399"
-        readonly property color diffRemoved: "#f87171"
+        readonly property color diffAdded: Theme.successAccent
+        readonly property color diffRemoved: Theme.dangerAccent
         // Input dock
-        readonly property color dockSurface: "#11161d"
-        readonly property color dockBorder: Qt.rgba(1, 1, 1, 0.08)
+        readonly property color dockSurface: Theme.assistantBubbleBackground
+        readonly property color dockBorder: Theme.artifactBorder
         readonly property color fieldSurface: canvas
         // Geometry
-        readonly property int dockMaxWidth: 760
+        readonly property int dockMaxWidth: Theme.dockMaxWidth
         readonly property int dockMargin: 96
     }
 
@@ -71,7 +71,7 @@ ApplicationWindow {
     readonly property color codeBorder: theme.cardBorder
     readonly property color userRecess: theme.userSurface
     readonly property color userBorder: theme.userBorder
-    readonly property color diffAdded: "#34d399"
+    readonly property color diffAdded: theme.diffAdded
     readonly property color diffRemoved: theme.diffRemoved
     readonly property color assistantSurface: theme.assistantSurface
     readonly property color assistantBorder: theme.assistantBorder
@@ -656,11 +656,11 @@ ApplicationWindow {
             height: pb.height
             Item {
                 id: pb
-                readonly property real hPad: 16
-                readonly property real vPad: 12
-                readonly property real minBubbleWidth: 56
+                readonly property real hPad: Theme.hPadding
+                readonly property real vPad: Theme.vPadding
+                readonly property real minBubbleWidth: Theme.minBubbleWidth
                 // Proportional reading ceiling (78% of the transcript list); the flow width is the guard.
-                readonly property real maxBubbleWidth: parent ? Math.min(list.width * 0.78, parent.width) : 0
+                readonly property real maxBubbleWidth: parent ? Math.min(list.width * Theme.maxBubbleCeilingProportion, parent.width) : 0
                 // True single-line text width via TextMetrics: it reads only the font and the text,
                 // never pb.width or any layout size, so the chain is strictly one-way (no loops).
                 // Short replies hug their content; long ones clamp to maxBubbleWidth and wrap.
@@ -677,7 +677,7 @@ ApplicationWindow {
                 Rectangle {
                     objectName: "assistantBubble"
                     anchors.fill: parent
-                    radius: 12
+                    radius: Theme.bubbleRadius
                     color: root.assistantSurface
                     border.color: root.assistantBorder
                     border.width: 1
@@ -700,6 +700,16 @@ ApplicationWindow {
                     lineHeight: root.narrativeLineHeight
                 }
             }
+        }
+    }
+
+    // Unboxed breakout plate for code and diffs (full reading column, no bubble styling).
+    Component {
+        id: artifactPlate
+        ArtifactPlate {
+            plateType: segment.type
+            lang: segment.lang
+            text: segment.text
         }
     }
 
@@ -957,7 +967,7 @@ ApplicationWindow {
                     readonly property real vPad: boxed ? Math.round(root.bodyPixelSize * 0.7) : 2
                     readonly property real edge: Math.round(root.bodyPixelSize * 8 / 7)
                     readonly property real maxWidth: row.isUser ? row.width * 0.72
-                        : (isAssistant ? Math.min(list.width * 0.78, row.width - 2 * edge) : row.width - 2 * edge)
+                        : (isAssistant ? Math.min(list.width * Theme.maxBubbleCeilingProportion, row.width - 2 * edge) : row.width - 2 * edge)
                     TextMetrics {
                         id: textMetrics
                         font.pixelSize: root.bodyPixelSize
@@ -974,7 +984,7 @@ ApplicationWindow {
                     Rectangle {
                         anchors.fill: parent
                         visible: bubble.boxed
-                        radius: 12
+                        radius: Theme.bubbleRadius
                         color: row.isUser ? root.userRecess : root.assistantSurface
                         border.color: row.isUser ? root.userBorder : root.assistantBorder
                         border.width: 1
@@ -1146,7 +1156,7 @@ ApplicationWindow {
                                 id: blockLoader
                                 y: blockSlot.extraGap
                                 width: blockSlot.width
-                                sourceComponent: blockSlot.modelData.kind === "prose" ? proseBubble : codeBlock
+                                sourceComponent: blockSlot.modelData.type === "prose" ? proseBubble : artifactPlate
                                 property var segment: blockSlot.modelData
                             }
                         }

@@ -274,8 +274,17 @@ def split_markdown(text: str) -> list[dict[str, Any]]:
     return segments
 
 
+def is_diff_block(lang: str, text: str) -> bool:
+    """True for a fenced block tagged diff/patch or whose body is a unified diff."""
+    if lang.strip().lower() in ("diff", "patch"):
+        return True
+    return text.startswith("diff --git") or (
+        re.search(r"^--- .+\n\+\+\+ .+\n@@ ", text, re.M) is not None
+    )
+
+
 def split_blocks(text: str) -> list[dict[str, Any]]:
-    """Presentation blocks `{kind, code, lang, text, is_pivot}` for an assistant reply.
+    """Presentation blocks `{type, kind, code, lang, text, is_pivot}` for an assistant reply.
 
     `prose` renders in a conversational bubble; `code` (fences), `table` (markdown pipe tables)
     and `data` (multi-line structured data) break out onto the canvas. `is_pivot` marks a prose
@@ -285,8 +294,21 @@ def split_blocks(text: str) -> list[dict[str, Any]]:
 
     def add(kind: str, body: str, lang: str = "") -> None:
         pivot = kind == "prose" and PIVOT_RE.search(body.rstrip()) is not None
+        if kind == "prose":
+            btype = "prose"
+        elif kind == "code" and is_diff_block(lang, body):
+            btype = "diff"
+        else:
+            btype = "code"
         blocks.append(
-            {"kind": kind, "code": kind in ("code", "data"), "lang": lang, "text": body, "is_pivot": pivot}
+            {
+                "type": btype,
+                "kind": kind,
+                "code": kind in ("code", "data"),
+                "lang": lang,
+                "text": body,
+                "is_pivot": pivot,
+            }
         )
 
     for segment in split_markdown(text):
@@ -536,6 +558,15 @@ class Bridge(QObject):
     def activeStanceCount(self) -> int:
         """Total active stance nodes in memory (the list above is capped)."""
         return int(self._stance_count or 0)
+
+    @Slot(str)
+    def copyToClipboard(self, text: str) -> None:
+        """Copy `text` to the system clipboard (artifact plate Copy button)."""
+        from PySide6.QtGui import QGuiApplication
+
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
 
     @Slot()
     def refreshActiveStance(self) -> None:

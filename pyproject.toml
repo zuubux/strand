@@ -49,4 +49,4 @@ strand-gui = "strand.ui.app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"strand.ui" = ["qml/*.qml"]
+"strand.ui" = ["qml/*.qml", "qml/qmldir"]

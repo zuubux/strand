@@ -17,6 +17,7 @@ from strand.common import (
     PERSONALITY_ARCHETYPES,
     aliases_of,
     clean_text,
+    get_persona_stance,
     is_private,
     load_metadata,
 )
@@ -436,6 +437,7 @@ class ContextResolver:
         decay_half_life_days: float = 30.0,
         clock: Callable[[], datetime] | None = None,
         persona_prompt: str = "",
+        persona_stance: str | None = None,
         continuity_horizon_days: float = DEFAULT_CONTINUITY_HORIZON_DAYS,
         continuity_max_episodes: int = DEFAULT_CONTINUITY_MAX_EPISODES,
     ) -> None:
@@ -447,6 +449,9 @@ class ContextResolver:
             raise ValueError(f"decay_half_life_days must be positive, got {decay_half_life_days}")
         self.db = db
         self.persona_prompt = persona_prompt.strip() if isinstance(persona_prompt, str) else ""
+        # An explicit persona_prompt overrides the named stance; None disables the stance.
+        if not self.persona_prompt and persona_stance is not None:
+            self.persona_prompt = get_persona_stance(persona_stance)
         self.continuity_horizon_days = float(continuity_horizon_days)
         self.continuity_max_episodes = int(continuity_max_episodes)
         self.decay_enabled = decay_enabled

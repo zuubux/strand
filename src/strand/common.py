@@ -11,8 +11,11 @@ from urllib.parse import urlsplit, urlunsplit
 
 from strand.prompts import (  # noqa: F401  (re-exports; prompts.py is the source)
     BEDROCK_INVARIANT,
+    DEFAULT_PERSONA_STANCE,
     FACTUAL_ARCHETYPES,
+    PERSONA_STANCES,
     PERSONALITY_ARCHETYPES,
+    get_persona_stance,
 )
 
 EMBEDDING_DIM = 384

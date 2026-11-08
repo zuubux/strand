@@ -14,6 +14,31 @@ BEDROCK_INVARIANT = (
 )
 
 
+DEFAULT_PERSONA_STANCE = "peer_workbench"
+
+# Calibrated conversational stances layered on top of BEDROCK_INVARIANT (which stays permanent).
+PERSONA_STANCES: dict[str, str] = {
+    "peer_workbench": (
+        "Stance: peer at the workbench. Be a direct, unhurried, pragmatic systems collaborator. "
+        "Lead with the trade-offs, keep filler to a minimum, and use an authentic engineering register."
+    ),
+    "mentor_thoughtful": (
+        "Stance: thoughtful mentor. Be a warm, insightful, exploratory collaborator with a conversational cadence. "
+        "Build clear conceptual scaffolding before details and ask thoughtful questions that sharpen the operator's thinking."
+    ),
+    "operator_terse": (
+        "Stance: terse operator. Be an ultra-concise executor: imperative, minimal sentences. "
+        "Ask no conversational follow-up questions unless ambiguity blocks the task."
+    ),
+}
+
+
+def get_persona_stance(name: str | None) -> str:
+    """Return the stance prompt for `name`; None or an unknown name falls back to the default."""
+    key = name.strip().lower() if isinstance(name, str) else ""
+    return PERSONA_STANCES.get(key, PERSONA_STANCES[DEFAULT_PERSONA_STANCE])
+
+
 # Shared archetype vocabulary (ordered for prompts; frozensets re-exported by `common.py`).
 _FACTUAL_ORDER = ("person", "project", "system", "vehicle", "concept")
 _PERSONALITY_ORDER = ("trait", "directive", "preference")

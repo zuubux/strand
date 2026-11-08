@@ -40,6 +40,7 @@ def build_app(config: Config):
         decay_enabled=config.decay_enabled,
         decay_half_life_days=config.decay_half_life_days,
         persona_prompt=config.persona_prompt,
+        persona_stance=config.persona_stance,
         continuity_horizon_days=config.continuity_horizon_days,
         continuity_max_episodes=config.continuity_max_episodes,
     )

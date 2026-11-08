@@ -1946,3 +1946,48 @@ def test_complete_setup_validation_leaves_config_untouched(qapp, home):
     assert b.completeSetup({**base, "roots": []})["step"] == 4
     assert not (home / ".config" / "strand" / "config.json").exists()
     assert not (home / ".config" / "systemd").exists()
+
+
+def test_split_blocks_emits_typed_dicts():
+    from strand.ui.bridge import split_blocks
+
+    text = "Intro.\n\n```python\nx = 1\n```\n\n```diff\n--- a/f.py\n+++ b/f.py\n@@ -1 +1 @@\n-a\n+b\n```\n\nDone."
+    blocks = split_blocks(text)
+    assert [b["type"] for b in blocks] == ["prose", "code", "diff", "prose"]
+    assert (blocks[1]["lang"], blocks[1]["text"]) == ("python", "x = 1")
+    assert blocks[2]["text"].startswith("--- a/f.py")
+    assert blocks[0]["text"] == "Intro."
+    # Unlabelled fences holding a unified diff are still diffs.
+    bare = split_blocks("```\n--- a/g\n+++ b/g\n@@ -1 +1 @@\n-a\n+b\n```")
+    assert [b["type"] for b in bare] == ["diff"]
+
+
+def test_bridge_copy_to_clipboard(qapp):
+    from PySide6.QtGui import QGuiApplication
+
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    b.copyToClipboard("hello")
+    assert QGuiApplication.clipboard().text() == "hello"
+
+
+def test_artifact_plate_instantiates_offscreen(qapp):
+    from PySide6.QtCore import QUrl
+    from PySide6.QtQml import QQmlComponent, QQmlEngine
+    from PySide6.QtQuickControls2 import QQuickStyle
+
+    from strand.ui.app import MAIN_QML
+
+    QQuickStyle.setStyle("Basic")
+    engine = QQmlEngine()
+    engine.addImportPath(str(MAIN_QML.parent))
+    comp = QQmlComponent(engine, QUrl.fromLocalFile(str(MAIN_QML.parent / "ArtifactPlate.qml")))
+    plate = comp.create()
+    assert plate is not None, comp.errorString()
+    plate.setProperty("plateType", "diff")
+    plate.setProperty("text", "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b")
+    assert plate.property("badge") == "x.py"
+    plate.setProperty("plateType", "code")
+    plate.setProperty("lang", "python")
+    assert plate.property("badge") == "python"
+    plate.deleteLater()
+    engine.deleteLater()
