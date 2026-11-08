@@ -5,7 +5,7 @@ import pytest
 from strand.common import BEDROCK_INVARIANT
 from strand.db import DatabaseManager
 from strand.resolver import ContextResolver
-from strand.session import SessionLedger
+from strand.session import BEDROCK_ID, MAX_REPLAY_CHARS, SessionLedger
 
 
 def run(coro):
@@ -61,6 +61,23 @@ def test_ledger_returns_only_novel_ids_and_marks_them_seen():
     third = ledger.filter_new("s1", [1, 2, 3, 4], [10, 11, 12])
     assert third.is_empty
     assert third.entity_ids == () and third.edge_ids == ()
+
+
+def test_bedrock_block_is_pinned_while_intermediate_blocks_are_evicted():
+    ledger = SessionLedger()
+    ledger.filter_new("s", [BEDROCK_ID, 1], [])
+    ledger.remember_context("s", BEDROCK_INVARIANT, [BEDROCK_ID, 1], [])
+    chunk = MAX_REPLAY_CHARS // 3
+    for n in range(2, 8):
+        ledger.filter_new("s", [n], [])
+        ledger.remember_context("s", f"fact{n} " + "x" * chunk, [n], [])
+    replay = ledger.replay_context("s", "")
+    assert BEDROCK_INVARIANT in replay
+    assert replay[0] == BEDROCK_INVARIANT
+    assert not any(t.startswith("fact2 ") for t in replay)
+    assert replay[-1].startswith("fact7 ")
+    assert ledger.filter_new("s", [BEDROCK_ID], []).is_empty
+    assert ledger.filter_new("s", [2], []).entity_ids == (2,)  # evicted block is un-seen
 
 
 def test_ledger_entity_and_edge_id_spaces_are_independent():

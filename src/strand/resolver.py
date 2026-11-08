@@ -23,7 +23,7 @@ from strand.common import (
 from strand.db import PRIVATE_ENTITY_SQL, DatabaseManager
 from strand.embed import Embedder, EmbeddingUnavailable
 from strand.logging import get_logger
-from strand.session import SessionDelta, SessionLedger
+from strand.session import BEDROCK_ID, SessionDelta, SessionLedger
 from strand.stopwords import FUNCTION_WORDS, is_stop_word
 
 MAX_HOPS_LIMIT = 2
@@ -34,7 +34,6 @@ MIN_EFFECTIVE_PRIORITY = 0.15  # with decay enabled, candidates below this are p
 MAX_FREQUENCY_FACTOR = 1.5  # cap on the access-frequency boost
 FREQUENCY_STEP = 0.05  # boost per recorded access
 MAX_PERSONALITY_ENTITIES = 20  # cap on always-on personality nodes recalled per turn
-BEDROCK_ID = -2  # sentinel ledger id: the permanent identity invariant is injected once per session
 PERSONA_ANCHOR_ID = -1  # sentinel ledger id: the configured persona prompt is injected once per session
 # Personality sections in presentation order, hierarchically above working memory.
 _PERSONALITY_SECTIONS = (

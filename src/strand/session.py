@@ -12,7 +12,8 @@ DEFAULT_MAX_SESSIONS = 1000
 MAX_SESSION_ID_LEN = 128
 
 
-MAX_REPLAY_CHARS = 12000  # cap on stored context blocks per session (oldest dropped first)
+MAX_REPLAY_CHARS = 12000  # cap on stored context blocks per session (oldest unpinned dropped first)
+BEDROCK_ID = -2  # sentinel ledger id: the permanent identity invariant is injected once per session
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,8 +204,16 @@ class SessionLedger:
         """
         state = self._touch(session_id)
         state.context_blocks.append(ContextBlock(text, frozenset(entity_ids), frozenset(edge_ids)))
-        while len(state.context_blocks) > 1 and sum(len(b.text) for b in state.context_blocks) > MAX_REPLAY_CHARS:
-            self._unsee(state, state.context_blocks.pop(0))
+        # The Bedrock identity block (BEDROCK_ID) is pinned: it is never evicted, so the peer
+        # stance survives the sliding window. The newest block is also always kept.
+        while sum(len(b.text) for b in state.context_blocks) > MAX_REPLAY_CHARS:
+            victim = next(
+                (i for i, b in enumerate(state.context_blocks[:-1]) if BEDROCK_ID not in b.entity_ids),
+                None,
+            )
+            if victim is None:
+                break
+            self._unsee(state, state.context_blocks.pop(victim))
 
     def replay_context(self, session_id: str, present_text: str, exclude: str = "") -> list[str]:
         """Stored blocks that are not already in `present_text` (the client's system prompt).
