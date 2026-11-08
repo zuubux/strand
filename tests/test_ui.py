@@ -1099,6 +1099,21 @@ def test_split_blocks_splits_paragraphs_into_bubbles():
     assert operator_name({"STRAND_UI_OPERATOR": ""})
 
 
+def test_split_blocks_marks_trailing_question_as_pivot():
+    from strand.ui.bridge import split_blocks
+
+    blocks = split_blocks("Redis is fast.\n\nIt also persists.\n\nWant me to sketch the schema?")
+    assert [(b["kind"], b["is_pivot"]) for b in blocks] == [
+        ("prose", False), ("prose", False), ("prose", True),
+    ]
+    # Closing markup after the question mark still counts; a mid-paragraph `?` does not.
+    assert split_blocks("Which one do you **prefer?**")[0]["is_pivot"] is True
+    assert split_blocks("Why? Because it is cheap.")[0]["is_pivot"] is False
+    # Technical canvas blocks are never pivots, even when their text ends in `?`.
+    cards = split_blocks("```\nwhy?\n```\n\n| a | b? |\n|---|---|\n| 1 | 2? |")
+    assert [(b["kind"], b["is_pivot"]) for b in cards] == [("code", False), ("table", False)]
+
+
 def test_qml_assistant_flow_bubble_hugs_and_tab_flushes(qapp):
     from PySide6.QtCore import QMetaObject, Qt
 

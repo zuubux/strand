@@ -649,8 +649,8 @@ ApplicationWindow {
         id: proseBubble
         Item {
             id: pb
-            readonly property real hPad: 14
-            readonly property real vPad: 10
+            readonly property real hPad: 16
+            readonly property real vPad: 12
             readonly property real minBubbleWidth: 56
             readonly property real maxBubbleWidth: parent ? parent.width : 0
             // Natural unwrapped text width (+ padding); `prose` wraps to pb.width, so only the
@@ -875,7 +875,7 @@ ApplicationWindow {
                 required property int index
                 readonly property bool isUser: role === "user"
                 // Turn hierarchy: the first row of a speaker group carries an identity header and a
-                // wide gap above it (30px); rows continuing a turn sit tight (6px).
+                // wide gap above it (30px); rows continuing a turn sit tight (6px; block gaps inside an assistant flow are semantic).
                 readonly property string prevRole: index > 0 ? transcript.get(index - 1).role : ""
                 // A finished assistant turn with no text (tool iteration limit) gets a dim notice
                 // instead of an empty card or an orphan speaker header.
@@ -1119,13 +1119,31 @@ ApplicationWindow {
                         }
                     }
 
+                    // Semantic intra-turn gaps (the Column spacing of 6 is the floor): prose after
+                    // prose stays tight (8), a pivot/volley block gets 18, and a hop to or from a
+                    // technical canvas card gets 14.
                     Repeater {
-                        model: !bridge || !row.flowMode ? [] : bridge.blocks(row.body)
-                        delegate: Loader {
+                        id: blockRepeater
+                        property var items: !bridge || !row.flowMode ? [] : bridge.blocks(row.body)
+                        model: items
+                        delegate: Item {
+                            id: blockSlot
                             required property var modelData
+                            required property int index
+                            readonly property var prev: index > 0 ? blockRepeater.items[index - 1] : null
+                            readonly property real desiredGap: prev === null ? 6
+                                : (modelData.is_pivot ? 18
+                                : (modelData.kind !== "prose" || prev.kind !== "prose" ? 14 : 8))
+                            readonly property real extraGap: Math.max(0, desiredGap - flow.spacing)
                             width: flow.width
-                            sourceComponent: modelData.kind === "prose" ? proseBubble : codeBlock
-                            property var segment: modelData
+                            height: extraGap + blockLoader.height
+                            Loader {
+                                id: blockLoader
+                                y: blockSlot.extraGap
+                                width: blockSlot.width
+                                sourceComponent: blockSlot.modelData.kind === "prose" ? proseBubble : codeBlock
+                                property var segment: blockSlot.modelData
+                            }
                         }
                     }
                 }

@@ -89,6 +89,7 @@ GROUNDING_RE = re.compile(r"(\w+)=(\d+)")
 TABLE_LINE_RE = re.compile(r"^[ \t]*\|.*\|[ \t]*$")
 KV_LINE_RE = re.compile(r"^[ \t]*[A-Za-z_][\w.-]*[ \t]*(?::|=)[ \t]+\S")
 PARAGRAPH_SPLIT_RE = re.compile(r"\n[ \t]*\n")
+PIVOT_RE = re.compile(r"\?[\s*_`~\"')\]]*$")  # a trailing question mark (past closing markup)
 COMMAND_RE = re.compile(r"^/([A-Za-z]+)(?:[ \t]+(.*))?$", re.DOTALL)
 FENCE_RE = re.compile(r"^[ \t]{0,3}```[ \t]*([\w+.#-]*)[ \t]*$")
 # Markdown images (`![alt](url)`, `![alt][ref]`, `![alt]`): Qt Quick fetches these over the network.
@@ -274,15 +275,19 @@ def split_markdown(text: str) -> list[dict[str, Any]]:
 
 
 def split_blocks(text: str) -> list[dict[str, Any]]:
-    """Presentation blocks `{kind, code, lang, text}` for an assistant reply.
+    """Presentation blocks `{kind, code, lang, text, is_pivot}` for an assistant reply.
 
     `prose` renders in a conversational bubble; `code` (fences), `table` (markdown pipe tables)
-    and `data` (multi-line structured data) break out onto the canvas.
+    and `data` (multi-line structured data) break out onto the canvas. `is_pivot` marks a prose
+    paragraph ending in a question mark (the volley handing the turn back); QML gives it a wider gap.
     """
     blocks: list[dict[str, Any]] = []
 
     def add(kind: str, body: str, lang: str = "") -> None:
-        blocks.append({"kind": kind, "code": kind in ("code", "data"), "lang": lang, "text": body})
+        pivot = kind == "prose" and PIVOT_RE.search(body.rstrip()) is not None
+        blocks.append(
+            {"kind": kind, "code": kind in ("code", "data"), "lang": lang, "text": body, "is_pivot": pivot}
+        )
 
     for segment in split_markdown(text):
         if segment["code"]:

@@ -128,6 +128,11 @@ This document tracks real-world friction points, visual bugs, design observation
 * **Component:** `src/strand/prompts.py` (new), `src/strand/common.py`, `src/strand/resolver.py`
 * **Resolution:** `BEDROCK_INVARIANT` moved to the new stdlib-only `prompts.py` (single source of truth for prompt contracts) and rewritten as a positive peer-level register (conversational cadence, prose over lists, task discipline); `common.py` re-exports it, so existing imports keep working. `ContextResolver.resolve` no longer gates the Bedrock on `stance or anchor`: it is queued on Turn 1 of every session, including fresh installs with an empty personality graph and no `persona_prompt`. `config.persona_prompt` is no longer suppressed when learned `trait`/`directive`/`preference` nodes exist; it stays as the baseline anchor at the top of `[Persona Stance]`. Side effects: the first resolve of a session is never `""`, and the proxy log `traits=` count includes the anchor line. Tests updated to the new text and behavior, plus new tests for Bedrock with an empty graph and with `format_context_delta` given no personality entities. No schema change; `SessionLedger` and `session.py` untouched. 795 tests pass with `-W error`.
 
+### `OBS-POL-012`: Conversational Volley & Pacing Calibration of `BEDROCK_INVARIANT` — **Resolved**
+* **Component:** `src/strand/prompts.py`
+* **Symptom:** The prior "concise, rhythmic prose paragraphs" wording still let the model answer open-ended questions with one monolithic essay.
+* **Resolution:** `BEDROCK_INVARIANT` now directs a back-and-forth cadence for open-ended discussion: a concise high-level take (1–2 short paragraphs) on the primary trade-offs, then a check of the operator's direction before deep specs or exhaustive lists. Lists/tables stay reserved for code, commands and spec sheets, and imperative tool/technical tasks keep Task-Yield (state the result plainly and stop). Existing tests reference the constant symbolically, so no assertions changed. No schema change.
+
 ### `OBS-POL-011`: Bedrock Eviction Vulnerability in `SessionLedger` (Audit R1) — **Resolved**
 * **Component:** `src/strand/session.py`, `src/strand/resolver.py`
 * **Symptom:** When stored context blocks exceeded `MAX_REPLAY_CHARS` (12000), the oldest block, Turn 1 carrying `BEDROCK_ID` and `BEDROCK_INVARIANT`, was popped and un-seen, so the model lost its peer stance mid-conversation (and the Bedrock was re-queued as new).
@@ -193,6 +198,7 @@ This document tracks real-world friction points, visual bugs, design observation
 ### `OBS-UI-002`: Transcript Presentation (Unboxed Text vs. Cards) — **Resolved**
 * **Component:** `src/strand/ui/qml/main.qml`, `bridge.py`
 * **Resolution:** Conversational text wraps into adaptive assistant bubbles (#13171f), while code blocks and tables expand into full technical slate cards (#0c0f14) with identity headers and variable turn spacing.
+* **Semantic intra-turn spacing:** `split_blocks` tags prose paragraphs ending in `?` as `is_pivot`. Continuous prose stays tight (8px), the pivot volley handing the turn back gets ~18px of breathing room, and transitions to/from technical cards use 14px; speaker-change gutter stays 30px. Bubble padding softened to 16px/12px.
 
 ### `OBS-ERG-003`: Stream Throughput Pacing & Grounding Transparency — **Resolved**
 * **Component:** `src/strand/ui/bridge.py` & `main.qml`
