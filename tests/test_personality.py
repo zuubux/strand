@@ -13,6 +13,7 @@ from strand.extractors import SYSTEM_PROMPT, LLMExtractor
 from strand.common import BEDROCK_INVARIANT
 from strand.resolver import ContextResolver
 from strand.stopwords import is_valid_entity_name
+from tests.conftest import HOST_TIME_LINE
 
 QUERY = "Stop apologizing, be more terse, and give me unified diffs for every code change."
 RESPONSE = "Understood. I will keep replies terse and send every code change as a unified diff."
@@ -196,7 +197,7 @@ def test_empty_sections_are_omitted_and_plain_output_unchanged(tmp_path):
         return only_rule, plain
 
     only_rule, plain = run(scenario())
-    assert only_rule == f"## Strand Memory\n{BEDROCK_INVARIANT}\n[Operational Directives]\n- no-filler: No conversational filler"
+    assert only_rule == f"## Strand Memory\n{BEDROCK_INVARIANT}\n[Operational Directives]\n- no-filler: No conversational filler\n{HOST_TIME_LINE}"
     assert "[Persona Stance]" not in only_rule and "[Interaction Preferences]" not in only_rule
     assert plain.startswith(f"## Strand Memory\n{BEDROCK_INVARIANT}\nEntities:") and "[Working Memory]" not in plain
 
@@ -210,7 +211,7 @@ def test_persona_prompt_anchor_injected_once_per_session(tmp_path):
             return first, second
 
     first, second = run(scenario())
-    assert first == f"## Strand Memory\n{BEDROCK_INVARIANT}\n[Persona Stance]\nCalm, unhurried peer."
+    assert first == f"## Strand Memory\n{BEDROCK_INVARIANT}\n[Persona Stance]\nCalm, unhurried peer.\n{HOST_TIME_LINE}"
     assert second == ""
 
 
@@ -224,7 +225,7 @@ def test_private_personality_nodes_hidden_unless_allowed(tmp_path):
             return hidden, shown
 
     hidden, shown = run(scenario())
-    assert hidden == f"## Strand Memory\n{BEDROCK_INVARIANT}"
+    assert hidden == f"## Strand Memory\n{BEDROCK_INVARIANT}\n{HOST_TIME_LINE}"
     assert "secret-rule" in shown
 
 

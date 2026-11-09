@@ -6,6 +6,7 @@ from strand.common import BEDROCK_INVARIANT
 from strand.db import DatabaseManager
 from strand.resolver import ContextResolver
 from strand.session import SessionLedger
+from tests.conftest import HOST_TIME_LINE
 
 FACTORY = "Factory persona: chirpy helper."
 
@@ -314,7 +315,7 @@ def test_bedrock_injected_with_empty_graph_and_no_persona(tmp_path):
             return await resolver.resolve("hello", "s"), await resolver.resolve("hello", "s")
 
     first, second = run(scenario())
-    assert first == f"## Strand Memory\n{BEDROCK_INVARIANT}"
+    assert first == f"## Strand Memory\n{BEDROCK_INVARIANT}\n{HOST_TIME_LINE}"
     assert second == ""
 
 
@@ -323,4 +324,26 @@ def test_format_context_delta_includes_bedrock_with_no_personality_entities():
     from strand.session import SessionDelta
 
     out = format_context_delta([], [], SessionDelta([BEDROCK_ID], []))
-    assert out == f"## Strand Memory\n{BEDROCK_INVARIANT}"
+    assert out == f"## Strand Memory\n{BEDROCK_INVARIANT}\n{HOST_TIME_LINE}"
+
+
+def test_resolved_envelope_includes_host_temporal_context(tmp_path):
+    async def scenario():
+        async with DatabaseManager(tmp_path / "m.db") as db:
+            resolver = ContextResolver(db, persona_prompt=FACTORY)
+            return await resolver.resolve("hello", "s"), await resolver.resolve("hello", "s")
+
+    first, second = run(scenario())
+    assert HOST_TIME_LINE in first
+    assert first.index(BEDROCK_INVARIANT) < first.index(HOST_TIME_LINE)
+    assert second == ""
+
+
+def test_host_temporal_context_uses_local_timezone_format(monkeypatch):
+    import re
+
+    from strand import resolver
+
+    monkeypatch.undo()  # real clock, no frozen fixture
+    line = resolver._host_temporal_context()
+    assert re.fullmatch(r"\[Host Temporal Context: \w+, \w+ \d{2}, \d{4} \d{2}:\d{2}:\d{2} [^\]]+\]", line)

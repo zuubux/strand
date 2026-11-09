@@ -274,6 +274,12 @@ def detect_discrepancies(entities: Iterable[Entity], edges: Iterable[Edge], quer
     return found
 
 
+def _host_temporal_context() -> str:
+    """Host wall-clock line so the model does not fall back to its training-cutoff year."""
+    now = datetime.now().astimezone()
+    return f"[Host Temporal Context: {now.strftime('%A, %B %d, %Y %H:%M:%S %Z')}]"
+
+
 def format_context_delta(
     entities: Iterable[Entity],
     edges: Iterable[Edge],
@@ -347,6 +353,8 @@ def format_context_delta(
         lines += ["Entities:", *entity_lines]
     if edge_lines:
         lines += ["Relations:", *edge_lines]
+    if BEDROCK_ID in new_entities:  # Turn 1 only, so Turn 2+ deltas stay empty (0-token tax)
+        lines.append(_host_temporal_context())
     return "\n".join(lines)
 
 
