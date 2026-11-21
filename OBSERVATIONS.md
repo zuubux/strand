@@ -147,6 +147,10 @@ This document tracks real-world friction points, visual bugs, design observation
 
 ## 2. Resolved Observations & Regressions
 
+### `NET-IMG-013`: Upstream HTTP 413 from Oversized Base64 Images — **Resolved**
+* **Component:** `src/strand/tools/workspace.py` (`normalize_image`, `read_image`), `src/strand/ui/bridge.py` (`_image_data_uris`)
+* **Resolution:** Images over 1536 px or 1.5 MB are downscaled and re-encoded (JPEG q85, PNG if transparent and small) with `QImage`; small images pass through byte-identical. Multi-image turns are held to a 6 MiB combined budget with progressively smaller tiers, so the body stays below the 10,485,760-byte upstream limit. Verified offline by tests with 3000x2000 noise PNGs. No DDL; no blobs in `memory.db`.
+
 ### `SEC-LOG-004`: Cleartext Entity and Deprecation Leaks at INFO Verbosity — **Resolved**
 * **Component:** `src/strand/distill.py`, `src/strand/db.py`
 * **Resolution:** Demoted entity-level extraction traces, alias merging, and deprecation rationales to `logger.debug()`. Production `INFO` logs record only aggregate operational counts and session identifiers.
@@ -203,6 +207,7 @@ This document tracks real-world friction points, visual bugs, design observation
 ### `OBS-ERG-003`: Stream Throughput Pacing & Grounding Transparency — **Resolved**
 * **Component:** `src/strand/ui/bridge.py` & `main.qml`
 * **Resolution:** Client-side token pacing implemented at ~67 tokens/sec with instant Tab-key flush. Added the `X-Strand-Grounding` ~150 ms header pip pulse to visually signify memory retrieval before stream rendering begins.
+* **Follow-up (word-boundary draining):** the fixed ~4-5 char slice per 16 ms tick split words mid-syllable and flashed unclosed Markdown markers. `Bridge._drain_text` now extends each tick's cut to the end of the current word (whitespace boundary), debits the actual released length from the credit (it may go negative and repays on the next ticks, so the average stays ~67 t/s), and caps unbroken runs at `MAX_WORD_CHARS` (24). `flush_stream()` and `pace_tps=0` are unchanged; the socket/proxy remain unthrottled.
 
 ### `OBS-UI-006`: Diagnostics Slide-Out Legibility & Canvas Interference — **Resolved**
 * **Component:** `src/strand/ui/qml/main.qml` (`telemetryDrawer`)
@@ -265,3 +270,21 @@ This document tracks real-world friction points, visual bugs, design observation
 ### `OBS-UI-015`: Input Dock Gating During Onboarding — **Resolved**
 * **Component:** `src/strand/ui/qml/main.qml` (input dock, first-run setup)
 * **Resolution:** The dock is hidden until setup completes (`visible: bridge.isConfigured`), so it cannot take input over the setup wizard. Tab isolation: the input has `activeFocusOnTab` and `enabled` bound to `bridge.isConfigured`, so Tab cannot reach it during setup. On completion, focus is deferred with `Qt.callLater` and then moved to the input via `forceActiveFocus()`, after the dock is visible.
+
+### `OBS-UI-016`: Attachment Ingestion Limited to a Small Dock Drop Target — **Resolved**
+* **Component:** `src/strand/ui/qml/main.qml` (`windowDropArea`, `attachButton`, `attachDialog`, `messageInput`), `src/strand/ui/bridge.py` (`pasteClipboardImage`, `primaryRootUrl`)
+* **Symptom:** Files could only be dropped on the input dock, and screenshots on the clipboard could not be attached at all.
+* **Resolution:** Window-wide `DropArea` (z 50, disabled under the drawer and settings modal, non-blocking for clicks and wheel), a `+` file picker and `Ctrl+V` image staging into `<first_root>/.strand_staging/` (dir `0700`, PNG `0600`) so pasted images pass `is_safe_path` and `read_image`. Staged pastes are not auto-deleted; the operator can remove the folder. Dock geometry is unchanged (BUG-UI-001).
+* **Tests:** `tests/test_ui.py` (`test_paste_clipboard_*`, `test_primary_root_url`, `test_qml_window_drop_area_and_attach_controls`).
+
+### `OBS-UI-017`: Out-of-Workspace Attachments, Drag-Over Watermark and Test Teardown Segfault — **Resolved**
+* **Component:** `src/strand/ui/bridge.py` (`inspectDroppedFile`, `_stage_copy`, `_cleanup_staging`, `_attachment_preamble`), `src/strand/ui/qml/main.qml`, `tests/test_ui.py` (`_drain_bridges`)
+* **Symptom:** Files picked or dropped from `~/Downloads` / `~/Pictures` were either rejected or staged at a path that `read_image`/`read_file` refused with `access_denied`, so Flash-Lite looped until `MAX_TOOL_ITERATIONS`. The empty-state "Ask Strand anything" text overlapped the "Drop files to attach" pill. The UI test run segfaulted intermittently at teardown.
+* **Resolution:** `inspectDroppedFile` first applies `is_denied_file()` (`.env*`, `*.key`, `id_rsa*`, ... rejected from anywhere, `denied_file`). Files already inside `workspace_roots` use their canonical path. Other regular files up to `MAX_STAGE_BYTES` (25 MiB) are copied (`O_EXCL`, `0600`) into `<primary_root>/.strand_staging/<ns-timestamp>_<name>` (dir `0700`), so the tools succeed on turn 1. Staged copies (including clipboard pastes) are deleted on `newConversation()` and `shutdown()`, and the dir is removed when empty. With no workspace root, outside files are still `outside_workspace`. With two or more attachments the `[Attached files ...]` header tells the model to call `read_image`/`read_file` for all files in one parallel tool turn. The watermark fades (120 ms) while `windowDropArea.containsDrag`. The `_drain_bridges` fixture now stops timers, shuts down (joins workers), `deleteLater()`s, flushes `DeferredDelete`, runs `gc.collect()` and only then calls `processEvents()`. SEC-NET-007, `is_safe_path` and the deny-list are unchanged; no DDL, no blobs in `memory.db`.
+* **Tests:** `tests/test_ui.py` (`test_out_of_workspace_drop_*`, `test_denied_files_never_staged`, `test_multi_attachment_preamble_requests_parallel_reads`).
+
+### `BUG-UI-018`: Multi-Image Attachments Returned an Empty Completion; Misleading Empty-Turn Notice — **Resolved**
+* **Component:** `src/strand/ui/bridge.py` (`sendMessage`, `_start_turn`, `_image_data_uris`, `_attachment_preamble`), `src/strand/ui/qml/main.qml` (`emptyNotice`)
+* **Symptom:** With 2+ attached images, the text hint asking for parallel `read_image` calls made `gemini-flash-lite-latest` (Google OpenAI-compat) return an empty 0-token completion, and the UI then claimed the tool iteration limit was hit.
+* **Resolution:** Attached images are validated through `read_image` and sent as `image_url` data-URI parts alongside the text part of the upstream user message. Non-image files keep the `[Attached files ...]` `read_file` header. `Bridge.history` stores only the prompt and metadata (no base64); `SessionLedger.compact_history` evicts the user `image_url` parts on turn 2+. No DDL; nothing enters `memory.db`. The empty-turn notice now reads "No response returned by upstream model."
+* **Tests:** `tests/test_ui.py` (`test_send_message_images_are_inline_multimodal_parts`, `test_compact_history_evicts_user_image_url_parts`, `test_attachment_preamble_lists_only_non_images`, `test_empty_turn_notice_is_upstream_accurate`).

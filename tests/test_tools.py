@@ -578,6 +578,40 @@ def test_read_image_encodes_valid_image(tmp_path):
     assert viaq["data_uri"] == out["data_uri"]
 
 
+
+def _noise_png(path, w=3000, h=2000):
+    from PySide6.QtGui import QImage
+
+    raw = os.urandom(w * h)
+    img = QImage(raw, w, h, w, QImage.Format.Format_Grayscale8).copy()
+    assert img.save(str(path), "PNG")
+    return path
+
+
+def test_read_image_downscales_large_png(tmp_path):
+    import base64
+
+    from PySide6.QtGui import QImage
+
+    root = _root(tmp_path)
+    big = _noise_png(root / "big.png")
+    assert big.stat().st_size > 2 * 1024 * 1024
+    out = read_image(str(big), [root])
+    assert "error" not in out and out["mime_type"] == "image/jpeg"
+    prefix = "data:image/jpeg;base64,"
+    assert out["data_uri"].startswith(prefix) and len(out["data_uri"]) < 2 * 1024 * 1024
+    decoded = QImage.fromData(base64.b64decode(out["data_uri"][len(prefix):]))
+    assert not decoded.isNull() and max(decoded.width(), decoded.height()) == 1536
+    assert decoded.width() * 2 == decoded.height() * 3 or abs(decoded.width() * 2 - decoded.height() * 3) <= 3
+
+
+def test_read_image_small_passthrough_unchanged(tmp_path):
+    root = _root(tmp_path)
+    (root / "tiny.png").write_bytes(PNG_BYTES)
+    out = read_image(str(root / "tiny.png"), [root])
+    assert out["mime_type"] == "image/png" and out["bytes"] == len(PNG_BYTES)
+
+
 def test_read_image_fails_closed(tmp_path, monkeypatch):
     root = _root(tmp_path)
     outside = tmp_path / "outside.png"

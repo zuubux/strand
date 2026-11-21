@@ -13,6 +13,7 @@ import getpass
 import json
 import os
 import re
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -27,7 +28,8 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 import httpx
-from PySide6.QtCore import Property, QObject, QTimer, Signal, Slot
+from PySide6.QtCore import Property, QObject, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QGuiApplication, QImage
 
 from strand.config import (
     Config,
@@ -43,7 +45,13 @@ from strand.config import (
 from strand.db import _ACTIVE, PRIVATE_ENTITY_SQL, DatabaseManager
 from strand.host import get_host_context
 from strand.perms import secure_parent_dir
-from strand.tools.workspace import IMAGE_MIME_TYPES, MAX_BATCH_FILE_BYTES, is_safe_path
+from strand.tools.workspace import (
+    IMAGE_MIME_TYPES,
+    MAX_BATCH_FILE_BYTES,
+    is_denied_file,
+    is_safe_path,
+    read_image,
+)
 from strand.onboarding import seed_operator_anchor
 from strand.onboarding import operator_name as anchor_operator_name
 
@@ -53,6 +61,10 @@ CHAT_PATH = "/v1/chat/completions"
 PRIVATE_HEADER = "X-Strand-Allow-Private"
 HISTORY_LIMIT = 100
 IMAGE_TOKEN_ESTIMATE = 1600
+IMAGE_PAYLOAD_BUDGET = 6 * 1024 * 1024  # combined inline image data URIs per turn (upstream limit: 10 MiB)
+IMAGE_TIERS = ((1536, 1536 * 1024, 85), (1024, 600 * 1024, 75), (768, 300 * 1024, 65), (512, 150 * 1024, 55))
+STAGING_DIR_NAME = ".strand_staging"
+MAX_STAGE_BYTES = 25 * 1024 * 1024  # largest out-of-workspace file copied into staging
 EXTRACTOR_TIMEOUT = 1.5
 MODEL_PROBE_TIMEOUT = 3.0
 EXTRACTOR_TAGS_TIMEOUT = 2.0
@@ -76,6 +88,7 @@ SETTINGS_KEYS: dict[str, str] = {
 PACE_TOKENS_PER_SEC = 67.0  # ~65-70 t/s (~270 chars/s): ~1.07 token (~4-5 chars) credit per 16 ms tick
 PACE_INTERVAL_MS = 16
 CHARS_PER_TOKEN = 4
+MAX_WORD_CHARS = 24  # unbroken run (URL, path, base64) released at once so the pacer never stalls
 GROUNDING_HEADER_NAME = "X-Strand-Grounding"
 MUTATIONS_HEADER_NAME = "X-Strand-Mutations"
 RESTORE_PATH = "/v1/backups/restore"
@@ -530,7 +543,7 @@ class Bridge(QObject):
         self._session_id = f"ui-{uuid.uuid4().hex[:12]}"
         self._uds_path, self._base_url = resolve_endpoint(self._config)
         self._client_factory = client_factory
-        self._history: list[dict[str, str]] = []
+        self._history: list[dict[str, Any]] = []
         self._status = "Connecting…"
         self._busy = False
         self._lock = threading.Lock()
@@ -548,6 +561,7 @@ class Bridge(QObject):
         self._mutations: list[dict[str, str]] = []
         self._reverted: list[str] = []
         self._workers: dict[threading.Thread, tuple[asyncio.AbstractEventLoop, asyncio.Task[None]]] = {}
+        self._staged: set[Path] = set()  # ephemeral copies this Bridge made in .strand_staging/
 
     @Property(list, notify=activeStanceNodesChanged)
     def activeStanceNodes(self) -> list[str]:
@@ -780,7 +794,7 @@ class Bridge(QObject):
         return len(self._buffer)
 
     @property
-    def history(self) -> list[dict[str, str]]:
+    def history(self) -> list[dict[str, Any]]:
         return list(self._history)
 
     # -- client-side stream pacing (OBS-ERG-003) ---------------------------------------
@@ -892,20 +906,51 @@ class Bridge(QObject):
         out: list[str] = []
         if not everything and time.monotonic() < self._hold_until:
             return ""
-        while everything or self._credit > 0:
-            try:
+        if everything:
+            while self._buffer:
                 generation, text = self._buffer.popleft()
-            except IndexError:
+                if generation == self._generation:  # else: stale chunk of a reset conversation
+                    out.append(text)
+            return "".join(out)
+        while self._credit >= 1 and self._buffer:
+            if self._buffer[0][0] != self._generation:
+                self._buffer.popleft()  # stale chunk of a reset conversation
+                continue
+            want = int(self._credit)
+            reach = max(want, MAX_WORD_CHARS)
+            head: list[str] = []
+            size = 0
+            for generation, text in self._buffer:
+                if generation != self._generation:
+                    continue
+                head.append(text)
+                size += len(text)
+                if size >= reach:
+                    break
+            window = "".join(head)
+            if not window:
                 break
-            if generation != self._generation:
-                continue  # stale chunk of a reset conversation
-            out.append(text)
-            if not everything:
-                self._credit -= max(1, -(-len(text) // CHARS_PER_TOKEN))
+            cut = min(want, len(window))
+            while cut < min(len(window), reach) and not window[cut - 1].isspace():
+                cut += 1  # finish the current word (and its trailing whitespace)
+            released = window[:cut]
+            left = cut
+            while left > 0:  # consume whole chunks; trim the partially released one
+                generation, text = self._buffer[0]
+                if generation != self._generation:
+                    self._buffer.popleft()
+                elif len(text) <= left:
+                    self._buffer.popleft()
+                    left -= len(text)
+                else:
+                    self._buffer[0] = (generation, text[left:])
+                    left = 0
+            out.append(released)
+            self._credit -= len(released)  # may go negative; repaid over the next ticks
         return "".join(out)
 
     def _tick(self) -> None:
-        self._credit += self._pace_tps * PACE_INTERVAL_MS / 1000
+        self._credit += self._pace_tps * CHARS_PER_TOKEN * PACE_INTERVAL_MS / 1000  # chars
         text = self._drain_text(False)
         if text:
             self._emit_text(text)
@@ -1160,15 +1205,27 @@ class Bridge(QObject):
             path = Path(unquote(raw)).resolve()
         except (OSError, RuntimeError, ValueError):
             return {"safe": False, "error": "invalid_path", "path": raw}
-        ok, _ = is_safe_path(path, self._config.resolved_workspace_roots())
-        if not ok:
-            return {"safe": False, "error": "outside_workspace", "path": str(path)}
+        if is_denied_file(path):
+            return {"safe": False, "error": "denied_file", "path": str(path)}
+        roots = self._config.resolved_workspace_roots()
+        inside, _ = is_safe_path(path, roots)
         try:
             if not path.is_file():
                 return {"safe": False, "error": "not_a_file", "path": str(path)}
             size = path.stat().st_size
         except OSError:
             return {"safe": False, "error": "unreadable", "path": str(path)}
+        if not inside:
+            # Explicit user pick/drop outside the roots: stage a private copy inside the primary
+            # root so read_image/read_file succeed on turn 1 instead of failing access_denied.
+            if not roots:
+                return {"safe": False, "error": "outside_workspace", "path": str(path)}
+            if size > MAX_STAGE_BYTES:
+                return {"safe": False, "error": "too_large", "path": str(path)}
+            staged = self._stage_copy(path, roots[0])
+            if staged is None:
+                return {"safe": False, "error": "stage_failed", "path": str(path)}
+            path = staged
         is_image = path.suffix.lower() in IMAGE_MIME_TYPES
         tokens = IMAGE_TOKEN_ESTIMATE if is_image else max(1, min(size, MAX_BATCH_FILE_BYTES) // 4)
         return {
@@ -1180,34 +1237,157 @@ class Bridge(QObject):
             "size_bytes": size,
         }
 
+    def _stage_copy(self, source: Path, root: Path) -> Path | None:
+        """Copy `source` to `<root>/.strand_staging/<ts>_<name>` (dir 0700, file 0600); None on failure."""
+        try:
+            staging = root / STAGING_DIR_NAME
+            staging.mkdir(mode=0o700, exist_ok=True)
+            os.chmod(staging, 0o700)
+            target = staging / f"{time.time_ns()}_{source.name}"
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as dst, open(source, "rb") as src:
+                shutil.copyfileobj(src, dst)
+            os.chmod(target, 0o600)
+            resolved = target.resolve()
+        except OSError:
+            return None
+        self._staged.add(resolved)
+        return resolved
+
+    def _cleanup_staging(self) -> None:
+        """Delete the staged copies this Bridge created (and the dir when left empty)."""
+        staged, self._staged = self._staged, set()
+        parents: set[Path] = set()
+        for path in staged:
+            parents.add(path.parent)
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        for parent in parents:
+            try:
+                parent.rmdir()
+            except OSError:
+                pass  # not empty (other sessions) or already gone
+
+    @Slot(result=str)
+    def primaryRootUrl(self) -> str:
+        """`file://` URL of the first workspace root (FileDialog default folder); "" when none."""
+        roots = self._config.resolved_workspace_roots()
+        return QUrl.fromLocalFile(str(roots[0])).toString() if roots else ""
+
+    @Slot(result="QVariantMap")
+    def pasteClipboardImage(self) -> dict[str, Any]:
+        """Stage a clipboard image as `<root>/.strand_staging/paste_<ts>.png` (file 0600, dir 0700).
+
+        Returns the `inspectDroppedFile` metadata, or `{"has_image": False}` when the clipboard has
+        no image so a normal text paste proceeds. The PNG lives on disk only; nothing enters memory.db.
+        """
+        clipboard = QGuiApplication.clipboard()
+        mime = clipboard.mimeData() if clipboard is not None else None
+        if mime is None or not mime.hasImage():
+            return {"has_image": False}
+        image = clipboard.image()
+        if not isinstance(image, QImage) or image.isNull():
+            return {"has_image": False}
+        roots = self._config.resolved_workspace_roots()
+        if not roots:
+            return {"has_image": True, "safe": False, "error": "no_workspace_root"}
+        try:
+            staging = roots[0] / STAGING_DIR_NAME
+            staging.mkdir(mode=0o700, exist_ok=True)
+            os.chmod(staging, 0o700)
+            target = staging / f"paste_{time.time_ns()}.png"
+            if not image.save(str(target), "PNG"):
+                return {"has_image": True, "safe": False, "error": "save_failed"}
+            os.chmod(target, 0o600)
+        except OSError:
+            return {"has_image": True, "safe": False, "error": "save_failed"}
+        self._staged.add(target.resolve())
+        info = self.inspectDroppedFile(str(target))
+        info["has_image"] = True
+        return info
+
+    def _attachment_meta(self, attachments: Any) -> list[dict[str, Any]]:
+        """Lightweight display metadata for re-validated attachments (never file contents)."""
+        meta: list[dict[str, Any]] = []
+        for item in attachments or []:
+            info = self.inspectDroppedFile(str(item))
+            if info.get("safe"):
+                meta.append(
+                    {
+                        "name": str(info["name"]),
+                        "path": str(info["path"]),
+                        "is_image": bool(info["is_image"]),
+                        "tokens": int(info["tokens"]),
+                    }
+                )
+        return meta
+
     def _attachment_preamble(self, attachments: Any) -> str:
-        """Prompt header naming re-validated attachments so Model A inspects them via tools."""
+        """Prompt header naming re-validated non-image attachments so Model A reads them via tools.
+
+        Images are not listed: they travel as inline multimodal `image_url` parts (see `sendMessage`).
+        """
         lines: list[str] = []
         for item in attachments or []:
             info = self.inspectDroppedFile(str(item))
-            if not info.get("safe"):
+            if not info.get("safe") or info["is_image"]:
                 continue
-            tool = "read_image" if info["is_image"] else "read_file"
-            lines.append(f"- {info['path']} (~{info['tokens']} tokens, use {tool})")
+            lines.append(f"- {info['path']} (~{info['tokens']} tokens, use read_file)")
         if not lines:
             return ""
-        return "[Attached files: inspect them with the workspace tools (read_file, read_image)]\n" + "\n".join(lines) + "\n\n"
+        header = "[Attached files: inspect them with the workspace tools (read_file)]\n"
+        return header + "\n".join(lines) + "\n\n"
+
+    def _image_data_uris(self, meta: list[dict[str, Any]]) -> list[str]:
+        """Data URIs for attached images, re-validated by `read_image` (roots, deny-list, magic, 10 MB).
+
+        Images are normalized and the combined payload is kept <= `IMAGE_PAYLOAD_BUDGET` (well under
+        the upstream 10 MiB body limit) by re-encoding at progressively smaller tiers; images that
+        still do not fit are dropped rather than risking an HTTP 413.
+        """
+        roots = self._config.resolved_workspace_roots()
+        paths = [str(i["path"]) for i in meta if i.get("is_image")]
+        uris: list[str] = []
+        for side, max_bytes, quality in IMAGE_TIERS:
+            uris = []
+            for path in paths:
+                uri = read_image(path, roots, side, max_bytes, quality).get("data_uri")
+                if isinstance(uri, str):
+                    uris.append(uri)
+            if sum(len(u) for u in uris) <= IMAGE_PAYLOAD_BUDGET:
+                return uris
+        kept: list[str] = []
+        total = 0
+        for uri in uris:
+            if total + len(uri) <= IMAGE_PAYLOAD_BUDGET:
+                kept.append(uri)
+                total += len(uri)
+        return kept
 
     @Slot(str, "QVariantList")
     def sendMessage(self, text: str, attachments: Any = None) -> None:
         text = text.strip()
         if not text:
             return
-        prompt = self._attachment_preamble(attachments) + text
+        meta = self._attachment_meta(attachments)
+        prompt = self._attachment_preamble([m["path"] for m in meta]) + text
         with self._lock:
             if self._busy:
                 return
             self._abort_requested = False
             self._set_busy(True)
         self._remember(text)
-        self._start_turn(prompt, locked=True)
+        self._start_turn(prompt, locked=True, attachments=meta, images=self._image_data_uris(meta))
 
-    def _start_turn(self, text: str, locked: bool = False) -> None:
+    def _start_turn(
+        self,
+        text: str,
+        locked: bool = False,
+        attachments: list[dict[str, Any]] | None = None,
+        images: list[str] | None = None,
+    ) -> None:
         """Append `text` as a user turn and stream the reply (no-op while busy)."""
         if not locked:
             with self._lock:
@@ -1215,8 +1395,18 @@ class Bridge(QObject):
                     return
                 self._abort_requested = False
                 self._set_busy(True)
-        self._history.append({"role": "user", "content": text})
-        messages = list(self._history)
+        entry: dict[str, Any] = {"role": "user", "content": text}
+        if attachments:
+            entry["attachments"] = attachments
+        self._history.append(entry)
+        # Display-only metadata never goes upstream.
+        messages: list[dict[str, Any]] = [
+            {"role": m["role"], "content": m["content"]} for m in self._history
+        ]
+        if images:  # ephemeral inline media: only in the upstream payload, never in history/memory.db
+            parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+            parts += [{"type": "image_url", "image_url": {"url": uri}} for uri in images]
+            messages[-1] = {"role": "user", "content": parts}
         generation = self._generation
         self._end_distilling()  # a new turn supersedes the previous weave feedback
         self._begin_strike()
@@ -1577,6 +1767,7 @@ class Bridge(QObject):
                 pass  # loop already closed: the worker is finishing on its own
         for thread, _ in workers:
             thread.join(timeout)
+        self._cleanup_staging()
 
     @Slot()
     def newConversation(self) -> None:
@@ -1586,6 +1777,7 @@ class Bridge(QObject):
             self.abort()
         self._buffer.clear()
         self._set_grounding(False, "")
+        self._cleanup_staging()
         self._history.clear()
         self._turn = {}
         self._session_id = f"ui-{uuid.uuid4().hex[:12]}"

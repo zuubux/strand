@@ -1,6 +1,10 @@
 import asyncio
+import gc
 import json
 import os
+import stat
+import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -37,12 +41,17 @@ def _drain_bridges(monkeypatch):
     monkeypatch.setattr(Bridge, "__init__", tracking_init)
     yield
     for b in bridges:
-        b.shutdown()
         for timer in (b._timer, b._distill_timer, b._strike_timer):
             timer.stop()
+        b.shutdown()  # cancels workers, joins threads, removes staged copies
+        b.deleteLater()
+    bridges.clear()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+    gc.collect()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
     QCoreApplication.processEvents()
     QCoreApplication.sendPostedEvents(None, 0)
+    QCoreApplication.processEvents()
 
 
 def sse(*tokens, done=True):
@@ -1024,6 +1033,53 @@ def test_default_pace_is_about_67_tps_with_small_per_tick_slices(qapp):
     assert b.buffered == 0
 
 
+def test_paced_ticks_release_whole_words(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("x")))
+    events = collect(b)
+    text = "The quick **brown** fox jumps over `lazy` dogs while streaming smoothly "
+    b._relay(b._generation, True, "t0 ")
+    for i in range(0, len(text), 7):  # arbitrary socket chunking splits words
+        b._relay(b._generation, True, text[i : i + 7])
+    for _ in range(100):
+        b._tick()
+    chunks = [t for k, t in events if k == "chunk"][1:]
+    assert chunks and "".join(chunks) == text
+    assert all(c[-1].isspace() for c in chunks)  # every tick ends on a word boundary
+    assert all(not c[0].isspace() or c.strip() == "" for c in chunks[:1])
+
+
+def test_word_boundary_drain_keeps_average_pace_and_flush(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("x")))
+    events = collect(b)
+    words = "alpha beta gamma delta epsilon zeta eta theta iota kappa "
+    b._relay(b._generation, True, "t0 ")
+    total = 0
+    for _ in range(40):
+        b._relay(b._generation, True, words)
+        total += len(words)
+    ticks = round(1000 / bridge_mod.PACE_INTERVAL_MS)
+    for _ in range(ticks):
+        b._tick()
+    drained = sum(len(t) for k, t in events if k == "chunk") - len("t0 ")
+    expected = bridge_mod.PACE_TOKENS_PER_SEC * bridge_mod.CHARS_PER_TOKEN
+    assert abs(drained - expected) <= 0.1 * expected  # ~67 t/s (~270 chars/s)
+    assert b.flush_stream() == total - drained
+    assert b.buffered == 0
+
+
+def test_long_unbroken_string_drains_without_stalling(qapp):
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("x")))
+    events = collect(b)
+    blob = "A" * 100
+    b._relay(b._generation, True, "t0 ")
+    b._relay(b._generation, True, blob)
+    for _ in range(200):
+        b._tick()
+    chunks = [t for k, t in events if k == "chunk"][1:]
+    assert "".join(chunks) == blob and b.buffered == 0
+    assert all(len(c) <= bridge_mod.MAX_WORD_CHARS for c in chunks)
+
+
 def test_paced_turn_defers_finish_until_drained_and_flush_completes_it(qapp):
     import time
 
@@ -1839,9 +1895,10 @@ def test_inspect_dropped_image(qapp, tmp_path):
 
 def test_inspect_dropped_outside_workspace(qapp, tmp_path):
     b, root = _roots_bridge(tmp_path)
-    outside = tmp_path / "secret.txt"
+    outside = tmp_path / "plain.txt"
     outside.write_text("nope")
-    info = b.inspectDroppedFile(outside.as_uri())
+    b2 = make_bridge(lambda r: httpx.Response(200, content=b""), config=Config(workspace_roots=[]))
+    info = b2.inspectDroppedFile(outside.as_uri())
     assert info == {"safe": False, "error": "outside_workspace", "path": str(outside.resolve())}
 
 
@@ -1851,7 +1908,8 @@ def test_inspect_dropped_symlink_escape_and_directory(qapp, tmp_path):
     outside.write_text("nope")
     link = root / "link.txt"
     link.symlink_to(outside)
-    assert b.inspectDroppedFile(link.as_uri())["error"] == "outside_workspace"
+    info = b.inspectDroppedFile(link.as_uri())  # resolved target is outside: staged, never the link
+    assert info["safe"] is True and Path(info["path"]).parent == root.resolve() / ".strand_staging"
     assert b.inspectDroppedFile(root.as_uri())["safe"] is False
 
 
@@ -1873,6 +1931,118 @@ def test_send_message_prepends_attachment_context(qapp, tmp_path):
     assert str(f.resolve()) in pre and "read_file" in pre
     assert str(out.resolve()) not in pre
     assert b._attachment_preamble([]) == ""
+
+
+def test_send_message_retains_attachment_metadata_without_bytes(qapp, tmp_path):
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, content=b"data: [DONE]\n\n")
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    doc = root / "a.py"
+    doc.write_text("SECRET_BODY = 1")
+    img = root / "shot.png"
+    img.write_bytes(b"\x89PNG" + b"RAWBYTES" * 10)
+    outside = tmp_path / "out.txt"
+    outside.write_text("x")
+    b = make_bridge(handler, config=Config(workspace_roots=[str(root)]))
+    b._start_turn(
+        "hi", attachments=b._attachment_meta([doc.as_uri(), img.as_uri(), outside.as_uri()])
+    )
+    entry = b.history[0]
+    assert entry["content"] == "hi"
+    assert entry["attachments"][:2] == [
+        {"name": "a.py", "path": str(doc.resolve()), "is_image": False, "tokens": 3},
+        {"name": "shot.png", "path": str(img.resolve()), "is_image": True, "tokens": 1600},
+    ]
+    staged = entry["attachments"][2]  # the out-of-workspace pick is staged inside the root
+    assert staged["name"].endswith("_out.txt") and not staged["is_image"]
+    assert Path(staged["path"]).parent == root.resolve() / ".strand_staging"
+    dumped = json.dumps(b.history)
+    assert "SECRET_BODY" not in dumped and "RAWBYTES" not in dumped
+    for _ in range(100):
+        if seen:
+            break
+        time.sleep(0.05)
+    assert seen and all(set(m) == {"role", "content"} for m in seen[0]["messages"])
+    b.newConversation()
+    assert b.history == []
+
+
+def test_send_message_slot_records_attachments(qapp, tmp_path):
+    root = tmp_path / "ws"
+    root.mkdir()
+    f = root / "n.md"
+    f.write_text("abcd" * 10)
+    b = make_bridge(
+        lambda r: httpx.Response(200, content=b"data: [DONE]\n\n"),
+        config=Config(workspace_roots=[str(root)]),
+    )
+    b.sendMessage("look", [f.as_uri()])
+    assert b.history[0]["attachments"][0]["name"] == "n.md"
+    assert b.history[0]["content"].endswith("look")
+    b.newConversation()
+    assert b.history == []
+
+
+def test_paste_clipboard_image_stages_0600_png_in_workspace(qapp, tmp_path):
+    from PySide6.QtGui import QColor, QGuiApplication, QImage
+
+    b, root = _roots_bridge(tmp_path)
+    image = QImage(8, 6, QImage.Format_RGB32)
+    image.fill(QColor("#38bdf8"))
+    QGuiApplication.clipboard().setImage(image)
+    info = b.pasteClipboardImage()
+    assert info["has_image"] is True and info["safe"] is True and info["is_image"] is True
+    assert info["tokens"] == 1600 and info["name"].startswith("paste_") and info["name"].endswith(".png")
+    staged = Path(info["path"])
+    assert staged.parent == root.resolve() / ".strand_staging"
+    assert staged.read_bytes().startswith(b"\x89PNG")
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+    assert stat.S_IMODE(staged.parent.stat().st_mode) == 0o700
+    assert QImage(str(staged)).size() == image.size()
+
+
+def test_paste_clipboard_text_only_falls_back(qapp, tmp_path):
+    from PySide6.QtGui import QGuiApplication
+
+    b, root = _roots_bridge(tmp_path)
+    QGuiApplication.clipboard().setText("just text")
+    assert b.pasteClipboardImage() == {"has_image": False}
+    assert not (root / ".strand_staging").exists()
+
+
+def test_paste_clipboard_image_without_workspace_root(qapp):
+    from PySide6.QtGui import QColor, QGuiApplication, QImage
+
+    b = make_bridge(lambda r: httpx.Response(200, content=b""), config=Config(workspace_roots=[]))
+    image = QImage(4, 4, QImage.Format_RGB32)
+    image.fill(QColor("red"))
+    QGuiApplication.clipboard().setImage(image)
+    info = b.pasteClipboardImage()
+    assert info["has_image"] is True and info["safe"] is False
+    assert b.primaryRootUrl() == ""
+
+
+def test_primary_root_url(qapp, tmp_path):
+    b, root = _roots_bridge(tmp_path)
+    assert b.primaryRootUrl() == root.resolve().as_uri()
+
+
+def test_qml_window_drop_area_and_attach_controls(qapp, home):
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    area = win.findChild(object, "windowDropArea")
+    assert area is not None and area.property("z") < 90
+    assert area.property("width") == win.property("width")
+    assert win.findChild(object, "dropIndicator").property("visible") is False
+    assert win.findChild(object, "attachButton") is not None
+    assert win.findChild(object, "attachDialog") is not None
+    win.setProperty("settingsOpen", True)
+    assert area.property("enabled") is False
 
 
 # -- 4-step setup wizard ---------------------------------------------------------------
@@ -1991,3 +2161,170 @@ def test_artifact_plate_instantiates_offscreen(qapp):
     assert plate.property("badge") == "python"
     plate.deleteLater()
     engine.deleteLater()
+
+
+def test_out_of_workspace_drop_is_staged_0600_and_cleaned(qapp, tmp_path):
+    b, root = _roots_bridge(tmp_path)
+    downloads = tmp_path / "Downloads"
+    downloads.mkdir()
+    img = downloads / "photo.png"
+    img.write_bytes(b"\x89PNG" + b"1" * 50)
+    info = b.inspectDroppedFile(img.as_uri())
+    assert info["safe"] is True and info["is_image"] is True and info["name"].endswith("_photo.png")
+    staged = Path(info["path"])
+    assert staged.parent == root.resolve() / ".strand_staging"
+    assert staged.read_bytes() == img.read_bytes()
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+    assert stat.S_IMODE(staged.parent.stat().st_mode) == 0o700
+    assert bridge_mod.is_safe_path(staged, [root.resolve()])[0]
+    again = b.inspectDroppedFile(str(staged))  # already in the workspace: used directly
+    assert again["path"] == str(staged)
+    b.newConversation()
+    assert not staged.exists()
+
+
+def test_out_of_workspace_drop_cleaned_on_shutdown(qapp, tmp_path):
+    b, root = _roots_bridge(tmp_path)
+    doc = tmp_path / "notes.txt"
+    doc.write_text("hello")
+    staged = Path(b.inspectDroppedFile(doc.as_uri())["path"])
+    assert staged.exists()
+    b.shutdown()
+    assert not staged.exists()
+    assert not (root / ".strand_staging").exists()
+
+
+def test_denied_files_never_staged(qapp, tmp_path):
+    b, root = _roots_bridge(tmp_path)
+    outside = tmp_path / "Downloads"
+    outside.mkdir()
+    for name in (".env", ".env.local", "id_rsa", "server.key"):
+        for base in (outside, root):
+            f = base / name
+            f.write_text("secret")
+            info = b.inspectDroppedFile(f.as_uri())
+            assert info["safe"] is False and info["error"] == "denied_file"
+    assert not (root / ".strand_staging").exists()
+
+
+def test_out_of_workspace_drop_size_limit_and_non_file(qapp, tmp_path, monkeypatch):
+    b, root = _roots_bridge(tmp_path)
+    monkeypatch.setattr(bridge_mod, "MAX_STAGE_BYTES", 10)
+    big = tmp_path / "big.bin"
+    big.write_bytes(b"x" * 11)
+    assert b.inspectDroppedFile(big.as_uri())["error"] == "too_large"
+    assert b.inspectDroppedFile(tmp_path.as_uri())["error"] == "not_a_file"
+    assert not (root / ".strand_staging").exists()
+
+
+def test_attachment_preamble_lists_only_non_images(qapp, tmp_path):
+    b, root = _roots_bridge(tmp_path)
+    a = root / "a.py"
+    a.write_text("1")
+    c = root / "c.png"
+    c.write_bytes(b"\x89PNG")
+    pre = b._attachment_preamble([a.as_uri(), c.as_uri()])
+    assert str(a.resolve()) in pre and "read_file" in pre
+    assert str(c.resolve()) not in pre and "read_image" not in pre and "parallel" not in pre
+    assert b._attachment_preamble([c.as_uri()]) == ""
+
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+
+
+def _noise_png(path, w=3000, h=2000):
+    from PySide6.QtGui import QImage
+
+    raw = os.urandom(w * h)
+    img = QImage(raw, w, h, w, QImage.Format.Format_Grayscale8).copy()
+    assert img.save(str(path), "PNG")
+    return path
+
+
+def test_send_message_multiple_large_images_stay_under_budget(qapp, tmp_path):
+    seen = []
+
+    def handler(request):
+        seen.append(request.content)
+        return httpx.Response(200, content=b"data: [DONE]\n\n")
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    imgs = [_noise_png(root / f"big{i}.png") for i in range(3)]
+    small = root / "small.png"
+    small.write_bytes(_PNG)
+    b = make_bridge(handler, config=Config(workspace_roots=[str(root)]))
+    b.sendMessage("compare", [p.as_uri() for p in imgs] + [small.as_uri()])
+    for _ in range(100):
+        if seen:
+            break
+        time.sleep(0.05)
+    assert seen
+    assert len(seen[0]) < 6 * 1024 * 1024 < 10485760
+    content = json.loads(seen[0])["messages"][-1]["content"]
+    urls = [p["image_url"]["url"] for p in content[1:]]
+    assert len(urls) == 4 and urls[-1].startswith("data:image/png;base64,")
+    assert all(u.startswith("data:image/jpeg;base64,") for u in urls[:3])
+
+
+def test_send_message_images_are_inline_multimodal_parts(qapp, tmp_path):
+    seen = []
+
+    def handler(request):
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, content=b"data: [DONE]\n\n")
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    doc = root / "a.py"
+    doc.write_text("x = 1")
+    imgs = []
+    for name in ("one.png", "two.png"):
+        f = root / name
+        f.write_bytes(_PNG)
+        imgs.append(f)
+    fake = root / "fake.png"
+    fake.write_bytes(b"not an image")
+    b = make_bridge(handler, config=Config(workspace_roots=[str(root)]))
+    b.sendMessage("compare", [doc.as_uri(), imgs[0].as_uri(), imgs[1].as_uri(), fake.as_uri()])
+    for _ in range(100):
+        if seen:
+            break
+        time.sleep(0.05)
+    assert seen
+    content = seen[0]["messages"][-1]["content"]
+    assert isinstance(content, list) and content[0]["type"] == "text"
+    assert content[0]["text"].endswith("compare") and str(doc.resolve()) in content[0]["text"]
+    assert str(imgs[0].resolve()) not in content[0]["text"]
+    urls = [p["image_url"]["url"] for p in content[1:] if p["type"] == "image_url"]
+    assert len(urls) == 2 and all(u.startswith("data:image/png;base64,") for u in urls)
+    assert len(content) == 3  # text + 2 images; fake.png (bad magic bytes) is dropped, not sent
+    entry = b.history[0]
+    assert isinstance(entry["content"], str) and "base64" not in json.dumps(b.history)
+    assert [a["name"] for a in entry["attachments"]][:1] == ["a.py"]
+
+
+def test_compact_history_evicts_user_image_url_parts():
+    from strand.session import SessionLedger
+
+    uri = "data:image/png;base64," + "QUJD" * 100
+    user1 = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": uri}},
+        ],
+    }
+    msgs = [user1, {"role": "assistant", "content": "ok"}, {"role": "user", "content": "next"}]
+    out = SessionLedger.compact_history(msgs)
+    assert "base64" not in json.dumps(out)
+    assert out[0]["content"][0] == {"type": "text", "text": "look"}
+    assert out[0]["content"][1]["type"] == "text" and "[Image:" in out[0]["content"][1]["text"]
+    assert SessionLedger.compact_history(msgs[:1])[0] is user1  # latest user turn keeps the media
+
+
+def test_empty_turn_notice_is_upstream_accurate():
+    qml = (Path(__file__).parent.parent / "src/strand/ui/qml/main.qml").read_text()
+    assert "No response returned by upstream model." in qml
+    assert "tool iteration limits" not in qml

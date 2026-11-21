@@ -7,6 +7,7 @@ from strand.config import Config, save_config_value
 from strand.db import DatabaseManager
 from strand.prompts import PERSONA_STANCES, get_persona_stance
 from strand.resolver import ContextResolver
+from tests.conftest import HOST_TIME_LINE
 
 
 def run(coro):
@@ -55,7 +56,7 @@ def test_resolver_injects_configured_stance(tmp_path, name):
             return first, second
 
     first, second = run(scenario())
-    assert first == f"## Strand Memory\n{BEDROCK_INVARIANT}\n[Persona Stance]\n{PERSONA_STANCES[name]}"
+    assert first == f"## Strand Memory\n{BEDROCK_INVARIANT}\n[Persona Stance]\n{PERSONA_STANCES[name]}\n{HOST_TIME_LINE}"
     assert second == ""
 
 

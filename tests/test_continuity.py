@@ -8,6 +8,7 @@ from strand.common import BEDROCK_INVARIANT
 from strand.db import DatabaseManager
 from strand.resolver import ContextResolver
 from strand.session import SessionLedger
+from tests.conftest import HOST_TIME_LINE
 
 DAY = 86400.0
 
@@ -90,7 +91,7 @@ def test_resolver_omits_when_unmatched_or_expired(tmp_path):
             return miss, expired, wide
 
     miss, expired, wide = run(scenario())
-    assert miss == f"## Strand Memory\n{BEDROCK_INVARIANT}"
+    assert miss == f"## Strand Memory\n{BEDROCK_INVARIANT}\n{HOST_TIME_LINE}"
     assert "[Recent Continuity]" not in expired and "Kiln" in expired
     assert "[Recent Continuity]" in wide
 

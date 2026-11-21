@@ -273,7 +273,7 @@ ApplicationWindow {
     ListModel { id: transcript }
 
     function note(message) {
-        transcript.append({ role: "note", body: message, pending: false, trail: "", mutations: "" })
+        transcript.append({ role: "note", body: message, pending: false, trail: "", mutations: "", attachments: "" })
     }
 
     // Context-delta whisper: nodes/rules traversed for the latest assistant turn.
@@ -494,7 +494,7 @@ ApplicationWindow {
         }
         welcomeKeyEdit.text = ""
         welcomeDismissed = true
-        transcript.append({ role: "assistant", body: result.ready, pending: false, trail: "", mutations: "" })
+        transcript.append({ role: "assistant", body: result.ready, pending: false, trail: "", mutations: "", attachments: "" })
         Qt.callLater(function() { input.forceActiveFocus() })
         return true
     }
@@ -549,17 +549,42 @@ ApplicationWindow {
                 rejected = true
                 continue
             }
-            var dup = false
-            for (var j = 0; j < attachedFiles.count; j++)
-                if (attachedFiles.get(j).path === info.path)
-                    dup = true
-            if (!dup)
-                attachedFiles.append({ path: info.path, name: info.name, tokens: info.tokens, isImage: info.is_image })
+            stageFile(info)
         }
         if (rejected) {
             dropWarning.visible = true
             dropWarningTimer.restart()
         }
+    }
+
+    function stageFile(info) {
+        for (var j = 0; j < attachedFiles.count; j++)
+            if (attachedFiles.get(j).path === info.path)
+                return
+        attachedFiles.append({ path: info.path, name: info.name, tokens: info.tokens, isImage: info.is_image })
+    }
+
+    function openAttachPicker() {
+        var start = bridge.primaryRootUrl()
+        if (start.length > 0)
+            attachDialog.currentFolder = start
+        attachDialog.open()
+    }
+
+    // Ctrl+V: stage a clipboard image; false lets the TextArea paste text as usual.
+    function pasteImage() {
+        if (!bridge)
+            return false
+        var info = bridge.pasteClipboardImage()
+        if (info.has_image !== true)
+            return false
+        if (info.safe === true)
+            stageFile(info)
+        else {
+            dropWarning.visible = true
+            dropWarningTimer.restart()
+        }
+        return true
     }
 
     function send() {
@@ -578,12 +603,16 @@ ApplicationWindow {
         }
         if (bridge.busy)
             return
-        transcript.append({ role: "user", body: text, pending: false, trail: "", mutations: "" })
-        transcript.append({ role: "assistant", body: "", pending: true, trail: "", mutations: "" })
-        input.text = ""
         var paths = []
-        for (var i = 0; i < attachedFiles.count; i++)
-            paths.push(attachedFiles.get(i).path)
+        var capsules = []
+        for (var i = 0; i < attachedFiles.count; i++) {
+            var f = attachedFiles.get(i)
+            paths.push(f.path)
+            capsules.push({ name: f.name, path: f.path, is_image: f.isImage, tokens: f.tokens })
+        }
+        transcript.append({ role: "user", body: text, pending: false, trail: "", mutations: "", attachments: capsules.length > 0 ? JSON.stringify(capsules) : "" })
+        transcript.append({ role: "assistant", body: "", pending: true, trail: "", mutations: "", attachments: "" })
+        input.text = ""
         attachedFiles.clear()
         bridge.sendMessage(text, paths)
     }
@@ -876,6 +905,8 @@ ApplicationWindow {
                 text: "Ask Strand anything"
                 color: root.dim
                 font.pixelSize: 15
+                opacity: windowDropArea.containsDrag ? 0.0 : 1.0
+                Behavior on opacity { NumberAnimation { duration: 120 } }
             }
 
             // Asymmetric turn geometry: the user is a compact, recessed, right-aligned card;
@@ -887,15 +918,17 @@ ApplicationWindow {
                 required property bool pending
                 required property string trail
                 required property string mutations
+                required property string attachments
                 required property int index
+                readonly property var attachmentList: (isUser && attachments.length > 0) ? JSON.parse(attachments) : []
                 readonly property bool isUser: role === "user"
                 // Turn hierarchy: the first row of a speaker group carries an identity header and a
                 // wide gap above it (30px); rows continuing a turn sit tight (6px; block gaps inside an assistant flow are semantic).
                 readonly property string prevRole: index > 0 ? transcript.get(index - 1).role : ""
-                // A finished assistant turn with no text (tool iteration limit) gets a dim notice
+                // A finished assistant turn with no text (e.g. empty upstream completion) gets a dim notice
                 // instead of an empty card or an orphan speaker header.
                 readonly property bool emptyTurn: role === "assistant" && !pending && body.trim().length === 0
-                readonly property string emptyNotice: "Unable to complete request within tool iteration limits."
+                readonly property string emptyNotice: "No response returned by upstream model."
                 readonly property bool showHeader: (isUser || role === "assistant") && !emptyTurn && prevRole !== role
                 readonly property real headerHeight: showHeader ? 24 : 0
                 readonly property real topGap: index === 0 ? 0 : (prevRole === role ? 6 : (role === "note" || prevRole === "note" ? 12 : 30))
@@ -978,7 +1011,7 @@ ApplicationWindow {
                     y: row.bodyTop
                     // Notes use the full column; user cards and the assistant thinking pill shrink to fit;
                     // assistant answers fill their bounded card width.
-                    width: (row.isUser || (isAssistant && isThinking)) ? Math.min(maxWidth, naturalWidth) : Math.max(0, maxWidth)
+                    width: (row.isUser && row.attachmentList.length > 0) ? Math.max(0, maxWidth) : (row.isUser || (isAssistant && isThinking)) ? Math.min(maxWidth, naturalWidth) : Math.max(0, maxWidth)
                     height: content.implicitHeight + 2 * vPad
 
                     Rectangle {
@@ -997,6 +1030,61 @@ ApplicationWindow {
                         y: bubble.vPad
                         width: bubble.width - 2 * bubble.hPad
                         spacing: 8
+
+                        // Attachment capsules (user turns): thumbnail for local images, icon + name otherwise.
+                        Flow {
+                            id: attachmentRow
+                            objectName: "attachmentRow"
+                            visible: row.attachmentList.length > 0
+                            width: parent.width
+                            height: visible ? implicitHeight : 0
+                            spacing: 6
+                            Repeater {
+                                model: row.attachmentList
+                                delegate: Rectangle {
+                                    id: capsule
+                                    required property var modelData
+                                    objectName: "attachmentCapsule"
+                                    readonly property bool showThumb: modelData.is_image === true && thumb.status === Image.Ready
+                                    height: showThumb ? 80 : 24
+                                    width: Math.min(attachmentRow.width, capsuleLabel.implicitWidth + (showThumb ? 126 : 36))
+                                    radius: showThumb ? 8 : 12
+                                    color: "transparent"
+                                    border.color: root.codeBorder
+                                    border.width: 1
+                                    Image {
+                                        id: thumb
+                                        objectName: "attachmentThumb"
+                                        visible: capsule.showThumb
+                                        x: 4
+                                        y: 4
+                                        width: 120
+                                        height: 72
+                                        fillMode: Image.PreserveAspectFit
+                                        asynchronous: true
+                                        cache: false
+                                        source: capsule.modelData.is_image === true ? "file://" + capsule.modelData.path : ""
+                                        sourceSize.width: 120
+                                        sourceSize.height: 80
+                                    }
+                                    Label {
+                                        id: capsuleLabel
+                                        objectName: "attachmentLabel"
+                                        anchors.left: parent.left
+                                        anchors.leftMargin: capsule.showThumb ? 130 : 10
+                                        anchors.right: parent.right
+                                        anchors.rightMargin: 10
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: (capsule.showThumb ? "" : "\uD83D\uDCC4 ") + capsule.modelData.name
+                                        elide: Text.ElideMiddle
+                                        maximumLineCount: 1
+                                        color: root.dim
+                                        font.family: root.monoFamily
+                                        font.pixelSize: 11
+                                    }
+                                }
+                            }
+                        }
 
                         // User text and local notes are plain text.
                         TextEdit {
@@ -1192,7 +1280,7 @@ ApplicationWindow {
                 Behavior on opacity { NumberAnimation { duration: 220; easing.type: Easing.OutQuad } }
                 color: theme.dockSurface
                 border.width: 1
-                border.color: dropArea.containsDrag ? Qt.rgba(0.220, 0.741, 0.973, 0.3)
+                border.color: windowDropArea.containsDrag ? Qt.rgba(0.220, 0.741, 0.973, 0.3)
                               : (input.activeFocus ? theme.cyan : theme.dockBorder)
                 Behavior on height { NumberAnimation { duration: 90; easing.type: Easing.OutQuad } }
 
@@ -1219,7 +1307,7 @@ ApplicationWindow {
                         verticalAlignment: Text.AlignTop
                         topPadding: 12
                         bottomPadding: 12
-                        leftPadding: 14
+                        leftPadding: 38
                         // Reserve room for the model watermark only while it is shown (empty input);
                         // once typing starts the full dock width is available, so no phantom wall
                         // forces a premature wrap (BUG-UI-001).
@@ -1231,7 +1319,9 @@ ApplicationWindow {
                         background: null
 
                         Keys.onPressed: function(event) {
-                            if (event.key === Qt.Key_Up && root.historyStep(true)) {
+                            if (event.matches(StandardKey.Paste) && root.pasteImage()) {
+                                event.accepted = true
+                            } else if (event.key === Qt.Key_Up && root.historyStep(true)) {
                                 event.accepted = true
                             } else if (event.key === Qt.Key_Down && root.historyStep(false)) {
                                 event.accepted = true
@@ -1254,14 +1344,26 @@ ApplicationWindow {
                     }
                 }
 
-                DropArea {
-                    id: dropArea
-                    objectName: "dropArea"
-                    anchors.fill: parent
-                    keys: ["text/uri-list"]
-                    onDropped: function(drop) {
-                        if (drop.hasUrls)
-                            root.attachDropped(drop.urls)
+                // Minimal `+` file picker (fixed geometry: never affects dock height or wrap, BUG-UI-001).
+                Label {
+                    id: attachButton
+                    objectName: "attachButton"
+                    x: 12
+                    y: 12
+                    width: 20
+                    height: 20
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                    text: "+"
+                    color: attachMouse.containsMouse ? theme.cyan : Qt.rgba(1, 1, 1, 0.4)
+                    font.pixelSize: 18
+                    MouseArea {
+                        id: attachMouse
+                        objectName: "attachMouse"
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.openAttachPicker()
                     }
                 }
 
@@ -1600,6 +1702,55 @@ ApplicationWindow {
             hoverEnabled: true
             cursorShape: Qt.PointingHandCursor
             onClicked: wb.clicked()
+        }
+    }
+
+    FileDialog {
+        id: attachDialog
+        objectName: "attachDialog"
+        title: "Attach files"
+        fileMode: FileDialog.OpenFiles
+        onAccepted: root.attachDropped(selectedFiles)
+    }
+
+    // Window-wide drop target below the drawer/modals; DropArea never consumes mouse or wheel events.
+    DropArea {
+        id: windowDropArea
+        objectName: "windowDropArea"
+        anchors.fill: parent
+        z: 50
+        keys: ["text/uri-list"]
+        enabled: !root.settingsOpen && !telemetryDrawer.open
+        onDropped: function(drop) {
+            if (drop.hasUrls)
+                root.attachDropped(drop.urls)
+        }
+    }
+
+    Rectangle {
+        id: dropIndicator
+        objectName: "dropIndicator"
+        anchors.fill: parent
+        z: 51
+        visible: windowDropArea.containsDrag
+        color: Qt.rgba(0.220, 0.741, 0.973, 0.05)
+        border.color: Qt.rgba(0.220, 0.741, 0.973, 0.45)
+        border.width: 3
+        Rectangle {
+            anchors.centerIn: parent
+            width: dropIndicatorLabel.implicitWidth + 40
+            height: 36
+            radius: 18
+            color: Qt.rgba(0.067, 0.086, 0.114, 0.9)
+            border.color: Qt.rgba(0.220, 0.741, 0.973, 0.5)
+            border.width: 1
+            Label {
+                id: dropIndicatorLabel
+                anchors.centerIn: parent
+                text: "Drop files to attach"
+                color: "#38bdf8"
+                font.pixelSize: 13
+            }
         }
     }
 

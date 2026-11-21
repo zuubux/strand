@@ -161,8 +161,75 @@ def _sniff_image_mime(head: bytes) -> str | None:
     return None
 
 
-def read_image(path: str, roots: list[Path] | None = None) -> dict[str, Any]:
-    """Return an image inside the approved roots as a base64 data URI (<= 10 MB, fail closed)."""
+IMAGE_MAX_SIDE = 1536
+IMAGE_TARGET_BYTES = 1536 * 1024
+IMAGE_JPEG_QUALITY = 85
+
+
+def normalize_image(
+    data: bytes,
+    mime: str,
+    max_side: int = IMAGE_MAX_SIDE,
+    max_bytes: int = IMAGE_TARGET_BYTES,
+    quality: int = IMAGE_JPEG_QUALITY,
+) -> tuple[bytes, str]:
+    """Bound an image for the upstream payload: longest side <= `max_side`, size <= `max_bytes`.
+
+    Small images pass through byte-for-byte. Larger ones are smooth-scaled with `QImage` (GUI
+    dependency, imported lazily) and re-encoded as JPEG, or PNG when transparent and still within
+    budget. Without Qt, or if the bytes cannot be decoded, the original is returned unchanged.
+    """
+    try:
+        from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
+        from PySide6.QtGui import QColor, QImage, QPainter
+    except ImportError:  # pragma: no cover - headless install without PySide6
+        return data, mime
+    image = QImage.fromData(data)
+    if image.isNull():
+        return data, mime
+    longest = max(image.width(), image.height())
+    if longest <= max_side and len(data) <= max_bytes:
+        return data, mime
+
+    def encode(img: Any, fmt: str, q: int) -> bytes:
+        raw = QByteArray()
+        buf = QBuffer(raw)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        ok = img.save(buf, fmt, q)
+        buf.close()
+        return bytes(raw.data()) if ok else b""
+
+    if longest > max_side:
+        image = image.scaled(max_side, max_side, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    if image.hasAlphaChannel():
+        png = encode(image, "PNG", -1)
+        if png and len(png) <= max_bytes:
+            return png, "image/png"
+        flat = QImage(image.size(), QImage.Format.Format_RGB32)
+        flat.fill(QColor("white"))
+        painter = QPainter(flat)
+        painter.drawImage(0, 0, image)
+        painter.end()
+        image = flat
+    else:
+        image = image.convertToFormat(QImage.Format.Format_RGB32)
+    jpeg = encode(image, "JPEG", quality)
+    if not jpeg:
+        return data, mime
+    return jpeg, "image/jpeg"
+
+
+def read_image(
+    path: str,
+    roots: list[Path] | None = None,
+    max_side: int = IMAGE_MAX_SIDE,
+    max_bytes: int = IMAGE_TARGET_BYTES,
+    quality: int = IMAGE_JPEG_QUALITY,
+) -> dict[str, Any]:
+    """Return an image inside the approved roots as a base64 data URI (<= 10 MB in, fail closed).
+
+    Oversized images are downscaled/re-encoded by `normalize_image` so the upstream request stays small.
+    """
     resolved, err = _check(path, roots or [])
     if err or resolved is None:
         return err or _error("access_denied", "invalid path")
@@ -190,6 +257,7 @@ def read_image(path: str, roots: list[Path] | None = None) -> dict[str, Any]:
     mime = _sniff_image_mime(data[:16])
     if mime is None or mime != expected:
         return _error("invalid_image", f"file content is not a valid {expected} image: {path}")
+    data, mime = normalize_image(data, mime, max_side, max_bytes, quality)
     encoded = base64.b64encode(data).decode("ascii")
     return {
         "path": str(resolved),
