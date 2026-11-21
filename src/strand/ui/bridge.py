@@ -32,6 +32,8 @@ from PySide6.QtCore import Property, QObject, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QGuiApplication, QImage
 
 from strand.config import (
+    OLLAMA_URLS,
+    UI_THEMES,
     Config,
     _as_bool,
     _read_file,
@@ -72,6 +74,7 @@ NON_CHAT_MODEL_RE = re.compile(r"embed|bge|whisper|tts|dall-e|moderation", re.IG
 # Keys the Settings modal may persist to config.json, with their value kind.
 SETTINGS_KEYS: dict[str, str] = {
     "persona_prompt": "str",
+    "ui_theme": "choice",
     "upstream_url": "str",
     "upstream_api_key": "secret",
     "model_default": "str",
@@ -82,6 +85,9 @@ SETTINGS_KEYS: dict[str, str] = {
     "redact_secrets": "bool",
     "enable_host_telemetry": "bool",
     "web_search_enabled": "bool",
+}
+CHOICE_VALUES: dict[str, tuple[str, ...]] = {
+    "ui_theme": UI_THEMES,
 }
 # Client-side presentation pacing (OBS-ERG-003): the socket is never throttled, only the
 # drain of the in-memory buffer into the transcript.
@@ -483,6 +489,10 @@ class Bridge(QObject):
     isProbingModelsChanged = Signal()
     probeStatusChanged = Signal()
     _probeResult = Signal(bool, list)
+    availableUpstreamModelsChanged = Signal()
+    isProbingUpstreamModelsChanged = Signal()
+    upstreamProbeStatusChanged = Signal()
+    _upstreamModelsResult = Signal(int, bool, list)
     distillingChanged = Signal()
     groundingActiveChanged = Signal()
     activeStanceNodesChanged = Signal()
@@ -535,6 +545,11 @@ class Bridge(QObject):
         self._extractor_probe_status = "idle"
         self._extractor_probe_seq = 0
         self._extractorModelsResult.connect(self._on_extractor_models_result)
+        self._available_upstream_models: list[str] = []
+        self._probing_upstream_models = False
+        self._upstream_probe_status = "idle"
+        self._upstream_probe_seq = 0
+        self._upstreamModelsResult.connect(self._on_upstream_models_result)
         self._config = config if config is not None else load_config()
         self._operator_override = str(_read_file(default_config_path()).get("operator_name") or "").strip()
         self._stance_nodes: list[str] = []
@@ -717,6 +732,18 @@ class Bridge(QObject):
     @Property(str, notify=extractorProbeStatusChanged)
     def extractorProbeStatus(self) -> str:
         return self._extractor_probe_status or ""
+
+    @Property(list, notify=availableUpstreamModelsChanged)
+    def availableUpstreamModels(self) -> list[str]:
+        return list(self._available_upstream_models)
+
+    @Property(bool, notify=isProbingUpstreamModelsChanged)
+    def isProbingUpstreamModels(self) -> bool:
+        return self._probing_upstream_models
+
+    @Property(str, notify=upstreamProbeStatusChanged)
+    def upstreamProbeStatus(self) -> str:
+        return self._upstream_probe_status
 
     @Slot(result=str)
     def pickDefaultModel(self) -> str:
@@ -1428,6 +1455,7 @@ class Bridge(QObject):
         file_values = _read_file(default_config_path())
         return {
             "persona_prompt": cfg.persona_prompt,
+            "ui_theme": cfg.ui_theme,
             "upstream_url": cfg.upstream_url,
             "model_default": cfg.model_default,
             "extractor_url": cfg.extractor_url,
@@ -1459,6 +1487,12 @@ class Bridge(QObject):
                     updates[key] = _as_bool(value)
                 elif kind == "float":
                     updates[key] = _validate_half_life(value)
+                elif kind == "choice":
+                    valid = CHOICE_VALUES[key]
+                    text = "" if value is None else str(value).strip().lower()
+                    if text not in valid:
+                        return False
+                    updates[key] = text
                 else:
                     text = "" if value is None else str(value).strip()
                     if kind == "secret" and not text:
@@ -1661,6 +1695,59 @@ class Bridge(QObject):
         self.availableModelsChanged.emit()
         self.isProbingModelsChanged.emit()
         self.probeStatusChanged.emit()
+
+    @Slot(str)
+    @Slot(str, str)
+    def probeUpstreamModels(self, endpointUrl: str, apiKey: str = "") -> None:
+        """List upstream chat models off-thread (Settings card); never raises, failure is `failed`.
+
+        An empty `apiKey` falls back to the stored key when the URL matches the saved
+        `upstream_url`; the secret stays inside Python.
+        """
+        key = apiKey.strip()
+        if not key:
+            try:
+                cfg = load_config()
+                if endpointUrl.strip().rstrip("/") == cfg.upstream_url.strip().rstrip("/"):
+                    key = cfg.upstream_api_key or ""
+            except Exception:  # noqa: BLE001 - an unreadable config just means no stored key
+                key = ""
+        self._upstream_probe_seq += 1
+        seq = self._upstream_probe_seq
+        self._probing_upstream_models = True
+        self._upstream_probe_status = "probing"
+        self.isProbingUpstreamModelsChanged.emit()
+        self.upstreamProbeStatusChanged.emit()
+        ollama = endpointUrl.strip().rstrip("/").removesuffix("/v1") in OLLAMA_URLS
+        self._run_async(lambda: self._probe_upstream_models(seq, endpointUrl, key, ollama))
+
+    async def _probe_upstream_models(self, seq: int, endpoint_url: str, api_key: str, ollama: bool) -> None:
+        models: list[str] | None = None
+        try:
+            base = endpoint_url.strip().rstrip("/")
+            if base.startswith(("http://", "https://")):
+                target = (base.removesuffix("/v1") + "/api/tags") if ollama else f"{base}/models"
+                headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+                async with self._make_model_client() as client:
+                    resp = await client.get(target, headers=headers)
+                    resp.raise_for_status()
+                    models = parse_model_names(resp.json(), ollama)
+        except Exception:  # noqa: BLE001 - an offline or odd endpoint is a status, never an error
+            models = None
+        self._upstreamModelsResult.emit(seq, models is not None, models or [])
+
+    @Slot(int, bool, list)
+    def _on_upstream_models_result(self, seq: int, ok: bool, models: list) -> None:
+        if seq != self._upstream_probe_seq:
+            return  # superseded by a newer probe
+        self._available_upstream_models = (
+            sorted((str(m) for m in models), key=lambda m: _model_sort_key(m, self._model)) if ok else []
+        )
+        self._probing_upstream_models = False
+        self._upstream_probe_status = "success" if ok else "failed"
+        self.availableUpstreamModelsChanged.emit()
+        self.isProbingUpstreamModelsChanged.emit()
+        self.upstreamProbeStatusChanged.emit()
 
     @Slot()
     @Slot(str)

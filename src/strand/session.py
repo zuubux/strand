@@ -14,6 +14,7 @@ MAX_SESSION_ID_LEN = 128
 
 MAX_REPLAY_CHARS = 12000  # cap on stored context blocks per session (oldest unpinned dropped first)
 BEDROCK_ID = -2  # sentinel ledger id: the permanent identity invariant is injected once per session
+PERSONA_ANCHOR_ID = -1  # sentinel ledger id: the optional persona_prompt override, injected once per session
 
 
 @dataclass(frozen=True, slots=True)

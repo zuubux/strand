@@ -601,7 +601,9 @@ def create_app(
         logger.debug("Incoming query preview session=%r: %r", session_id, preview)
         resolution_failed = False
         try:
-            delta = await resolver.resolve(query, session_id, allow_private) if query else ""
+            delta = (
+                await resolver.resolve(query, session_id, allow_private) if query else ""
+            )
         except Exception:
             resolution_failed = True
             # Fail open: memory problems must never block the user's request.

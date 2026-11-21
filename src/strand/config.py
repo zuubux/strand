@@ -16,7 +16,6 @@ from .common import (
     DEFAULT_CONTINUITY_HORIZON_DAYS,
     DEFAULT_CONTINUITY_MAX_EPISODES,
     DEFAULT_DEDUP_DISTANCE_THRESHOLD,
-    PERSONA_STANCES,
 )
 from .perms import secure_parent_dir
 
@@ -58,12 +57,24 @@ ENV_VARS = {
     "continuity_max_episodes": "STRAND_CONTINUITY_MAX_EPISODES",
     "model_default": "STRAND_MODEL_DEFAULT",
     "persona_prompt": "STRAND_PERSONA_PROMPT",
-    "persona_stance": "STRAND_PERSONA_STANCE",
+    "ui_theme": "STRAND_UI_THEME",
     "workspace_roots": "STRAND_WORKSPACE_ROOTS",
     "tools_enabled": "STRAND_TOOLS_ENABLED",
     "enable_host_telemetry": "STRAND_ENABLE_HOST_TELEMETRY",
     "web_search_enabled": "STRAND_WEB_SEARCH_ENABLED",
 }
+
+
+# The theme also fixes the operator font (obsidian/daylight: Inter, graphite: JetBrains Mono).
+# Legacy "carbon" and unknown values migrate to the default; a legacy `user_font` is ignored.
+UI_THEMES = ("obsidian", "graphite", "daylight")
+DEFAULT_UI_THEME = "obsidian"
+
+
+def _choice(value: Any, valid: tuple[str, ...], default: str) -> str:
+    """Normalise a named choice; unknown values fall back to `default`."""
+    text = str(value).strip().lower()
+    return text if text in valid else default
 
 
 def _as_bool(value: Any) -> bool:
@@ -143,8 +154,8 @@ class Config:
     model_default: str = ""
     # Optional bedrock persona anchor, injected ahead of the personality matrix.
     persona_prompt: str = ""
-    # Named conversational stance (see prompts.PERSONA_STANCES); unknown names fall back to default.
-    persona_stance: str = "peer_workbench"
+    # GUI presentation: curated theme and operator font (see ui/qml/Theme.qml).
+    ui_theme: str = "obsidian"
     # Ring-0 ambient read: approved workspace roots and the tool-runner master switch.
     workspace_roots: list[str] = field(default_factory=lambda: list(DEFAULT_WORKSPACE_ROOTS))
     tools_enabled: bool = True
@@ -237,8 +248,7 @@ class Config:
             ),
             model_default=str(pick("model_default", "")).strip(),
             persona_prompt=str(pick("persona_prompt", "")).strip(),
-            persona_stance=str(pick("persona_stance", "peer_workbench")).strip().lower()
-            or "peer_workbench",
+            ui_theme=_choice(pick("ui_theme", DEFAULT_UI_THEME), UI_THEMES, DEFAULT_UI_THEME),
             workspace_roots=_as_roots(pick("workspace_roots", list(DEFAULT_WORKSPACE_ROOTS))),
             tools_enabled=_as_bool(pick("tools_enabled", True)),
             enable_host_telemetry=_as_bool(pick("enable_host_telemetry", False)),
@@ -307,10 +317,10 @@ def save_config_value(key: str, value: Any, config_path: Path | None = None) -> 
         value = str(value).upper()
     elif key == "model_default":
         value = str(value).strip()
-    elif key == "persona_stance":
+    elif key == "ui_theme":
         value = str(value).strip().lower()
-        if value not in PERSONA_STANCES:
-            raise ValueError(f"unknown persona stance {value!r}; valid: {', '.join(PERSONA_STANCES)}")
+        if value not in UI_THEMES:
+            raise ValueError(f"unknown ui_theme {value!r}; valid: {', '.join(UI_THEMES)}")
     save_config({key: value}, config_path)
 
 

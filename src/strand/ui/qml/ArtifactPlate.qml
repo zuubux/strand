@@ -14,10 +14,8 @@ Rectangle {
     readonly property string filename: isDiff ? diffFilename(text) : ""
     readonly property string badge: filename.length > 0 ? filename
         : (lang.length > 0 ? lang : (isDiff ? "diff" : "snippet"))
-    readonly property string monoFamily: Qt.fontFamilies().indexOf("JetBrains Mono") >= 0 ? "JetBrains Mono"
-        : (Qt.fontFamilies().indexOf("Fira Code") >= 0 ? "Fira Code" : "monospace")
 
-    implicitHeight: header.height + body.implicitHeight + 20
+    implicitHeight: header.height + body.implicitHeight + 2 * Theme.vPadding
     height: implicitHeight
     implicitWidth: parent ? parent.width : 320
     width: parent ? parent.width : implicitWidth
@@ -67,26 +65,26 @@ Rectangle {
         id: header
         objectName: "artifactHeader"
         width: parent.width
-        height: 28
+        height: Theme.artifactHeaderHeight
         color: Theme.artifactHeaderBackground
         Label {
             objectName: "artifactBadge"
             anchors.left: parent.left
-            anchors.leftMargin: 12
+            anchors.leftMargin: Theme.artifactPadding
             anchors.right: copyButton.left
             anchors.rightMargin: 8
             anchors.verticalCenter: parent.verticalCenter
             text: plate.badge
             elide: Text.ElideMiddle
             color: Theme.brandAccent
-            font.family: plate.monoFamily
-            font.pixelSize: 11
+            font.family: Theme.monoFontFamily
+            font.pixelSize: Theme.captionPixelSize
         }
         Item {
             id: copyButton
             objectName: "artifactCopy"
             anchors.right: parent.right
-            anchors.rightMargin: 12
+            anchors.rightMargin: Theme.artifactPadding
             anchors.verticalCenter: parent.verticalCenter
             width: copyLabel.implicitWidth
             height: parent.height
@@ -96,8 +94,8 @@ Rectangle {
                 anchors.verticalCenter: parent.verticalCenter
                 text: copyButton.copied ? "[ Copied ]" : "[ Copy ]"
                 color: copyArea.containsMouse ? Theme.codeText : Theme.textMuted
-                font.family: plate.monoFamily
-                font.pixelSize: 11
+                font.family: Theme.monoFontFamily
+                font.pixelSize: Theme.captionPixelSize
             }
             Timer {
                 id: copiedReset
@@ -122,9 +120,9 @@ Rectangle {
     TextEdit {
         id: body
         objectName: "artifactBody"
-        x: 12
-        y: header.height + 10
-        width: parent.width - 24
+        x: Theme.artifactPadding
+        y: header.height + Theme.vPadding
+        width: parent.width - 2 * Theme.artifactPadding
         readOnly: true
         selectByMouse: true
         wrapMode: TextEdit.WrapAnywhere
@@ -132,7 +130,7 @@ Rectangle {
         text: plate.isDiff ? plate.diffHtml(plate.text) : plate.text
         color: Theme.codeText
         selectionColor: Theme.brandAccent
-        font.family: plate.monoFamily
-        font.pixelSize: 13
+        font.family: Theme.monoFontFamily
+        font.pixelSize: Theme.codePixelSize
     }
 }

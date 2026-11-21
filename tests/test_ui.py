@@ -1208,7 +1208,7 @@ def test_split_blocks_marks_trailing_question_as_pivot():
     assert [(b["kind"], b["is_pivot"]) for b in cards] == [("code", False), ("table", False)]
 
 
-def test_qml_assistant_flow_bubble_hugs_and_tab_flushes(qapp):
+def test_qml_assistant_flow_bubble_hugs_and_tab_flushes(qapp, home):
     from PySide6.QtCore import QMetaObject, Qt
 
     b = make_bridge(lambda r: httpx.Response(200, json={}))
@@ -2328,3 +2328,241 @@ def test_empty_turn_notice_is_upstream_accurate():
     qml = (Path(__file__).parent.parent / "src/strand/ui/qml/main.qml").read_text()
     assert "No response returned by upstream model." in qml
     assert "tool iteration limits" not in qml
+
+
+# -- Curated themes, operator fonts and persona-coupled styling ---------------------------
+def test_appearance_config_defaults_and_persistence(qapp, home):
+    from strand.config import Config, UI_THEMES, load_config, save_config_value
+
+    assert UI_THEMES == ("obsidian", "graphite", "daylight")
+    cfg = Config()
+    assert cfg.ui_theme == "obsidian" and not hasattr(cfg, "persona_stance")
+    assert not hasattr(cfg, "user_font")
+    assert Config.from_env({}, {"ui_theme": "bogus"}).ui_theme == "obsidian"
+    assert Config.from_env({}, {"ui_theme": "carbon"}).ui_theme == "obsidian"
+    # A legacy user_font key in config.json is ignored without failing.
+    legacy = Config.from_env({}, {"ui_theme": "Daylight", "user_font": "jetbrains"})
+    assert legacy.ui_theme == "daylight" and not hasattr(legacy, "user_font")
+    save_config_value("ui_theme", "Daylight")
+    with pytest.raises(ValueError):
+        save_config_value("ui_theme", "carbon")
+    with pytest.raises(KeyError):
+        save_config_value("user_font", "inter")
+    assert load_config().ui_theme == "daylight"
+
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    got = b.getConfig()
+    assert "user_font" not in got and "persona_stance" not in got
+    assert b.saveConfig({"ui_theme": "graphite"}) is True
+    path = home / ".config" / "strand" / "config.json"
+    data = json.loads(path.read_text())
+    assert data["ui_theme"] == "graphite"
+    got = b.getConfig()
+    assert got["ui_theme"] == "graphite"
+    assert b.saveConfig({"ui_theme": "bogus"}) is False
+    assert b.saveConfig({"persona_stance": "peer_workbench"}) is True
+    assert "persona_stance" not in json.loads(path.read_text())
+    assert b.saveConfig({"ui_theme": "carbon"}) is False
+    # The removed user_font key is an unknown key: ignored, never written.
+    assert b.saveConfig({"user_font": "inter"}) is True
+    assert json.loads(path.read_text()) == data
+
+
+def test_bundled_fonts_packaged():
+    root = Path(__file__).parent.parent
+    fonts = root / "src/strand/ui/qml/fonts"
+    for name in ("Inter", "IBMPlexSans", "JetBrainsMono"):
+        assert (fonts / f"{name}.ttf").stat().st_size > 10_000
+    assert not (fonts / "SourceSerif4.ttf").exists()
+    assert "source serif" not in (fonts / "LICENSES.txt").read_text().lower()
+    assert "SIL OPEN FONT LICENSE" in (fonts / "LICENSES.txt").read_text().upper()
+    pyproject = (root / "pyproject.toml").read_text()
+    assert "qml/fonts/*.ttf" in pyproject and "qml/fonts/*.txt" in pyproject
+
+
+def test_qml_theme_token_switching(qapp, home):
+    from PySide6.QtCore import Q_ARG, QMetaObject
+
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    assert win.property("assistantFamily") and win.property("userFamily")
+    canvas = {"obsidian": "#090b0e", "graphite": "#111317", "daylight": "#f4f6f8"}
+    bubbles = {"obsidian": "#11161d", "graphite": "#161a20", "daylight": "#ffffff"}
+    users = {"obsidian": "#141c2b", "graphite": "#1c212b", "daylight": "#e2e8f0"}
+    fonts = {"obsidian": "Inter", "graphite": "JetBrains Mono", "daylight": "Inter"}
+    QMetaObject.invokeMethod(win, "openSettings")
+    # Theme lives in its own compact themeCard; ACTIVE STANCE is a read-only mirror; no appearance card.
+    assert win.findChild(object, "appearancePanel") is None
+    for name in ("fontInter", "fontJetbrains", "fontSystem", "themeCarbon"):
+        assert win.findChild(object, name) is None
+    assert win.findChild(object, "themeSelector") is not None
+    for seg, theme_name in (("themeGraphite", "graphite"), ("themeDaylight", "daylight"), ("themeObsidian", "obsidian")):
+        win.findChild(object, seg).click()
+        assert win.property("color").name() == canvas[theme_name]
+        assert win.property("assistantSurface").name() == bubbles[theme_name]
+        assert win.property("userRecess").name() == users[theme_name]
+        assert fonts[theme_name] in win.property("userFamily")
+        assert fonts[theme_name] in win.property("uiFamily")
+        assert "IBM Plex Sans" in win.property("assistantFamily")  # one assistant voice on every theme
+        assert json.loads((home / ".config/strand/config.json").read_text())["ui_theme"] == theme_name
+    # Daylight: dark ink on light surfaces (contrast), cool persona accents, no dark-only washes.
+    win.findChild(object, "themeDaylight").click()
+    assert win.property("textColor").name() == "#0f172a"
+    assert win.property("textColor").lightness() < win.property("color").lightness()
+    assert win.property("assistantText").name() == "#0f172a"
+    assert win.property("dim").name() == "#475569"
+    assert win.property("assistantBorder").red() == 2 and win.property("assistantBorder").blue() == 199
+    for name in ("stanceSelector", "stancePeer", "stanceMentor", "stanceOperator", "stanceDropdown", "stanceDescription"):
+        assert win.findChild(object, name) is None
+    assert win.findChild(object, "stanceTitle").property("text") == "ACTIVE STANCE"
+    assert win.findChild(object, "stanceFooter") is not None
+    # Ordering: decay pills, then whisper, then the THEME selector in its own card below.
+    decay = win.findChild(object, "decayHorizon")
+    horizon = win.findChild(object, "horizonWhisper")
+    themes = win.findChild(object, "themeSelector")
+    ys = [i.mapToItem(None, 0, 0).y() for i in (decay, horizon, themes)]
+    assert ys[0] < ys[1] < ys[2]
+    card = win.findChild(object, "themeCard")
+    assert card is not None
+    assert card.mapToItem(None, 0, 0).y() > horizon.mapToItem(None, 0, 0).y()
+    assert horizon.property("text")
+    win.findChild(object, "themeObsidian").click()
+    assert win.property("textColor").name() == "#e6e9ed"
+    engine.deleteLater()
+
+
+def _walk_items(item):
+    for child in item.childItems():
+        yield child
+        yield from _walk_items(child)
+
+
+def _pump(seconds):
+    import time
+
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
+
+
+def test_qml_active_stance_counter_sits_in_bottom_right_footer(qapp, home):
+    from PySide6.QtCore import QMetaObject
+
+    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    engine, win = _load_window(b)
+    win.setWidth(900)
+    win.setHeight(640)
+    win.show()
+    QMetaObject.invokeMethod(win, "openSettings")
+    _pump(0.2)
+    title = win.findChild(object, "stanceTitle")
+    counter = win.findChild(object, "stanceFooter")
+    assert win.findChild(object, "stanceDropdown") is None
+    assert win.findChild(object, "stanceDescription") is None
+    card = counter.parent().parent()  # footer label -> ColumnLayout -> card Rectangle
+    placeholder = win.findChild(object, "stancePlaceholder")
+    cy = counter.mapToItem(None, 0, 0).y()
+    assert cy > title.mapToItem(None, 0, 0).y() + 20  # not on the title's header line
+    assert cy > placeholder.mapToItem(None, 0, 0).y()  # below the body
+    assert win.findChild(object, "stanceHeader") is None
+    card_right = card.mapToItem(None, card.width(), 0).x()
+    assert counter.property("font").pixelSize() == 11
+    assert abs(counter.mapToItem(None, counter.width(), 0).x() - (card_right - 14)) < 3  # right edge
+    card_bottom = card.mapToItem(None, 0, card.height()).y()
+    assert card_bottom - (cy + counter.height()) < 24  # bottom footer
+    assert counter.property("truncated") is False
+    win.hide()
+    engine.deleteLater()
+
+
+
+
+def _run_upstream_probe(handler, url, key="", config=None):
+    factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))  # noqa: E731
+    b = Bridge(config=config or Config(), model="m", probe_factory=factory)
+    b.probeUpstreamModels(url, key) if key else b.probeUpstreamModels(url)
+    assert b.upstreamProbeStatus == "probing" and b.isProbingUpstreamModels is True
+    deadline = time.time() + 5
+    while b.isProbingUpstreamModels and time.time() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
+    b.shutdown()
+    return b
+
+
+def test_probe_upstream_models_uses_stored_key_for_matching_url(qapp, home):
+    from strand.config import save_config
+
+    save_config({"upstream_url": "https://up.example/v1", "upstream_api_key": "stored-secret"})
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers.get("authorization"))
+        return httpx.Response(200, json={"data": [{"id": "gpt-x"}, {"id": "text-embedding-3"}]})
+
+    b = _run_upstream_probe(handler, "https://up.example/v1/")
+    assert seen == ["Bearer stored-secret"]
+    assert b.availableUpstreamModels == ["gpt-x"] and b.upstreamProbeStatus == "success"
+    assert b.availableModels == [] and b.availableExtractorModels == []  # no collision
+    seen.clear()
+    _run_upstream_probe(handler, "https://other.example/v1")  # URL mismatch: stored key not sent
+    assert seen == [None]
+
+
+def test_probe_upstream_models_explicit_key_overrides_stored(qapp, home):
+    from strand.config import save_config
+
+    save_config({"upstream_url": "https://up.example/v1", "upstream_api_key": "stored-secret"})
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers.get("authorization"))
+        return httpx.Response(200, json={"data": [{"id": "a"}]})
+
+    _run_upstream_probe(handler, "https://up.example/v1", "typed-key")
+    assert seen == ["Bearer typed-key"]
+
+
+def test_probe_upstream_models_offline_is_silent(qapp, home):
+    def refuse(request):
+        raise httpx.ConnectError("no")
+
+    for handler in (refuse, lambda r: httpx.Response(500), lambda r: httpx.Response(200, text="nope")):
+        b = _run_upstream_probe(handler, "https://up.example/v1", "k")
+        assert b.upstreamProbeStatus == "failed" and b.availableUpstreamModels == []
+        assert b.isProbingUpstreamModels is False
+    b = _run_upstream_probe(lambda r: httpx.Response(200, json={}), "not-a-url", "k")
+    assert b.upstreamProbeStatus == "failed"
+
+
+def test_qml_upstream_routing_order_and_model_dropdown(qapp, home):
+    from strand.config import save_config
+
+    save_config({"upstream_url": "https://up.example/v1", "upstream_api_key": "stored-secret"})
+    handler = lambda r: httpx.Response(200, json={"data": [{"id": "m-one"}, {"id": "m-two"}]})  # noqa: E731
+    b = Bridge(
+        config=Config(upstream_api_key="k"),
+        model="m",
+        probe_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    from PySide6.QtCore import QMetaObject
+
+    engine, win = _load_window(b)
+    win.setWidth(900)
+    win.setHeight(700)
+    win.show()
+    QMetaObject.invokeMethod(win, "openSettings")
+    _pump(0.2)
+    url = win.findChild(object, "upstreamUrlEdit")
+    key = win.findChild(object, "apiKeyEdit")
+    model = win.findChild(object, "upstreamModelBox")
+    status = win.findChild(object, "upstreamModelsStatus")
+    assert model is not None and status is not None
+    assert _wait(lambda: status.property("visible") is True)
+    _pump(0.1)
+    assert model.property("editable") is True
+    assert win.findChild(object, "modelEdit") is None
+    ys = [i.mapToItem(None, 0, 0).y() for i in (url, key, model, status)]
+    assert ys[0] < ys[1] < ys[2] < ys[3]
+    engine.deleteLater()

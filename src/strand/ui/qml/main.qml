@@ -20,92 +20,36 @@ ApplicationWindow {
             root.hide()
         }
     }
-    color: theme.canvas
+    color: Theme.canvasBackground
 
-    // Centralized theme tokens: every colour and font stack used by the transcript,
-    // identity headers, cards and input dock is defined here and nowhere else.
-    QtObject {
-        id: theme
-        // Surfaces
-        readonly property color canvas: Theme.canvasBackground
-        readonly property color panel: "#1E2228"
-        readonly property color border: "#2C323A"
-        // User voice: deep slate-indigo bubble, indigo hairline, clean sans.
-        readonly property color userSurface: Theme.userBubbleBackground
-        readonly property color userBorder: Theme.userBubbleBorder
-        // Assistant voice: dark carbon bubble, cyan hairline, high-contrast text.
-        readonly property color assistantSurface: Theme.assistantBubbleBackground
-        readonly property color assistantBorder: Theme.assistantBubbleBorder
-        readonly property color assistantText: Theme.assistantText
-        // Cards / code / tables: recessed monospace substrate.
-        readonly property color cardSurface: Theme.artifactBackground
-        readonly property color cardHeader: Theme.artifactHeaderBackground
-        readonly property color cardBorder: Theme.canvasBorder
-        readonly property color codeText: Theme.codeText
-        // Text & accents
-        readonly property color text: "#E6E9ED"
-        readonly property color dim: "#7F8A96"
-        readonly property color accent: "#3DAEE9"
-        readonly property color cyan: Theme.brandAccent
-        readonly property color cyanSoft: "#7dd3fc"
-        readonly property color amber: Theme.distillationAccent
-        readonly property color warn: "#fbbf24"
-        readonly property color diffAdded: Theme.successAccent
-        readonly property color diffRemoved: Theme.dangerAccent
-        // Input dock
-        readonly property color dockSurface: Theme.assistantBubbleBackground
-        readonly property color dockBorder: Theme.artifactBorder
-        readonly property color fieldSurface: canvas
-        // Geometry
-        readonly property int dockMaxWidth: Theme.dockMaxWidth
-        readonly property int dockMargin: 96
-    }
+    // Backwards-compatible aliases: every value lives in the Theme singleton (Theme.qml).
+    readonly property color panel: Theme.panel
+    readonly property color border: Theme.border
+    readonly property color textColor: Theme.textPrimary
+    readonly property color dim: Theme.textDim
+    readonly property color accent: Theme.actionAccent
+    readonly property color codeBg: Theme.artifactBackground
+    readonly property color codeHeaderBg: Theme.artifactHeaderBackground
+    readonly property color codeBorder: Theme.canvasBorder
+    readonly property color userRecess: Theme.userBubbleBackground
+    readonly property color userBorder: Theme.userBubbleBorder
+    readonly property color diffAdded: Theme.successAccent
+    readonly property color diffRemoved: Theme.dangerAccent
+    readonly property color assistantSurface: Theme.assistantBubbleBackground
+    readonly property color assistantBorder: Theme.assistantBubbleBorder
+    readonly property color assistantText: Theme.assistantText
 
-    readonly property color panel: theme.panel
-    readonly property color border: theme.border
-    readonly property color textColor: theme.text
-    readonly property color dim: theme.dim
-    readonly property color accent: theme.accent
-    readonly property color codeBg: theme.cardSurface
-    readonly property color codeHeaderBg: theme.cardHeader
-    readonly property color codeBorder: theme.cardBorder
-    readonly property color userRecess: theme.userSurface
-    readonly property color userBorder: theme.userBorder
-    readonly property color diffAdded: theme.diffAdded
-    readonly property color diffRemoved: theme.diffRemoved
-    readonly property color assistantSurface: theme.assistantSurface
-    readonly property color assistantBorder: theme.assistantBorder
-    readonly property color assistantText: theme.assistantText
-
-    // Typography cascade: the workstation's system font first, then portable fallbacks.
-    readonly property var uiFamilies: [Qt.application.font.family, "Inter", "-apple-system", "Segoe UI", "Noto Sans", "sans-serif"]
-    // Monospace substrate: code, diffs, specs and telemetry tokens.
-    readonly property var monoFamilies: ["JetBrains Mono", "Fira Code", "monospace"]
-    // User voice: clean Inter / system sans.
-    readonly property var userFamilies: ["Inter", Qt.application.font.family, "-apple-system", "Segoe UI", "Noto Sans", "sans-serif"]
-    // Assistant voice: an articulate proportional sans, distinct from the user's, never monospaced.
-    readonly property var assistantFamilies: ["IBM Plex Sans", "Source Sans 3", "Inter", "Noto Sans", "Segoe UI", "sans-serif"]
+    readonly property var uiFamilies: Theme.uiFamilies
+    readonly property var monoFamilies: Theme.monoFamilies
+    readonly property string uiFamily: Theme.uiFontFamily
+    readonly property string monoFamily: Theme.monoFontFamily
+    readonly property string assistantFamily: Theme.assistantFontFamily
+    readonly property string userFamily: Theme.userFontFamily
+    readonly property int bodyPixelSize: Theme.bodyPixelSize
+    readonly property real narrativeLineHeight: Theme.narrativeLineHeight
+    readonly property real narrativeLetterSpacing: Theme.narrativeLetterSpacing
 
     readonly property string operatorName: bridge && bridge.operatorName ? bridge.operatorName : "Operator"
-
-    readonly property int bodyPixelSize: 14
-    readonly property real narrativeLineHeight: 1.65
-    readonly property real narrativeLetterSpacing: 0.15
-
-    // QML `font.family` takes one name, so the cascade is resolved to the first installed
-    // family (generic names such as sans-serif/monospace are always accepted by fontconfig).
-    function firstFamily(chain) {
-        var installed = Qt.fontFamilies()
-        for (var i = 0; i < chain.length; i++) {
-            if (chain[i].length > 0 && installed.indexOf(chain[i]) >= 0)
-                return chain[i]
-        }
-        return chain[chain.length - 1]
-    }
-    readonly property string uiFamily: firstFamily(uiFamilies)
-    readonly property string monoFamily: firstFamily(monoFamilies)
-    readonly property string assistantFamily: firstFamily(assistantFamilies)
-    readonly property string userFamily: firstFamily(userFamilies)
 
     // Sleek compact action button shared by the settings modal.
     component SleekButton: Button {
@@ -116,7 +60,7 @@ ApplicationWindow {
         topPadding: 0
         bottomPadding: 0
         hoverEnabled: true
-        font.family: root.uiFamily
+        font.family: Theme.uiFontFamily
         font.pixelSize: 12
         font.weight: Font.Medium
         font.letterSpacing: 0.3
@@ -130,10 +74,10 @@ ApplicationWindow {
             elide: Text.ElideRight
         }
         background: Rectangle {
-            radius: 6
-            color: sleek.hovered ? Qt.rgba(1, 1, 1, 0.10) : Qt.rgba(1, 1, 1, 0.05)
+            radius: Theme.controlRadius
+            color: sleek.hovered ? Theme.controlHoverStrong : Theme.controlFill
             border.width: 1
-            border.color: sleek.pressed ? theme.cyan : (sleek.hovered ? Qt.rgba(1, 1, 1, 0.20) : Qt.rgba(1, 1, 1, 0.08))
+            border.color: sleek.pressed ? Theme.brandAccent : (sleek.hovered ? Theme.controlBorderHover : Theme.controlBorder)
             Behavior on color { ColorAnimation { duration: 120 } }
             Behavior on border.color { ColorAnimation { duration: 120 } }
         }
@@ -148,7 +92,7 @@ ApplicationWindow {
         topPadding: 0
         bottomPadding: 0
         hoverEnabled: true
-        font.family: root.uiFamily
+        font.family: Theme.uiFontFamily
         font.pixelSize: 12
         HoverHandler { cursorShape: Qt.PointingHandCursor }
         contentItem: Text {
@@ -161,9 +105,9 @@ ApplicationWindow {
         }
         background: Rectangle {
             radius: 14
-            color: seg.selected ? Qt.rgba(1, 1, 1, 0.10) : "transparent"
+            color: seg.selected ? Theme.controlHoverStrong : "transparent"
             border.width: 1
-            border.color: seg.selected ? theme.cyan : (seg.hovered ? Qt.rgba(1, 1, 1, 0.12) : "transparent")
+            border.color: seg.selected ? Theme.brandAccent : (seg.hovered ? Theme.borderMedium : "transparent")
         }
     }
 
@@ -185,7 +129,7 @@ ApplicationWindow {
             visible: consequence.active
             wrapMode: Text.WordWrap
             color: root.dim
-            font.family: root.uiFamily
+            font.family: Theme.uiFontFamily
             font.pixelSize: 11
         }
         Label {
@@ -194,8 +138,8 @@ ApplicationWindow {
             text: consequence.uncheckedText
             visible: !consequence.active
             wrapMode: Text.WordWrap
-            color: consequence.warnUnchecked ? theme.warn : root.dim
-            font.family: root.uiFamily
+            color: consequence.warnUnchecked ? Theme.warnAccent : root.dim
+            font.family: Theme.uiFontFamily
             font.pixelSize: 11
         }
     }
@@ -213,15 +157,15 @@ ApplicationWindow {
             width: 16
             height: 16
             radius: 3
-            color: theme.fieldSurface
+            color: Theme.fieldBackground
             border.width: 1
-            border.color: cbox.checked || cbox.hovered ? Qt.rgba(1, 1, 1, 0.22) : Qt.rgba(1, 1, 1, 0.12)
+            border.color: cbox.checked || cbox.hovered ? Theme.checkboxBorderHover : Theme.borderMedium
             Text {
                 anchors.centerIn: parent
                 visible: cbox.checked
                 text: "\u2713"
-                color: theme.diffAdded
-                font.family: root.uiFamily
+                color: Theme.successAccent
+                font.family: Theme.uiFontFamily
                 font.pixelSize: 12
                 font.bold: true
             }
@@ -229,14 +173,14 @@ ApplicationWindow {
         contentItem: Text {
             leftPadding: cbox.indicator.width + cbox.spacing
             text: cbox.text
-            font.family: root.uiFamily
+            font.family: Theme.uiFontFamily
             font.pixelSize: 12
             color: root.textColor
             verticalAlignment: Text.AlignVCenter
         }
     }
 
-    font.family: uiFamily
+    font.family: Theme.uiFontFamily
 
     readonly property var diag: bridge ? bridge.diagnostics : null
     property bool drawerOpen: false
@@ -307,7 +251,7 @@ ApplicationWindow {
         var lines = text.split("\n")
         for (var i = 0; i < lines.length; i++) {
             var line = lines[i]
-            var color = theme.codeText
+            var color = Theme.codeText
             if (line.indexOf("+++") === 0 || line.indexOf("---") === 0)
                 color = root.dim
             else if (line.indexOf("@@") === 0)
@@ -340,6 +284,19 @@ ApplicationWindow {
             decayHorizon = name
     }
 
+    // Appearance: live Theme tokens, persisted through the same saveConfig path.
+    function applyAppearance(c) {
+        Theme.uiTheme = c.ui_theme
+    }
+
+    function selectAppearance(key, value) {
+        if (!persist({ [key]: value }))
+            return false
+        if (key === "ui_theme")
+            Theme.uiTheme = value
+        return true
+    }
+
     function toggleDrawer() { drawerOpen = !drawerOpen }
 
     // Tab while streaming: fast-forward the paced buffer onto the transcript at once.
@@ -353,8 +310,10 @@ ApplicationWindow {
         if (welcomeActive)
             return
         var c = bridge.getConfig()
+        applyAppearance(c)
         upstreamUrlEdit.text = c.upstream_url
-        modelEdit.text = c.model_default
+        upstreamModelBox.desired = c.model_default
+        upstreamModelBox.editText = c.model_default
         apiKeyEdit.text = ""
         apiKeyEdit.placeholderText = c.upstream_api_key_set ? "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022  (anchored to disk 0600)" : "Enter upstream API key..."
         extractorUrlEdit.text = c.extractor_url
@@ -366,6 +325,19 @@ ApplicationWindow {
         routingMessage = ""
         settingsOpen = true
         bridge.probeExtractorModels(root.extractorProbeUrl())
+        if (c.upstream_url && (c.upstream_api_key_set || root.isLocalUpstream(c.upstream_url)))
+            bridge.probeUpstreamModels(c.upstream_url, "")
+    }
+
+    function isLocalUpstream(url) {
+        return /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(url.trim())
+    }
+
+    // Debounced probe of the Settings upstream; an empty key lets the bridge use the stored one.
+    function probeUpstream() {
+        var url = upstreamUrlEdit.text.trim()
+        if (url.length > 0)
+            bridge.probeUpstreamModels(url, apiKeyEdit.text.trim())
     }
 
     // Extractor endpoint to probe: the typed URL, else the placeholder default (local Ollama).
@@ -663,12 +635,12 @@ ApplicationWindow {
             text: segment.text
             color: root.textColor
             linkColor: root.accent
-            font.family: root.uiFamily
-            font.pixelSize: root.bodyPixelSize
+            font.family: Theme.uiFontFamily
+            font.pixelSize: Theme.bodyPixelSize
             font.kerning: true
-            font.letterSpacing: root.narrativeLetterSpacing
+            font.letterSpacing: Theme.narrativeLetterSpacing
             lineHeightMode: Text.ProportionalHeight
-            lineHeight: root.narrativeLineHeight
+            lineHeight: Theme.narrativeLineHeight
         }
     }
 
@@ -708,25 +680,26 @@ ApplicationWindow {
                     anchors.fill: parent
                     radius: Theme.bubbleRadius
                     color: root.assistantSurface
-                    border.color: root.assistantBorder
+                    border.color: Theme.assistantBubbleBorder
                     border.width: 1
                 }
                 Text {
                     id: prose
+                    objectName: "assistantProse"
                     x: pb.hPad
                     y: pb.vPad
                     width: pb.width - 2 * pb.hPad
                     wrapMode: Text.Wrap
                     textFormat: Text.MarkdownText
                     text: segment.text
-                    color: theme.assistantText
+                    color: Theme.assistantText
                     linkColor: root.accent
-                    font.family: root.assistantFamily
-                    font.pixelSize: root.bodyPixelSize
+                    font.family: Theme.assistantFontFamily
+                    font.pixelSize: Theme.bodyPixelSize
                     font.kerning: true
-                    font.letterSpacing: root.narrativeLetterSpacing
+                    font.letterSpacing: Theme.narrativeLetterSpacing
                     lineHeightMode: Text.ProportionalHeight
-                    lineHeight: root.narrativeLineHeight
+                    lineHeight: Theme.narrativeLineHeight
                 }
             }
         }
@@ -774,7 +747,7 @@ ApplicationWindow {
                     text: card.title.length > 0 ? card.title : (card.tag.length > 0 ? "" : "snippet")
                     elide: Text.ElideMiddle
                     color: root.dim
-                    font.family: root.monoFamily
+                    font.family: Theme.monoFontFamily
                     font.pixelSize: 11
                 }
                 Label {
@@ -785,7 +758,7 @@ ApplicationWindow {
                     visible: card.tag.length > 0
                     text: card.tag
                     color: root.accent
-                    font.family: root.monoFamily
+                    font.family: Theme.monoFontFamily
                     font.pixelSize: 10
                 }
                 Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: root.codeBorder }
@@ -800,9 +773,9 @@ ApplicationWindow {
                 wrapMode: TextEdit.WrapAnywhere
                 textFormat: card.diff ? TextEdit.RichText : TextEdit.PlainText
                 text: card.diff ? root.diffHtml(segment.text) : segment.text
-                color: theme.codeText
+                color: Theme.codeText
                 selectionColor: root.accent
-                font.family: root.monoFamily
+                font.family: Theme.monoFontFamily
                 font.pixelSize: 13
             }
         }
@@ -863,7 +836,7 @@ ApplicationWindow {
                     id: lockGlyph
                     anchors.centerIn: parent
                     text: lockButton.active ? "\uD83D\uDD13\uFE0E" : "\uD83D\uDD12\uFE0E"
-                    color: lockButton.active ? theme.amber : Qt.rgba(1, 1, 1, 0.28)
+                    color: lockButton.active ? Theme.distillationAccent : Theme.placeholderText
                     font.pixelSize: 13
                 }
                 MouseArea {
@@ -955,7 +928,7 @@ ApplicationWindow {
                         height: 16
                         radius: 8
                         color: row.isUser ? root.userRecess : "transparent"
-                        border.color: row.isUser ? root.userBorder : root.assistantBorder
+                        border.color: row.isUser ? root.userBorder : Theme.assistantBubbleBorder
                         border.width: 1
                         Label {
                             visible: row.isUser
@@ -971,14 +944,14 @@ ApplicationWindow {
                             width: 6
                             height: 6
                             radius: 3
-                            color: theme.cyan
+                            color: Theme.brandAccent
                             opacity: 0.85
                         }
                     }
                     Label {
                         anchors.verticalCenter: parent.verticalCenter
                         text: row.isUser ? root.operatorName.toUpperCase() : "STRAND"
-                        color: row.isUser ? root.dim : theme.cyan
+                        color: row.isUser ? root.dim : Theme.brandAccent
                         opacity: row.isUser ? 1.0 : 0.85
                         font.pixelSize: 11
                         font.weight: Font.DemiBold
@@ -996,14 +969,14 @@ ApplicationWindow {
                     readonly property bool isThinking: row.pending && row.body.length === 0
                     readonly property bool isAssistant: row.role === "assistant"
                     readonly property bool boxed: row.isUser || (isAssistant && !row.emptyTurn)
-                    readonly property real hPad: boxed ? root.bodyPixelSize : 0
-                    readonly property real vPad: boxed ? Math.round(root.bodyPixelSize * 0.7) : 2
-                    readonly property real edge: Math.round(root.bodyPixelSize * 8 / 7)
+                    readonly property real hPad: boxed ? Theme.bodyPixelSize : 0
+                    readonly property real vPad: boxed ? Math.round(Theme.bodyPixelSize * 0.7) : 2
+                    readonly property real edge: Math.round(Theme.bodyPixelSize * 8 / 7)
                     readonly property real maxWidth: row.isUser ? row.width * 0.72
                         : (isAssistant ? Math.min(list.width * Theme.maxBubbleCeilingProportion, row.width - 2 * edge) : row.width - 2 * edge)
                     TextMetrics {
                         id: textMetrics
-                        font.pixelSize: root.bodyPixelSize
+                        font.pixelSize: Theme.bodyPixelSize
                         text: (bubble.isThinking ? "\u2026" : (row.emptyTurn ? row.emptyNotice : row.body))
                     }
                     readonly property real naturalWidth: (isThinking ? 24 : Math.ceil(textMetrics.advanceWidth)) + 2 * hPad + 2
@@ -1019,7 +992,7 @@ ApplicationWindow {
                         visible: bubble.boxed
                         radius: Theme.bubbleRadius
                         color: row.isUser ? root.userRecess : root.assistantSurface
-                        border.color: row.isUser ? root.userBorder : root.assistantBorder
+                        border.color: row.isUser ? root.userBorder : Theme.assistantBubbleBorder
                         border.width: 1
                     }
 
@@ -1079,7 +1052,7 @@ ApplicationWindow {
                                         elide: Text.ElideMiddle
                                         maximumLineCount: 1
                                         color: root.dim
-                                        font.family: root.monoFamily
+                                        font.family: Theme.monoFontFamily
                                         font.pixelSize: 11
                                     }
                                 }
@@ -1098,10 +1071,10 @@ ApplicationWindow {
                             textFormat: TextEdit.PlainText
                             text: row.emptyTurn ? row.emptyNotice : row.body
                             color: bubble.isNote ? root.dim : root.textColor
-                            font.family: root.userFamily
+                            font.family: Theme.userFontFamily
                             font.italic: bubble.isNote
                             selectionColor: root.accent
-                            font.pixelSize: root.bodyPixelSize
+                            font.pixelSize: Theme.bodyPixelSize
                         }
 
                         // Live thinking placeholder while awaiting the first token.
@@ -1147,7 +1120,7 @@ ApplicationWindow {
                             maximumLineCount: 1
                             color: root.dim
                             opacity: 0.8
-                            font.family: root.monoFamily
+                            font.family: Theme.monoFontFamily
                             font.pixelSize: 10
                         }
                     }
@@ -1174,7 +1147,7 @@ ApplicationWindow {
                                     height: 22
                                     width: Math.min(mutationRow.width - undoPill.width - 4, pathLabel.implicitWidth + 20)
                                     radius: 11
-                                    color: Qt.rgba(1, 1, 1, 0.04)
+                                    color: Theme.surfaceFaint
                                     border.color: root.codeBorder
                                     border.width: 1
                                     Label {
@@ -1187,7 +1160,7 @@ ApplicationWindow {
                                         elide: Text.ElideMiddle
                                         maximumLineCount: 1
                                         color: root.dim
-                                        font.family: root.monoFamily
+                                        font.family: Theme.monoFontFamily
                                         font.pixelSize: 10
                                     }
                                 }
@@ -1197,7 +1170,7 @@ ApplicationWindow {
                                     height: 22
                                     width: undoLabel.implicitWidth + 20
                                     radius: 11
-                                    color: undoArea.containsMouse && !mutationPill.reverted ? Qt.rgba(1, 1, 1, 0.08) : Qt.rgba(1, 1, 1, 0.04)
+                                    color: undoArea.containsMouse && !mutationPill.reverted ? Theme.controlHover : Theme.surfaceFaint
                                     border.color: root.codeBorder
                                     border.width: 1
                                     Label {
@@ -1206,7 +1179,7 @@ ApplicationWindow {
                                         text: mutationPill.reverted ? "\u21BA Reverted" : "\u21B6 Undo"
                                         color: mutationPill.reverted ? root.dim : root.textColor
                                         opacity: mutationPill.reverted ? 0.6 : 1.0
-                                        font.family: root.monoFamily
+                                        font.family: Theme.monoFontFamily
                                         font.pixelSize: 10
                                     }
                                     MouseArea {
@@ -1269,7 +1242,7 @@ ApplicationWindow {
                 anchors.top: parent.top
                 anchors.topMargin: 8
                 // Fixed reading measure: never reacts to typed text.
-                width: Math.max(0, Math.min(parent.width - theme.dockMargin, theme.dockMaxWidth))
+                width: Math.max(0, Math.min(parent.width - Theme.dockMargin, Theme.dockMaxWidth))
                 // Tracks the wrapped text height: one line (44) up to 180, then scrolls inside.
                 height: Math.min(Math.max(input.contentHeight + verticalPadding, 44), 180)
                 radius: 14
@@ -1278,10 +1251,10 @@ ApplicationWindow {
                 enabled: bridge ? (bridge.isConfigured && !bridge.busy) : false
                 opacity: visible ? 1 : 0
                 Behavior on opacity { NumberAnimation { duration: 220; easing.type: Easing.OutQuad } }
-                color: theme.dockSurface
+                color: Theme.dockSurface
                 border.width: 1
-                border.color: windowDropArea.containsDrag ? Qt.rgba(0.220, 0.741, 0.973, 0.3)
-                              : (input.activeFocus ? theme.cyan : theme.dockBorder)
+                border.color: windowDropArea.containsDrag ? Theme.dockDropBorder
+                              : (input.activeFocus ? Theme.brandAccent : Theme.dockBorder)
                 Behavior on height { NumberAnimation { duration: 90; easing.type: Easing.OutQuad } }
 
                 Flickable {
@@ -1298,7 +1271,7 @@ ApplicationWindow {
                         id: input
                         objectName: "messageInput"
                         placeholderText: "Message Strand..."
-                        placeholderTextColor: Qt.rgba(1, 1, 1, 0.28)
+                        placeholderTextColor: Theme.placeholderText
                         color: root.textColor
                         wrapMode: TextArea.Wrap
                         font.pixelSize: 14
@@ -1355,7 +1328,7 @@ ApplicationWindow {
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                     text: "+"
-                    color: attachMouse.containsMouse ? theme.cyan : Qt.rgba(1, 1, 1, 0.4)
+                    color: attachMouse.containsMouse ? Theme.brandAccent : Theme.subtleText
                     font.pixelSize: 18
                     MouseArea {
                         id: attachMouse
@@ -1376,8 +1349,8 @@ ApplicationWindow {
                     // only visible while the input is empty, i.e. a single unscrolled line).
                     y: inputFlick.y + input.baselineOffset - baselineOffset
                     text: bridge ? bridge.modelName : "gemini-3.6-flash"
-                    color: Qt.rgba(1, 1, 1, 0.22)
-                    font.family: root.firstFamily([Qt.application.font.family, "Inter", "-apple-system", "Segoe UI", "Noto Sans", "sans-serif"])
+                    color: Theme.watermarkText
+                    font.family: Theme.uiFontFamily
                     font.pointSize: 9.5
                     font.weight: Font.Normal
                     visible: opacity > 0
@@ -1402,17 +1375,17 @@ ApplicationWindow {
                         height: 24
                         width: chipLabel.implicitWidth + closeLabel.implicitWidth + 22
                         radius: 12
-                        color: Qt.rgba(1, 1, 1, 0.06)
+                        color: Theme.chipSurface
                         border.width: 1
-                        border.color: Qt.rgba(1, 1, 1, 0.1)
+                        border.color: Theme.chipBorder
                         Label {
                             id: chipLabel
                             anchors.left: parent.left
                             anchors.leftMargin: 10
                             anchors.verticalCenter: parent.verticalCenter
                             text: (model.isImage ? "\uD83D\uDDBC " : "\uD83D\uDCC4 ") + model.name + " \u2022 " + root.formatTokens(model.tokens)
-                            color: model.tokens > 50000 ? "#f59e0b" : "#8b949e"
-                            font.family: root.monoFamily
+                            color: model.tokens > 50000 ? Theme.distillationAccent : Theme.textFaint
+                            font.family: Theme.monoFontFamily
                             font.pixelSize: 11
                         }
                         Label {
@@ -1421,7 +1394,7 @@ ApplicationWindow {
                             anchors.rightMargin: 8
                             anchors.verticalCenter: parent.verticalCenter
                             text: "\u2715"
-                            color: closeMouse.containsMouse ? root.textColor : "#8b949e"
+                            color: closeMouse.containsMouse ? root.textColor : Theme.textFaint
                             font.pixelSize: 11
                             MouseArea {
                                 id: closeMouse
@@ -1441,7 +1414,7 @@ ApplicationWindow {
                     visible: false
                     anchors.verticalCenter: undefined
                     text: "Path outside workspace roots"
-                    color: "#f59e0b"
+                    color: Theme.distillationAccent
                     font.pixelSize: 11
                 }
             }
@@ -1465,7 +1438,7 @@ ApplicationWindow {
                     width: 26
                     height: 26
                     radius: 13
-                    color: telemetryButtonMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : "transparent"
+                    color: telemetryButtonMouse.containsMouse ? Theme.controlHover : "transparent"
                     Behavior on color { ColorAnimation { duration: 120 } }
                     Label {
                         anchors.centerIn: parent
@@ -1489,7 +1462,7 @@ ApplicationWindow {
                     width: 26
                     height: 26
                     radius: 13
-                    color: settingsButtonMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : "transparent"
+                    color: settingsButtonMouse.containsMouse ? Theme.controlHover : "transparent"
                     Behavior on color { ColorAnimation { duration: 120 } }
                     Label {
                         anchors.centerIn: parent
@@ -1542,8 +1515,8 @@ ApplicationWindow {
         clip: true
         radius: 16
         // Near-opaque #0d1117 surface (0.96) so transcript text never ghosts through.
-        color: Qt.rgba(0.051, 0.067, 0.090, 0.96)
-        border.color: Qt.rgba(1, 1, 1, 0.08)
+        color: Theme.drawerSurface
+        border.color: Theme.controlBorder
         border.width: 1
         Behavior on progress {
             NumberAnimation { id: drawerSlideAnimation; duration: 140; easing.type: Easing.OutCubic }
@@ -1572,7 +1545,7 @@ ApplicationWindow {
                         anchors.verticalCenter: parent.verticalCenter
                         text: "TELEMETRY"
                         color: root.textColor
-                        font.family: root.uiFamily
+                        font.family: Theme.uiFontFamily
                         font.pixelSize: 12
                         font.bold: true
                         font.letterSpacing: 1.2
@@ -1585,7 +1558,7 @@ ApplicationWindow {
                         width: 24
                         height: 24
                         radius: 12
-                        color: closeMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : "transparent"
+                        color: closeMouse.containsMouse ? Theme.controlHover : "transparent"
                         Behavior on color { ColorAnimation { duration: 120 } }
                         Label { anchors.centerIn: parent; text: "\u2715"; color: root.dim; font.pixelSize: 12 }
                         MouseArea {
@@ -1621,7 +1594,7 @@ ApplicationWindow {
                         Label {
                             text: modelData.title.toUpperCase()
                             color: root.dim
-                            font.family: root.uiFamily
+                            font.family: Theme.uiFontFamily
                             font.pixelSize: 10
                             font.letterSpacing: 1.0
                         }
@@ -1629,7 +1602,7 @@ ApplicationWindow {
                             width: parent.width
                             height: cardColumn.height + 20
                             radius: 8
-                            color: Qt.rgba(1, 1, 1, 0.03)
+                            color: Theme.surfaceRecessed
                             border.color: root.border
                             border.width: 1
                             Column {
@@ -1644,7 +1617,7 @@ ApplicationWindow {
                                         required property var modelData
                                         width: cardColumn.width
                                         spacing: 1
-                                        Label { text: modelData[0]; color: root.dim; font.family: root.uiFamily; font.pixelSize: 10 }
+                                        Label { text: modelData[0]; color: root.dim; font.family: Theme.uiFontFamily; font.pixelSize: 10 }
                                         TextEdit {
                                             width: parent.width
                                             readOnly: true
@@ -1652,7 +1625,7 @@ ApplicationWindow {
                                             wrapMode: TextEdit.WrapAnywhere
                                             text: String(modelData[1])
                                             color: root.textColor
-                                            font.family: root.monoFamily
+                                            font.family: Theme.monoFontFamily
                                             font.pixelSize: 11
                                             selectionColor: root.accent
                                         }
@@ -1683,8 +1656,8 @@ ApplicationWindow {
         implicitHeight: 40
         implicitWidth: wbText.implicitWidth + 36
         radius: 8
-        color: primary ? (wbMouse.containsMouse ? Qt.lighter(theme.accent, 1.1) : theme.accent)
-                       : (wbMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : "transparent")
+        color: primary ? (wbMouse.containsMouse ? Qt.lighter(Theme.actionAccent, 1.1) : Theme.actionAccent)
+                       : (wbMouse.containsMouse ? Theme.controlHover : "transparent")
         border.color: primary ? "transparent" : root.codeBorder
         border.width: 1
         Behavior on color { ColorAnimation { duration: 120 } }
@@ -1692,7 +1665,7 @@ ApplicationWindow {
             id: wbText
             anchors.centerIn: parent
             text: wb.label
-            color: wb.primary ? "#0b0e12" : root.textColor
+            color: wb.primary ? Theme.onPrimaryText : root.textColor
             font.pixelSize: 14
             font.weight: Font.DemiBold
         }
@@ -1733,22 +1706,22 @@ ApplicationWindow {
         anchors.fill: parent
         z: 51
         visible: windowDropArea.containsDrag
-        color: Qt.rgba(0.220, 0.741, 0.973, 0.05)
-        border.color: Qt.rgba(0.220, 0.741, 0.973, 0.45)
+        color: Theme.dropOverlayFill
+        border.color: Theme.dropOverlayBorder
         border.width: 3
         Rectangle {
             anchors.centerIn: parent
             width: dropIndicatorLabel.implicitWidth + 40
             height: 36
             radius: 18
-            color: Qt.rgba(0.067, 0.086, 0.114, 0.9)
-            border.color: Qt.rgba(0.220, 0.741, 0.973, 0.5)
+            color: Theme.dropBadgeSurface
+            border.color: Theme.dropBadgeBorder
             border.width: 1
             Label {
                 id: dropIndicatorLabel
                 anchors.centerIn: parent
                 text: "Drop files to attach"
-                color: "#38bdf8"
+                color: Theme.brandAccent
                 font.pixelSize: 13
             }
         }
@@ -1768,8 +1741,8 @@ ApplicationWindow {
         width: Math.min(parent.width - 48, 680)
         height: welcomeColumn.implicitHeight + 72
         radius: 16
-        color: theme.cardSurface
-        border.color: Qt.rgba(1, 1, 1, 0.08)
+        color: Theme.artifactBackground
+        border.color: Theme.controlBorder
         border.width: 1
         opacity: root.welcomeActive ? 1 : 0
         visible: opacity > 0
@@ -1887,11 +1860,11 @@ ApplicationWindow {
                     placeholderText: "Endpoint URL (e.g. http://127.0.0.1:8000/v1)"
                     color: root.textColor
                     selectionColor: root.accent
-                    font.family: root.monoFamily
+                    font.family: Theme.monoFontFamily
                     font.pixelSize: 12
                     leftPadding: 10
                     rightPadding: 10
-                    background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
+                    background: Rectangle { radius: Theme.controlRadius; color: Theme.fieldBackground; border.color: root.codeBorder; border.width: 1 }
                     onTextChanged: root.scheduleWelcomeProbe()
                     onAccepted: root.wizardNext()
                 }
@@ -1905,11 +1878,11 @@ ApplicationWindow {
                     placeholderText: "API key"
                     color: root.textColor
                     selectionColor: root.accent
-                    font.family: root.monoFamily
+                    font.family: Theme.monoFontFamily
                     font.pixelSize: 12
                     leftPadding: 10
                     rightPadding: 10
-                    background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
+                    background: Rectangle { radius: Theme.controlRadius; color: Theme.fieldBackground; border.color: root.codeBorder; border.width: 1 }
                     onTextChanged: root.scheduleWelcomeProbe()
                     onAccepted: root.wizardNext()
                 }
@@ -1920,7 +1893,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     editable: true
                     model: root.welcomeModels
-                    font.family: root.monoFamily
+                    font.family: Theme.monoFontFamily
                     font.pixelSize: 12
                     onActivated: root.welcomeModel = currentText
                     onEditTextChanged: if (activeFocus) root.welcomeModel = editText
@@ -1979,7 +1952,7 @@ ApplicationWindow {
                     leftPadding: 10
                     rightPadding: 10
                     maximumLength: 64
-                    background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
+                    background: Rectangle { radius: Theme.controlRadius; color: Theme.fieldBackground; border.color: root.codeBorder; border.width: 1 }
                     Component.onCompleted: text = root.wizardName
                     onTextChanged: root.wizardName = text
                     onAccepted: root.wizardNext()
@@ -2035,8 +2008,8 @@ ApplicationWindow {
                         required property string modelData
                         Layout.fillWidth: true
                         Layout.preferredHeight: 38
-                        radius: 6
-                        color: theme.fieldSurface
+                        radius: Theme.controlRadius
+                        color: Theme.fieldBackground
                         border.color: root.codeBorder
                         border.width: 1
                         RowLayout {
@@ -2048,7 +2021,7 @@ ApplicationWindow {
                                 text: modelData
                                 elide: Text.ElideMiddle
                                 color: root.textColor
-                                font.family: root.monoFamily
+                                font.family: Theme.monoFontFamily
                                 font.pixelSize: 12
                             }
                             Rectangle {
@@ -2056,7 +2029,7 @@ ApplicationWindow {
                                 Layout.preferredWidth: 26
                                 Layout.preferredHeight: 26
                                 radius: 13
-                                color: removeMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : "transparent"
+                                color: removeMouse.containsMouse ? Theme.controlHover : "transparent"
                                 Label { anchors.centerIn: parent; text: "\u2715"; color: root.dim; font.pixelSize: 12 }
                                 MouseArea {
                                     id: removeMouse
@@ -2081,7 +2054,7 @@ ApplicationWindow {
                 objectName: "welcomeError"
                 visible: root.welcomeError.length > 0
                 text: root.welcomeError
-                color: theme.warn
+                color: Theme.warnAccent
                 font.pixelSize: 12
                 wrapMode: Text.WordWrap
                 Layout.fillWidth: true
@@ -2126,7 +2099,7 @@ ApplicationWindow {
         enabled: root.settingsOpen
         visible: root.settingsOpen
         onClicked: root.closeSettings()
-        Rectangle { anchors.fill: parent; color: Qt.rgba(0, 0, 0, 0.55) }
+        Rectangle { anchors.fill: parent; color: Theme.overlayBackdrop }
     }
 
     Rectangle {
@@ -2138,8 +2111,8 @@ ApplicationWindow {
         height: Math.min(parent.height - 48, 640)
         anchors.centerIn: parent
         radius: 16
-        color: Qt.rgba(root.panel.r, root.panel.g, root.panel.b, 0.97)
-        border.color: Qt.rgba(1, 1, 1, 0.10)
+        color: Theme.modalSurface
+        border.color: Theme.modalBorder
         border.width: 1
 
         // Swallow clicks on the card so they never reach the dismiss backdrop.
@@ -2156,7 +2129,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     text: "STRAND CALIBRATION"
                     color: root.textColor
-                    font.family: root.uiFamily
+                    font.family: Theme.uiFontFamily
                     font.pixelSize: 12
                     font.bold: true
                     font.letterSpacing: 1.2
@@ -2166,7 +2139,7 @@ ApplicationWindow {
                     width: 24
                     height: 24
                     radius: 12
-                    color: settingsCloseMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.08) : "transparent"
+                    color: settingsCloseMouse.containsMouse ? Theme.controlHover : "transparent"
                     Label { anchors.centerIn: parent; text: "\u2715"; color: root.dim; font.pixelSize: 12 }
                     MouseArea {
                         id: settingsCloseMouse
@@ -2190,13 +2163,14 @@ ApplicationWindow {
                     Layout.fillHeight: true
                     spacing: 12
 
-                    // Panel A: read-only active stance mirror
+                    // Panel A: active stance (read-only mirror of learned directives)
                     Rectangle {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
+                        Layout.minimumHeight: 110
                         radius: 10
-                        color: Qt.rgba(1, 1, 1, 0.03)
-                        border.color: Qt.rgba(1, 1, 1, 0.06)
+                        color: Theme.surfaceRecessed
+                        border.color: Theme.subtleBorder
                         ColumnLayout {
                             anchors.fill: parent
                             anchors.margins: 14
@@ -2205,7 +2179,7 @@ ApplicationWindow {
                                 objectName: "stanceTitle"
                                 text: "ACTIVE STANCE"
                                 color: root.textColor
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 12
                                 font.bold: true
                                 font.letterSpacing: 1.0
@@ -2216,7 +2190,7 @@ ApplicationWindow {
                                 wrapMode: Text.WordWrap
                                 color: root.dim
                                 opacity: 0.8
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
                             }
                             Column {
@@ -2233,9 +2207,9 @@ ApplicationWindow {
                                         width: stanceList.width
                                         text: "\u2022 " + modelData
                                         wrapMode: Text.WordWrap
-                                        color: Qt.rgba(0.82, 0.85, 0.9, 0.85)
+                                        color: Theme.stanceText
                                         lineHeight: 1.25
-                                        font.family: root.uiFamily
+                                        font.family: Theme.uiFontFamily
                                         font.pixelSize: 12
                                     }
                                 }
@@ -2250,7 +2224,7 @@ ApplicationWindow {
                                 text: "Adapting to your workflow. Standing directives and stylistic preferences will appear here as Strand learns your habits."
                                 wrapMode: Text.WordWrap
                                 color: root.dim
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 12
                                 font.italic: true
                                 lineHeight: 1.25
@@ -2261,7 +2235,7 @@ ApplicationWindow {
                                 horizontalAlignment: Text.AlignRight
                                 text: (bridge ? bridge.activeStanceCount : 0) + " Active Directives in Memory"
                                 color: root.dim
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
                             }
                         }
@@ -2272,8 +2246,8 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.preferredHeight: privacyColumn.implicitHeight + 28
                         radius: 10
-                        color: Qt.rgba(1, 1, 1, 0.03)
-                        border.color: Qt.rgba(1, 1, 1, 0.06)
+                        color: Theme.surfaceRecessed
+                        border.color: Theme.subtleBorder
                         ColumnLayout {
                             id: privacyColumn
                             anchors.left: parent.left
@@ -2284,7 +2258,7 @@ ApplicationWindow {
                             Label {
                                 text: "FIBER RETENTION & BOUNDARIES"
                                 color: root.textColor
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 12
                                 font.bold: true
                                 font.letterSpacing: 1.0
@@ -2292,6 +2266,7 @@ ApplicationWindow {
                             CompactCheckBox {
                                 id: redactBox
                                 objectName: "redactBox"
+                                Layout.topMargin: 6
                                 text: "Thread Secret Redaction"
                                 onToggled: root.persist({ redact_secrets: checked })
                             }
@@ -2304,6 +2279,7 @@ ApplicationWindow {
                             CompactCheckBox {
                                 id: webSearchBox
                                 objectName: "webSearchBox"
+                                Layout.topMargin: 4
                                 text: "Ground with Live Web Search"
                                 checked: bridge.webSearchEnabled
                                 onToggled: bridge.setWebSearchEnabled(checked)
@@ -2314,14 +2290,14 @@ ApplicationWindow {
                                 text: "Allow models to consult a local web search tool (DuckDuckGo) for real-time facts. Increases latency; search snippets are never saved to memory."
                                 wrapMode: Text.WordWrap
                                 color: root.dim
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
                             }
                             Label {
-                                Layout.topMargin: 8
+                                Layout.topMargin: 16
                                 text: "FIBER DECAY"
                                 color: root.dim
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
                                 font.capitalization: Font.AllUppercase
                                 font.letterSpacing: 1.0
@@ -2354,15 +2330,66 @@ ApplicationWindow {
                                 objectName: "horizonWhisper"
                                 Layout.fillWidth: true
                                 Layout.topMargin: 8
-                                Layout.bottomMargin: 4
                                 Layout.minimumHeight: 30
                                 wrapMode: Text.WordWrap
                                 color: root.dim
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
                                 text: root.decayHorizon === "sprint" ? "Aggressive pruning: unreferenced strands fade after 7 days."
                                     : (root.decayHorizon === "balanced" ? "Standard working memory: unreferenced strands fade over 30 days."
                                     : "Time is frozen: all strands retain permanent baseline weight.")
+                            }
+                        }
+                    }
+
+                    // Panel C: compact theme plate
+                    Rectangle {
+                        id: themeCard
+                        objectName: "themeCard"
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: themeColumn.implicitHeight + 28
+                        radius: 10
+                        color: Theme.surfaceRecessed
+                        border.color: Theme.subtleBorder
+                        ColumnLayout {
+                            id: themeColumn
+                            anchors.left: parent.left
+                            anchors.right: parent.right
+                            anchors.top: parent.top
+                            anchors.margins: 14
+                            spacing: 2
+                            Label {
+                                text: "THEME"
+                                color: root.textColor
+                                font.family: Theme.uiFontFamily
+                                font.pixelSize: 12
+                                font.bold: true
+                                font.capitalization: Font.AllUppercase
+                                font.letterSpacing: 1.0
+                            }
+                            RowLayout {
+                                objectName: "themeSelector"
+                                Layout.fillWidth: true
+                                Layout.topMargin: 6
+                                spacing: 6
+                                SegmentButton {
+                                    objectName: "themeObsidian"
+                                    text: "Obsidian"
+                                    selected: Theme.uiTheme === "obsidian"
+                                    onClicked: root.selectAppearance("ui_theme", "obsidian")
+                                }
+                                SegmentButton {
+                                    objectName: "themeGraphite"
+                                    text: "Graphite"
+                                    selected: Theme.uiTheme === "graphite"
+                                    onClicked: root.selectAppearance("ui_theme", "graphite")
+                                }
+                                SegmentButton {
+                                    objectName: "themeDaylight"
+                                    text: "Daylight"
+                                    selected: Theme.uiTheme === "daylight"
+                                    onClicked: root.selectAppearance("ui_theme", "daylight")
+                                }
                             }
                         }
                     }
@@ -2380,8 +2407,8 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         radius: 10
-                        color: Qt.rgba(1, 1, 1, 0.03)
-                        border.color: Qt.rgba(1, 1, 1, 0.06)
+                        color: Theme.surfaceRecessed
+                        border.color: Theme.subtleBorder
                         ColumnLayout {
                             anchors.fill: parent
                             anchors.margins: 14
@@ -2389,7 +2416,7 @@ ApplicationWindow {
                             Label {
                                 text: "UPSTREAM ROUTING"
                                 color: root.textColor
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 12
                                 font.bold: true
                                 font.letterSpacing: 1.0
@@ -2398,7 +2425,7 @@ ApplicationWindow {
                                 Layout.topMargin: 4
                                 text: "API ENDPOINT URL"
                                 color: root.dim
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
                                 font.letterSpacing: 0.5
                             }
@@ -2409,38 +2436,18 @@ ApplicationWindow {
                                 placeholderText: "https://generativelanguage.googleapis.com/v1beta/openai"
                                 color: root.textColor
                                 selectionColor: root.accent
-                                font.family: root.monoFamily
+                                font.family: Theme.monoFontFamily
                                 font.pixelSize: 12
                                 leftPadding: 10
                                 rightPadding: 10
-                                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
-                            }
-                            Label {
-                                Layout.topMargin: 4
-                                text: "DEFAULT MODEL"
-                                color: root.dim
-                                font.family: root.uiFamily
-                                font.pixelSize: 11
-                                font.letterSpacing: 0.5
-                            }
-                            TextField {
-                                id: modelEdit
-                                objectName: "modelEdit"
-                                Layout.fillWidth: true
-                                placeholderText: "gemini-3.6-flash"
-                                color: root.textColor
-                                selectionColor: root.accent
-                                font.family: root.monoFamily
-                                font.pixelSize: 12
-                                leftPadding: 10
-                                rightPadding: 10
-                                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
+                                background: Rectangle { radius: Theme.controlRadius; color: Theme.fieldBackground; border.color: root.codeBorder; border.width: 1 }
+                                onTextEdited: upstreamProbeTimer.restart()
                             }
                             Label {
                                 Layout.topMargin: 4
                                 text: "UPSTREAM API KEY"
                                 color: root.dim
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
                                 font.letterSpacing: 0.5
                             }
@@ -2452,11 +2459,69 @@ ApplicationWindow {
                                 placeholderText: "Enter upstream API key..."
                                 color: root.textColor
                                 selectionColor: root.accent
-                                font.family: root.monoFamily
+                                font.family: Theme.monoFontFamily
                                 font.pixelSize: 12
                                 leftPadding: 10
                                 rightPadding: 10
-                                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
+                                background: Rectangle { radius: Theme.controlRadius; color: Theme.fieldBackground; border.color: root.codeBorder; border.width: 1 }
+                                onTextEdited: if (text.length >= 20) upstreamProbeTimer.restart()
+                            }
+                            Label {
+                                Layout.topMargin: 4
+                                text: "DEFAULT MODEL"
+                                color: root.dim
+                                font.family: Theme.uiFontFamily
+                                font.pixelSize: 11
+                                font.letterSpacing: 0.5
+                            }
+                            ComboBox {
+                                id: upstreamModelBox
+                                objectName: "upstreamModelBox"
+                                Layout.fillWidth: true
+                                editable: true
+                                model: (bridge ? bridge.availableUpstreamModels : [])
+                                font.family: Theme.monoFontFamily
+                                font.pixelSize: 12
+                                property string desired: ""
+                                // Free typing stays possible for custom models or when offline.
+                                onActivated: desired = currentText
+                                onEditTextChanged: if (activeFocus) desired = editText
+                                function applyDetected() {
+                                    var list = (bridge ? bridge.availableUpstreamModels : [])
+                                    var keep = desired
+                                    if (list.length > 0) {
+                                        var i = keep ? list.indexOf(keep) : -1
+                                        currentIndex = i
+                                    }
+                                    editText = keep
+                                }
+                                Connections {
+                                    target: bridge
+                                    function onAvailableUpstreamModelsChanged() {
+                                        upstreamModelBox.applyDetected()
+                                    }
+                                }
+                            }
+                            Label {
+                                id: upstreamModelsStatus
+                                objectName: "upstreamModelsStatus"
+                                visible: text.length > 0
+                                text: !bridge ? ""
+                                    : bridge.isProbingUpstreamModels ? "Probing upstream models..."
+                                    : bridge.upstreamProbeStatus === "success" && bridge.availableUpstreamModels.length > 0
+                                    ? "\u2713 Detected " + bridge.availableUpstreamModels.length + " upstream models"
+                                    : bridge.upstreamProbeStatus === "failed" || bridge.upstreamProbeStatus === "success"
+                                    ? "Could not auto-detect models (enter manually)"
+                                    : ""
+                                color: (bridge && bridge.availableUpstreamModels.length > 0) ? root.diffAdded : root.dim
+                                font.pixelSize: 11
+                                Layout.fillWidth: true
+                            }
+                            Timer {
+                                id: upstreamProbeTimer
+                                interval: 400
+                                repeat: false
+                                onTriggered: root.probeUpstream()
                             }
                             Item { Layout.fillHeight: true }
                             RowLayout {
@@ -2477,7 +2542,7 @@ ApplicationWindow {
                                     onClicked: {
                                         root.routingMessage = root.persist({
                                             upstream_url: upstreamUrlEdit.text,
-                                            model_default: modelEdit.text,
+                                            model_default: upstreamModelBox.editText.trim(),
                                             upstream_api_key: apiKeyEdit.text
                                         }) ? "Route spliced" : "Save failed"
                                         apiKeyEdit.text = ""
@@ -2492,8 +2557,8 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         Layout.preferredHeight: extractorColumn.implicitHeight + 28
                         radius: 10
-                        color: Qt.rgba(1, 1, 1, 0.03)
-                        border.color: Qt.rgba(1, 1, 1, 0.06)
+                        color: Theme.surfaceRecessed
+                        border.color: Theme.subtleBorder
                         ColumnLayout {
                             id: extractorColumn
                             anchors.left: parent.left
@@ -2504,7 +2569,7 @@ ApplicationWindow {
                             Label {
                                 text: "LOCAL FIBER WEAVER"
                                 color: root.textColor
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 12
                                 font.bold: true
                                 font.letterSpacing: 1.0
@@ -2513,7 +2578,7 @@ ApplicationWindow {
                                 Layout.topMargin: 4
                                 text: "OLLAMA / LOCAL SLM ENDPOINT"
                                 color: root.dim
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
                                 font.letterSpacing: 0.5
                             }
@@ -2523,14 +2588,14 @@ ApplicationWindow {
                                 wrapMode: Text.WordWrap
                                 color: root.dim
                                 opacity: 0.8
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
                             }
                             Label {
                                 Layout.topMargin: 4
                                 text: "ENDPOINT URL"
                                 color: root.dim
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
                                 font.letterSpacing: 0.5
                             }
@@ -2541,11 +2606,11 @@ ApplicationWindow {
                                 placeholderText: "http://127.0.0.1:11434/v1"
                                 color: root.textColor
                                 selectionColor: root.accent
-                                font.family: root.monoFamily
+                                font.family: Theme.monoFontFamily
                                 font.pixelSize: 12
                                 leftPadding: 10
                                 rightPadding: 10
-                                background: Rectangle { radius: 6; color: theme.fieldSurface; border.color: root.codeBorder; border.width: 1 }
+                                background: Rectangle { radius: Theme.controlRadius; color: Theme.fieldBackground; border.color: root.codeBorder; border.width: 1 }
                                 // Saved on blur/Enter; Test Connection saves too.
                                 onEditingFinished: root.persist({ extractor_url: text })
                             }
@@ -2553,7 +2618,7 @@ ApplicationWindow {
                                 Layout.topMargin: 4
                                 text: "EXTRACTOR MODEL"
                                 color: root.dim
-                                font.family: root.uiFamily
+                                font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
                                 font.letterSpacing: 0.5
                             }
@@ -2563,7 +2628,7 @@ ApplicationWindow {
                                 Layout.fillWidth: true
                                 editable: true
                                 model: (bridge ? bridge.availableExtractorModels : [])
-                                font.family: root.monoFamily
+                                font.family: Theme.monoFontFamily
                                 font.pixelSize: 12
                                 // Free typing stays possible for custom endpoints or when offline.
                                 onActivated: root.persist({ extractor_model: currentText })
@@ -2641,5 +2706,9 @@ ApplicationWindow {
         border.width: 1
     }
 
-    Component.onCompleted: input.forceActiveFocus()
+    Component.onCompleted: {
+        if (bridge)
+            applyAppearance(bridge.getConfig())
+        input.forceActiveFocus()
+    }
 }

@@ -17,14 +17,13 @@ from strand.common import (
     PERSONALITY_ARCHETYPES,
     aliases_of,
     clean_text,
-    get_persona_stance,
     is_private,
     load_metadata,
 )
 from strand.db import PRIVATE_ENTITY_SQL, DatabaseManager
 from strand.embed import Embedder, EmbeddingUnavailable
 from strand.logging import get_logger
-from strand.session import BEDROCK_ID, SessionDelta, SessionLedger
+from strand.session import BEDROCK_ID, PERSONA_ANCHOR_ID, SessionDelta, SessionLedger
 from strand.stopwords import FUNCTION_WORDS, is_stop_word
 
 MAX_HOPS_LIMIT = 2
@@ -35,7 +34,6 @@ MIN_EFFECTIVE_PRIORITY = 0.15  # with decay enabled, candidates below this are p
 MAX_FREQUENCY_FACTOR = 1.5  # cap on the access-frequency boost
 FREQUENCY_STEP = 0.05  # boost per recorded access
 MAX_PERSONALITY_ENTITIES = 20  # cap on always-on personality nodes recalled per turn
-PERSONA_ANCHOR_ID = -1  # sentinel ledger id: the configured persona prompt is injected once per session
 # Personality sections in presentation order, hierarchically above working memory.
 _PERSONALITY_SECTIONS = (
     ("trait", "[Persona Stance]"),
@@ -445,7 +443,6 @@ class ContextResolver:
         decay_half_life_days: float = 30.0,
         clock: Callable[[], datetime] | None = None,
         persona_prompt: str = "",
-        persona_stance: str | None = None,
         continuity_horizon_days: float = DEFAULT_CONTINUITY_HORIZON_DAYS,
         continuity_max_episodes: int = DEFAULT_CONTINUITY_MAX_EPISODES,
     ) -> None:
@@ -457,9 +454,6 @@ class ContextResolver:
             raise ValueError(f"decay_half_life_days must be positive, got {decay_half_life_days}")
         self.db = db
         self.persona_prompt = persona_prompt.strip() if isinstance(persona_prompt, str) else ""
-        # An explicit persona_prompt overrides the named stance; None disables the stance.
-        if not self.persona_prompt and persona_stance is not None:
-            self.persona_prompt = get_persona_stance(persona_stance)
         self.continuity_horizon_days = float(continuity_horizon_days)
         self.continuity_max_episodes = int(continuity_max_episodes)
         self.decay_enabled = decay_enabled
@@ -742,7 +736,12 @@ class ContextResolver:
         keep = [r for r in rows if r["id"] not in has_edge or r["id"] in live]
         return [_entity_from_row(r) for r in keep[:MAX_PERSONALITY_ENTITIES]]
 
-    async def resolve(self, query: str, session_id: str, allow_private: bool = False) -> str:
+    async def resolve(
+        self,
+        query: str,
+        session_id: str,
+        allow_private: bool = False,
+    ) -> str:
         """Markdown block of facts new to `session_id`, or "" if there is nothing to add.
 
         Facts are marked as seen as soon as they are returned, so callers should
@@ -759,7 +758,8 @@ class ContextResolver:
                 logger.warning("touch_access failed; recall continues", exc_info=True)
         # Bedrock is unconditional on Turn 1 (C3); persona_prompt stays as the baseline anchor
         # alongside learned stance nodes (C1).
-        anchor = [PERSONA_ANCHOR_ID] if self.persona_prompt else []
+        persona_prompt = self.persona_prompt
+        anchor = [PERSONA_ANCHOR_ID] if persona_prompt else []
         bedrock = [BEDROCK_ID]
         delta = self.ledger.filter_new(
             session_id, [*bedrock, *anchor, *(e.id for e in entities)], (e.id for e in edges)
@@ -770,7 +770,7 @@ class ContextResolver:
         if delta.is_empty and not discrepancies and not continuity:
             return ""  # a discrepancy is re-flagged whenever the query repeats it, ledger unchanged
         text = format_context_delta(
-            entities, edges, delta, self.persona_prompt, discrepancies, continuity
+            entities, edges, delta, persona_prompt, discrepancies, continuity
         )
         if not delta.is_empty:  # ERG-CTX-005: keep it replayable if the client drops our prompt
             self.ledger.remember_context(session_id, text, delta.entity_ids, delta.edge_ids)
