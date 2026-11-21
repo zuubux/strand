@@ -683,23 +683,26 @@ ApplicationWindow {
                     border.color: Theme.assistantBubbleBorder
                     border.width: 1
                 }
-                Text {
+                TextEdit {
                     id: prose
                     objectName: "assistantProse"
                     x: pb.hPad
                     y: pb.vPad
                     width: pb.width - 2 * pb.hPad
-                    wrapMode: Text.Wrap
-                    textFormat: Text.MarkdownText
+                    padding: 0
+                    readOnly: true
+                    selectByMouse: true
+                    activeFocusOnPress: true
+                    selectionColor: Theme.selectionColor
+                    selectedTextColor: Theme.selectedTextColor
+                    wrapMode: TextEdit.Wrap
+                    textFormat: TextEdit.MarkdownText
                     text: segment.text
                     color: Theme.assistantText
-                    linkColor: root.accent
                     font.family: Theme.assistantFontFamily
                     font.pixelSize: Theme.bodyPixelSize
                     font.kerning: true
                     font.letterSpacing: Theme.narrativeLetterSpacing
-                    lineHeightMode: Text.ProportionalHeight
-                    lineHeight: Theme.narrativeLineHeight
                 }
             }
         }

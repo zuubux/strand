@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strand Audit: Persona Prompts &amp; Behavioral Distribution</title>
+<style>
+:root{--bg:#0b0e13;--panel:#12171f;--panel2:#171d27;--line:#232c3a;--tx:#d6dde8;--mut:#8493a8;--acc:#6ee7c8;--a:#7aa2ff;--b:#f6b86b;--bad:#ff7a8a;--warn:#f6d36b;--ok:#6ee7a0;--mono:ui-monospace,"JetBrains Mono","Fira Code",Menlo,Consolas,monospace;--sans:Inter,"Segoe UI",system-ui,-apple-system,sans-serif}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(1200px 600px at 80% -10%,#142033 0,transparent 60%),var(--bg);color:var(--tx);font:15px/1.6 var(--sans)}
+main{max-width:1180px;margin:0 auto;padding:48px 24px 96px}
+h1{font-size:30px;letter-spacing:-.02em;margin:0 0 6px}
+h2{font-size:21px;margin:56px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line);letter-spacing:-.01em}
+h2 span{color:var(--acc);font-family:var(--mono);font-size:13px;margin-right:10px}
+h3{font-size:15px;margin:22px 0 8px;color:var(--acc)}
+p{margin:8px 0}.mut{color:var(--mut)}
+code,.m{font-family:var(--mono);font-size:12.5px}
+code{background:var(--panel2);border:1px solid var(--line);padding:1px 6px;border-radius:5px}
+.grid{display:grid;gap:14px}.g3{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.g2{grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.card h4{margin:0 0 6px;font-size:14px}
+.stat b{display:block;font-size:26px;color:var(--acc);font-family:var(--mono)}
+.tag{display:inline-block;font:600 11px var(--mono);padding:1px 8px;border-radius:999px;border:1px solid}
+.tA{color:var(--a);border-color:var(--a)}.tB{color:var(--b);border-color:var(--b)}.tX{color:var(--mut);border-color:var(--mut)}
+.hi{color:var(--bad);border-color:var(--bad)}.md{color:var(--warn);border-color:var(--warn)}.lo{color:var(--ok);border-color:var(--ok)}
+.callout{border-left:3px solid var(--warn);background:#1a1a12;padding:12px 16px;border-radius:0 10px 10px 0;margin:14px 0}
+.callout.red{border-color:var(--bad);background:#1c1215}
+.flow{display:flex;flex-wrap:wrap;gap:10px;align-items:stretch;margin:16px 0}
+.node{flex:1 1 150px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.node small{display:block;color:var(--mut);font-family:var(--mono);font-size:11px}
+.node b{font-size:13px}
+.node.a{border-color:var(--a)}.node.b{border-color:var(--b)}.node.in{border-color:var(--acc)}
+.arrow{align-self:center;color:var(--mut);font-family:var(--mono)}
+.layers{display:flex;flex-direction:column;gap:6px;margin:12px 0}
+.layer{display:flex;gap:12px;align-items:center;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px}
+.layer .n{font:700 12px var(--mono);color:var(--acc);width:22px}
+.layer .t{flex:1}.layer .t small{color:var(--mut);display:block;font-family:var(--mono);font-size:11px}
+.tools{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.tools button,.tools input{background:var(--panel2);color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:6px 12px;font:13px var(--sans)}
+.tools button.on{border-color:var(--acc);color:var(--acc)}
+.tools input{min-width:240px}
+.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}
+table{border-collapse:collapse;width:100%;min-width:1000px;font-size:13px}
+th,td{padding:9px 12px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
+th{background:var(--panel2);color:var(--mut);font:600 11px var(--mono);text-transform:uppercase;letter-spacing:.06em}
+tr:hover td{background:#141a24}
+td.snip{font-family:var(--mono);font-size:11.5px;color:#b9c4d6;max-width:340px}
+td.num{font-family:var(--mono);text-align:right;white-space:nowrap}
+tr.hide{display:none}
+details{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 16px;margin:10px 0}
+summary{cursor:pointer;font-weight:600}
+pre{background:#0a0d12;border:1px solid var(--line);border-radius:8px;padding:12px;overflow-x:auto;font:12px/1.5 var(--mono);color:#b9c4d6;margin:10px 0}
+.bar{height:8px;background:var(--panel2);border-radius:4px;overflow:hidden;margin-top:4px}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--a))}
+ul{padding-left:20px;margin:8px 0}li{margin:4px 0}
+footer{margin-top:64px;color:var(--mut);font-size:12px;border-top:1px solid var(--line);padding-top:16px}
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <span class="tag tX">READ-ONLY AUDIT</span>
+  <h1>Persona Prompts &amp; Behavioral Distribution Matrix</h1>
+  <p class="mut">Strand daemon (<code>127.0.0.1:8088</code>) &middot; audited against the working tree on 2026-11-08 &middot; method: static read of <code>src/strand/*.py</code> plus <code>ARCHITECTURE.md</code>, <code>OBSERVATIONS.md</code> and <code>ROADMAP.md</code>. No source, test, config or doc file was modified. Token counts are estimates (characters &divide; 4); character counts were measured by importing the constants.</p>
+</header>
+
+<h2><span>01</span>Executive Summary &amp; Assembly Pipeline</h2>
+
+<div class="callout red">
+  <b>Scope correction.</b> Parts of the audit brief describe code that no longer exists. <code>OBS-ONB-009</code> (Resolved) removed <code>onboarding_directive()</code>, Day-Zero turns, the Task-Yield and Question-Budget rules, the telemetry gate question, Intent Triage, <code>is_onboarding_completed()</code>, the <code>X-Strand-Mode: onboarding</code> header handling and Model B's operator-name special cases. A grep of <code>src/</code> finds no <code>TASK_YIELD_RULE</code>, <code>QUESTION_BUDGET_RULE</code>, <code>TELEMETRY_GATE_QUESTION</code> or <code>onboarding_directive</code>. The only remaining references are in <code>tests/test_onboarding.py</code> and <code>tests/test_proxy.py</code>, which assert that a fresh session has <em>no</em> onboarding directive. Proxy headers matter only for <code>x-strand-allow-private</code>, plus the outbound <code>X-Strand-Grounding</code> and <code>X-Strand-Mutations</code>. I found no <code>X-Strand-Host-Telemetry</code> handling in <code>src/</code>. <code>onboarding.py</code> is now 137 lines of anchor-seeding and telemetry-query helpers with zero prompt text. The turn-by-turn onboarding map is therefore reported as <b>historical / removed</b> (Section 3.4).
+</div>
+
+<div class="grid g3">
+  <div class="card stat"><b>1 &rarr; 1</b>Frontier-bound persona text is built in <em>one</em> function (<code>resolver.format_context_delta</code>), from 3 string sources</div>
+  <div class="card stat"><b>2</b>Model B prompts (<code>extractors.SYSTEM_PROMPT</code> &asymp;1,300 tok, <code>compactor.SYSTEM_PROMPT</code> &asymp;360 tok); neither is shared with Model A</div>
+  <div class="card stat"><b>~1,760</b>Estimated tokens of fixed tool-schema JSON sent to Model A when tools are enabled, more than the Bedrock by ~40&times;</div>
+</div>
+
+<h3>Headline findings</h3>
+<ul>
+  <li><b>Bedrock is not unconditional.</b> <code>ROADMAP.md</code> says <code>BEDROCK_INVARIANT</code> is emitted in every prompt envelope. In <code>resolver.py:754</code> it is only queued when a personality node is recalled <em>or</em> <code>persona_prompt</code> is non-empty. <code>Config.persona_prompt</code> defaults to <code>""</code> (<code>config.py:143</code>). On a stock install with no trait/directive/preference rows, Model A receives no identity text from Strand. This also contradicts the <code>OBS-ONB-009</code> statement that a fresh session loads the Bedrock. (Code reading only; I did not run a live request.)</li>
+  <li><b>The bedrock is split across layers.</b> The text is in <code>common.py:52</code>, but its ledger sentinel <code>BEDROCK_ID = -2</code> and its gating logic are in <code>resolver.py:37, 754</code>. The brief placed <code>BEDROCK_ID</code> in <code>common.py</code>.</li>
+  <li><b>Strand's persona is prepended, so the client's own system prompt follows it.</b> <code>proxy._inject_delta</code> puts the Strand block first, then <code>\n\n</code>, then the client's text. Where a frontend supplies its own persona, recency favours the client. Strand cannot override it.</li>
+  <li><b>All fragments are strings pasted inline.</b> There are 9 prompt-bearing definitions across 6 modules. Model B's extractor prompt is one 5.2 KB string literal with roughly 19 negation or restriction words.</li>
+</ul>
+<h3>Assembly pipeline: Model A (Frontier)</h3>
+<div class="flow">
+  <div class="node in"><small>client</small><b>POST /v1/chat/completions</b><small>messages[], session_id, x-strand-allow-private</small></div><div class="arrow">&rarr;</div>
+  <div class="node"><small>proxy.py:595</small><b>_last_user_query</b><small>last user text &rarr; resolver</small></div><div class="arrow">&rarr;</div>
+  <div class="node"><small>resolver.py:733</small><b>resolve()</b><small>gather + personality_entities + ledger.filter_new</small></div><div class="arrow">&rarr;</div>
+  <div class="node"><small>resolver.py:277</small><b>format_context_delta</b><small>assembles the text block</small></div><div class="arrow">&rarr;</div>
+  <div class="node"><small>proxy.py:615</small><b>replay_context</b><small>re-add blocks the client dropped</small></div><div class="arrow">&rarr;</div>
+  <div class="node"><small>proxy.py:69</small><b>_inject_delta</b><small>prepend to first system/developer msg</small></div><div class="arrow">&rarr;</div>
+  <div class="node a"><small>proxy.py:636-641</small><b>+ tool schemas</b><small>WORKSPACE_TOOLS, WEB_SEARCH_TOOL</small></div><div class="arrow">&rarr;</div>
+  <div class="node a"><small>upstream</small><b>MODEL A</b></div>
+</div>
+
+<h3>Layer order inside the injected block (top to bottom)</h3>
+<div class="layers">
+  <div class="layer"><span class="n">1</span><div class="t">## Strand Memory <small>_HEADER, resolver.py:31</small></div></div>
+  <div class="layer"><span class="n">2</span><div class="t">BEDROCK_INVARIANT <small>only if BEDROCK_ID is new to the session; common.py:52; queued iff stance or anchor</small></div></div>
+  <div class="layer"><span class="n">3</span><div class="t">[Reality Check - Attribute Discrepancy] <small>re-emitted on every turn whose query repeats the contradiction; ends with an imperative</small></div></div>
+  <div class="layer"><span class="n">4</span><div class="t">[Persona Stance] = <code>config.persona_prompt</code> anchor (only when no personality node exists), then <code>trait</code> nodes <small>resolver.py:319-325</small></div></div>
+  <div class="layer"><span class="n">5</span><div class="t">[Operational Directives] = <code>directive</code> nodes</div></div>
+  <div class="layer"><span class="n">6</span><div class="t">[Interaction Preferences] = <code>preference</code> nodes</div></div>
+  <div class="layer"><span class="n">7</span><div class="t">[Recent Continuity] <small>episode narratives, &le;240 chars each, 7-day horizon, max 2</small></div></div>
+  <div class="layer"><span class="n">8</span><div class="t">[Working Memory] / Entities / Relations <small>factual graph facts new to the session</small></div></div>
+  <div class="layer"><span class="n">9</span><div class="t">&hellip;then the client's own system/developer message <small>unmodified, after Strand's block</small></div></div>
+</div>
+<h3>Turn 1 vs Turn 2+ (SessionLedger)</h3>
+<div class="grid g2">
+  <div class="card"><h4>Turn 1 (cold session)</h4>
+    <ul>
+      <li>Ledger empty, so <code>filter_new</code> returns <code>[BEDROCK_ID, PERSONA_ANCHOR_ID?, personality ids, matched entity ids]</code>.</li>
+      <li>Full block rendered, then stored by <code>remember_context</code> (<code>session.py:192</code>).</li>
+      <li>Up to 20 personality nodes (<code>MAX_PERSONALITY_ENTITIES</code>) are recalled <em>regardless of query relevance</em>.</li>
+    </ul></div>
+  <div class="card"><h4>Turn 2+ (warm session)</h4>
+    <ul>
+      <li>Ids already seen are dropped. Bedrock, anchor and personality rows are <b>not</b> re-sent. Only new factual facts, re-flagged discrepancies and new continuity appear.</li>
+      <li>If nothing is new, <code>resolve()</code> returns <code>""</code> and nothing is injected.</li>
+      <li><code>replay_context</code> re-prepends earlier blocks that are absent from the client's system text (ERG-CTX-005), so persona survives clients that resend only user/assistant history.</li>
+      <li><b>Eviction:</b> when stored blocks exceed <code>MAX_REPLAY_CHARS = 12000</code>, the <em>oldest</em> block is dropped and its ids un-seen (<code>session.py:201-207</code>). Turn 1 carries the Bedrock, so it is the first block to go. The Bedrock is re-injected the next time it is queued, so the persona can reappear mid-conversation.</li>
+      <li><code>ledger.reset</code> on resolution failure or upstream &ge;400 clears everything, so the next turn is a cold Turn 1 again.</li>
+    </ul></div>
+</div>
+
+<h3>Assembly pipeline: Model B (Local SLM)</h3>
+<div class="flow">
+  <div class="node a"><small>post-response</small><b>schedule_distillation</b><small>proxy.py:439; skipped on allow-private</small></div><div class="arrow">&rarr;</div>
+  <div class="node b"><small>extractors.py:24</small><b>SYSTEM_PROMPT</b><small>+ user msg "Host / User / Assistant" (6000 chars each)</small></div><div class="arrow">&rarr;</div>
+  <div class="node"><small>distill.py</small><b>write graph</b><small>origin=model_inferred; entities, edges, deprecations, forgets</small></div><div class="arrow">&rarr;</div>
+  <div class="node in"><small>next turn</small><b>personality_entities()</b><small>closes the loop into Model A's prompt</small></div>
+</div>
+<p class="mut">Model B output becomes Model A input a turn later, so extractor wording decides the quality of the persona rules Model A is given.</p>
+
+<h2><span>02</span>Catalog of Distributed Prompt Strings</h2>
+<div class="tools">
+  <input id="q" placeholder="Filter by file, name, text…">
+  <button data-m="all" class="on">All</button><button data-m="A">Model A</button><button data-m="B">Model B</button><button data-m="X">Neither / data</button>
+</div>
+<div class="wrap">
+<table id="cat">
+<thead><tr><th>File : Line</th><th>Constant / Function</th><th>Target</th><th>Injection condition</th><th>Exact text snippet</th><th>Tokens (est.)</th></tr></thead>
+<tbody>
+<tr data-m="A"><td class="m">common.py:52-55</td><td class="m">BEDROCK_INVARIANT</td><td><span class="tag tA">A</span></td><td>First time <code>BEDROCK_ID</code> is new in a session, and only if a personality node is recalled or <code>persona_prompt</code> is non-empty</td><td class="snip">You are Strand, running locally on the operator's machine. Be direct, plain-spoken, and technically sharp. Never apologize. Never use corporate filler or polite fluff.</td><td class="num">~42<br><span class="mut">167 ch</span></td></tr>
+<tr data-m="A"><td class="m">resolver.py:37</td><td class="m">BEDROCK_ID = -2</td><td><span class="tag tX">ledger</span></td><td>Sentinel in <code>seen_entity_ids</code>; no text</td><td class="snip">(integer sentinel)</td><td class="num">0</td></tr>
+<tr data-m="A"><td class="m">resolver.py:38, 319-323</td><td class="m">PERSONA_ANCHOR_ID = -1 &rarr; config.persona_prompt</td><td><span class="tag tA">A</span></td><td>Non-empty <code>persona_prompt</code> <b>and</b> no personality node in the recalled set; inserted as first line of <code>[Persona Stance]</code></td><td class="snip">(operator-defined, whitespace-collapsed by <code>_clean</code>; empty by default)</td><td class="num">0 default<br><span class="mut">unbounded</span></td></tr>
+<tr data-m="A"><td class="m">resolver.py:40-45</td><td class="m">_PERSONALITY_SECTIONS, _WORKING_MEMORY</td><td><span class="tag tA">A</span></td><td>Section header printed when its archetype has new rows</td><td class="snip">[Persona Stance] / [Operational Directives] / [Interaction Preferences] / [Working Memory]</td><td class="num">~5 each</td></tr>
+<tr data-m="A"><td class="m">resolver.py:694-731</td><td class="m">personality_entities() &rarr; graph rows</td><td><span class="tag tA">A</span></td><td>Every turn, any query; archetype in trait|directive|preference; skipped if all edges deprecated; private filtered; cap 20</td><td class="snip">- &lt;name&gt;: &lt;summary&gt; [inferred, confidence: x.xx] (summary &le; 300 chars, Model B authored)</td><td class="num">&le;~1,500<br><span class="mut">20 &times; ~75</span></td></tr>
+<tr data-m="A"><td class="m">resolver.py:49, 331-339</td><td class="m">_REALITY_CHECK + imperative line</td><td><span class="tag tA">A</span></td><td>Whenever <code>detect_discrepancies</code> finds a stored vs queried spec clash; repeated every time the query repeats it</td><td class="snip">- Clarify or challenge this discrepancy rather than assuming the contradictory spec.</td><td class="num">~60</td></tr>
+<tr data-m="A"><td class="m">resolver.py:46, 341-343</td><td class="m">_CONTINUITY / recent_continuity()</td><td><span class="tag tA">A</span></td><td>Episodes within horizon (default 7 d), max 2, unseen, matched roots</td><td class="snip">[Recent Continuity] - YYYY-MM-DD: &lt;narrative &le;240 chars&gt;</td><td class="num">&le;~130</td></tr>
+<tr data-m="A"><td class="m">resolver.py:31</td><td class="m">_HEADER</td><td><span class="tag tA">A</span></td><td>Every non-empty delta</td><td class="snip">## Strand Memory</td><td class="num">~4</td></tr>
+<tr data-m="A"><td class="m">proxy.py:69-81</td><td class="m">_inject_delta()</td><td><span class="tag tA">A</span></td><td>Delta non-empty. Prepends to first <code>system</code>/<code>developer</code> message (list content: new text part first); otherwise inserts a system message at index 0. Adds only a separator, with no wrapper prompt</td><td class="snip">f"{delta}\n\n{content}"</td><td class="num">~1</td></tr>
+<tr data-m="A"><td class="m">proxy.py:615-618</td><td class="m">ledger.replay_context()</td><td><span class="tag tA">A</span></td><td>Earlier blocks missing from the client's system text; oldest first; &le;12,000 chars total</td><td class="snip">(re-sends prior delta text verbatim)</td><td class="num">&le;~3,000</td></tr>
+<tr data-m="A"><td class="m">tools/workspace.py:939-943</td><td class="m">SCOPE_NOTE (appended to 4 tool descriptions)</td><td><span class="tag tA">A</span></td><td><code>tools_enabled</code>; duplicated on <code>list_directory</code>, <code>read_file</code>, <code>grep_workspace</code>, <code>glob_files</code></td><td class="snip">Scope: project files and source trees inside approved workspace roots only. These tools cannot run shell commands, inspect /proc or query host hardware; answer questions about host hardware (CPU, RAM, GPU) directly from the ambient host context instead of calling tools.</td><td class="num">~68 &times; 4<br><span class="mut">271 ch</span></td></tr>
+<tr data-m="A"><td class="m">tools/workspace.py:945-1062</td><td class="m">WORKSPACE_TOOLS (11+ schemas)</td><td><span class="tag tA">A</span></td><td><code>tools_enabled</code>, merged by <code>_merge_tools</code> (client definitions win on name clash)</td><td class="snip">Replace one exact, unique block of text in an existing file. Fails without changes when search_block is missing or matches more than once. &hellip;</td><td class="num">~1,680<br><span class="mut">6,713 ch JSON</span></td></tr>
+<tr data-m="A"><td class="m">tools/search.py:24-39</td><td class="m">WEB_SEARCH_TOOL</td><td><span class="tag tA">A</span></td><td><code>web_search_enabled</code></td><td class="snip">Search the live web for recent news, vehicle specifications, real-time documentation, or public facts.</td><td class="num">~80<br><span class="mut">322 ch JSON</span></td></tr>
+<tr data-m="B"><td class="m">extractors.py:24-85</td><td class="m">SYSTEM_PROMPT (extractor)</td><td><span class="tag tB">B</span></td><td>Every distilled exchange (non-trivial turns, not allow-private); <code>temperature: 0</code></td><td class="snip">You extract a knowledge graph from a conversation turn. Reply with strict JSON only, shaped as {"entities": [&hellip;], "edges": [&hellip;], "deprecated_edges": [&hellip;]}. &hellip; Permanence guardrail: distinguish PERMANENT DIRECTIVES from TRANSIENT STEERING. &hellip;</td><td class="num">~1,300<br><span class="mut">5,188 ch / 769 words</span></td></tr>
+<tr data-m="B"><td class="m">extractors.py:259-269</td><td class="m">user message wrapper</td><td><span class="tag tB">B</span></td><td>Per call; hostname from <code>get_host_context()</code></td><td class="snip">Host: {hostname}\n\nUser: {query[:6000]}\n\nAssistant: {response[:6000]}</td><td class="num">variable<br><span class="mut">&le;~3,000</span></td></tr>
+<tr data-m="B"><td class="m">compactor.py:38-56</td><td class="m">SYSTEM_PROMPT (compactor)</td><td><span class="tag tB">B</span></td><td>Session compaction after <code>DEFAULT_COMPACTION_THRESHOLD_HOURS = 24</code>; <code>temperature: 0</code></td><td class="snip">You consolidate a finished conversation session into durable, multi-horizon knowledge. &hellip; Ignore one-off conversational steering and transient requests; only emit a trait or preference that reflects a sustained pattern &hellip;</td><td class="num">~360<br><span class="mut">1,438 ch</span></td></tr>
+<tr data-m="B"><td class="m">compactor.py:172-178</td><td class="m">user message wrapper</td><td><span class="tag tB">B</span></td><td>Per compaction; truncated to 12,000 chars</td><td class="snip">Known entities:\n{known}\n\nSession episodes:\n{body}</td><td class="num">variable<br><span class="mut">&le;~3,000</span></td></tr>
+<tr data-m="X"><td class="m">config.py:59, 142-143, 235</td><td class="m">Config.persona_prompt / STRAND_PERSONA_PROMPT</td><td><span class="tag tX">source</span></td><td>Default <code>""</code>; picked from env / <code>config.json</code>, stripped; wired by <code>daemon.py:42</code> into <code>ContextResolver</code>; editable in the GUI (<code>bridge.py:62, 1204</code>)</td><td class="snip">persona_prompt: str = ""</td><td class="num">0</td></tr>
+<tr data-m="X"><td class="m">common.py:50-57</td><td class="m">PERSONALITY_ / FACTUAL_ / VALID_ARCHETYPES</td><td><span class="tag tX">data</span></td><td>Routing constants; no prose. The archetype enum is <em>re-stated by hand</em> inside the extractor prompt</td><td class="snip">frozenset({"trait","directive","preference"})</td><td class="num">0</td></tr>
+<tr data-m="X"><td class="m">onboarding.py:101-103</td><td class="m">TELEMETRY_ENABLED / TELEMETRY_ON_DEMAND / TELEMETRY_RELATION</td><td><span class="tag tX">data</span></td><td>Entity-name literals, not prompts. Model B is told the same names in prose (<code>extractors.py:74-82</code>), a duplicated contract with no shared constant</td><td class="snip">"Host Telemetry Enabled" / "Host Telemetry On-Demand" / "prefers"</td><td class="num">0</td></tr>
+<tr data-m="X"><td class="m">onboarding.py (whole file)</td><td class="m">onboarding_directive, TASK_YIELD_RULE, QUESTION_BUDGET_RULE, TELEMETRY_GATE_QUESTION</td><td><span class="tag tX">REMOVED</span></td><td>Deleted by OBS-ONB-009. Not present in <code>src/</code></td><td class="snip">&mdash;</td><td class="num">0</td></tr>
+</tbody>
+</table>
+</div>
+<p class="mut">Typical fixed Model A overhead on a warm, tools-on session: tool schemas &asymp;1,760 tokens vs Bedrock &asymp;42 tokens. On turn 1, persona and memory text ranges from the Bedrock alone up to &asymp;1,700 tokens (20 personality nodes plus continuity).</p>
+
+<h3>Token budget at a glance (Model A, tools enabled, worst case)</h3>
+<div class="card">
+  <div class="m">Replay blocks (cap 12,000 chars) &asymp;3,000<div class="bar"><i style="width:100%;background:linear-gradient(90deg,var(--warn),var(--bad))"></i></div></div><br>
+  <div class="m">Tool schemas &asymp;1,760<div class="bar"><i style="width:59%"></i></div></div><br>
+  <div class="m">Personality nodes (cap 20) &asymp;1,500<div class="bar"><i style="width:50%"></i></div></div><br>
+  <div class="m">Bedrock &asymp;42<div class="bar"><i style="width:2%"></i></div></div>
+</div>
+
+<h2><span>03</span>Instruction Collision &amp; Precedence Analysis</h2>
+
+<h3>3.1 Precedence ladder as implemented</h3>
+<div class="layers">
+  <div class="layer"><span class="n">1</span><div class="t"><b>Client system/developer message</b> <small>positioned last, with no Strand marker; strongest by recency and authorship. Nothing in Strand arbitrates against it.</small></div></div>
+  <div class="layer"><span class="n">2</span><div class="t"><b>Graph personality rows</b> (trait, then directive, then preference by <em>position</em>, not authority) <small>Model B authored; <code>ORDER BY confidence DESC</code>, then tagged [inferred] below 0.8.</small></div></div>
+  <div class="layer"><span class="n">3</span><div class="t"><b>Bedrock Invariant</b> <small>listed first in the block, but a one-time injection and the first block evicted from replay.</small></div></div>
+  <div class="layer"><span class="n">4</span><div class="t"><b><code>config.persona_prompt</code></b> <small>cold-boot fallback only. Silently <em>suppressed</em> once any trait/directive/preference exists (resolver.py:750-753).</small></div></div>
+  <div class="layer"><span class="n">5</span><div class="t"><b>Provider RLHF defaults</b> <small>everything above competes against these.</small></div></div>
+</div>
+<div class="callout">Nothing in the text tells Model A which tier wins. Precedence is encoded only in <b>section order</b>, so a model that weights later text more heavily may let lower sections override the Bedrock. The Bedrock is called the "permanent identity", yet the code makes it the least durable fragment in the block. Recency weighting is a general tendency, not something I measured on Strand's models.</div>
+
+<h3>3.2 Collisions and gaps</h3>
+<div class="grid g2">
+  <div class="card"><h4>C1 &middot; persona_prompt suppression <span class="tag hi">HIGH</span></h4>
+    <p>The anchor is dropped as soon as one stance node exists (<code>anchor = [...] if persona_prompt and not stance</code>), and <code>stance</code> is evaluated over all recalled entities each turn. An operator-written <code>persona_prompt</code> therefore disappears from <em>new</em> sessions after the first learned preference. Within one session, turn 1 may carry the anchor and turn 3 a new trait, so the context can hold both. The outcome depends on when a rule was learned.</p></div>
+  <div class="card"><h4>C2 &middot; Bedrock vs. client prompt <span class="tag md">MED</span></h4>
+    <p>"Never use corporate filler" is prepended to a client prompt that may demand a polite, structured or verbose assistant (editor frontends, for example). Strand supplies no conflict marker, so the result is undefined and varies per upstream model.</p></div>
+  <div class="card"><h4>C3 &middot; Bedrock is conditional <span class="tag hi">HIGH</span></h4>
+    <p>With defaults (<code>persona_prompt=""</code>, empty personality graph) Model A gets zero Strand identity text. That contradicts <code>ROADMAP.md</code> (OBS-POL-005 Phase 1) and <code>OBS-ONB-009</code>. The logic is deterministic (<code>resolver.py:752-754</code>), so this is a docs/design discrepancy. Based on code reading; no live request was sent.</p></div>
+  <div class="card"><h4>C4 &middot; Model B rules reach Model A unreviewed <span class="tag md">MED</span></h4>
+    <p>Directive and preference summaries are written by a local SLM, then injected verbatim as instructions. A mis-extraction, such as a transient request stored as a permanent rule, becomes a standing instruction in every future session. The permanence guardrail is prose enforced by SLM compliance. Code-level nets are the confidence tag, deprecation and <code>collapse_containers</code>.</p></div>
+  <div class="card"><h4>C5 &middot; Contradictory rules can coexist <span class="tag md">MED</span></h4>
+    <p>Deprecation needs Model B to reproduce the <em>exact</em> source, target and relation of the old rule (<code>extractors.py:54-57, 63-67</code>). A paraphrased target creates a new node while the old one stays live, so Model A could see "send full files" and "give unified diffs" together. Only nodes whose <em>every</em> edge is dead are dropped (<code>resolver.py:730</code>).</p></div>
+  <div class="card"><h4>C6 &middot; Operator anchoring <span class="tag lo">LOW</span></h4>
+    <p>Rules link to "the entity User"; telemetry uses "the declared name, else User". <code>reanchor_generic_user</code> later folds <code>User</code> into the named operator and keeps it as an alias, so rule edges may briefly hang off two nodes. <code>telemetry_preference</code> reads only <code>person</code> sources and tolerates this.</p></div>
+  <div class="card"><h4>C7 &middot; Reality-check imperative repeats <span class="tag lo">LOW</span></h4>
+    <p>"Clarify or challenge this discrepancy" is re-sent each time the query repeats the clash and bypasses the ledger (<code>resolver.py:761-762</code>). That is intentional, but it can push toward an interrogative cadence that works against "direct, plain-spoken".</p></div>
+  <div class="card"><h4>C8 &middot; Tool note points at absent context <span class="tag lo">LOW</span></h4>
+    <p>Four tool descriptions say to answer hardware questions "from the ambient host context". My grep found no host-context block injected by <code>proxy.py</code> or <code>resolver.py</code>; <code>get_host_context</code> is used by <code>extractors.py</code> (hostname only) and the UI bridge. The instruction may therefore reference context Model A never receives. Confirmed by grep, not by a live request.</p></div>
+</div>
+
+<h3>3.3 Negative-constraint audit</h3>
+<div class="wrap"><table style="min-width:760px">
+<thead><tr><th>Location</th><th>Negative constraints</th><th>Risk</th></tr></thead>
+<tbody>
+<tr><td class="m">Bedrock (Model A)</td><td>"Never apologize." "Never use corporate filler or polite fluff." Two hard negatives alongside one positive clause.</td><td><span class="tag md">MED</span> A blanket "never apologize" can suppress legitimate error acknowledgment ("I got that wrong"). A "never X" list invites over-correction into curt output, against the peer-level intent. The positive clause ("direct, plain-spoken, technically sharp") does the useful work.</td></tr>
+<tr><td class="m">extractor (Model B)</td><td>About 19 negation or restriction tokens in 769 words (never, NEVER, must NOT, only when, "no two-hop chains", "Never create generic intermediate container entities", "Never also list a forgotten entity", "never list entities for deletion"). The count is my regex tally and approximate.</td><td><span class="tag hi">HIGH</span> A small local SLM gets a 5 KB prompt with stacked only-when / never / except gates. The rules interact (transient vs permanent, deprecate vs active edge, forget vs entity) and are not tiered. Failure is silent: an empty result (missed fact) or over-deprecation. No metric in the repo measures extraction accuracy against the prompt, so impact is unquantified.</td></tr>
+<tr><td class="m">compactor (Model B)</td><td>"Ignore one-off conversational steering and transient requests; only emit &hellip; sustained pattern"</td><td><span class="tag lo">LOW</span> Short and single-purpose, but it restates the extractor's permanence concept in different words ("transient steering" vs "sustained pattern").</td></tr>
+<tr><td class="m">Tool descriptions (Model A)</td><td>"These tools cannot run shell commands, inspect /proc or query host hardware", repeated 4&times;</td><td><span class="tag lo">LOW</span> Useful boundary, but duplicated verbatim per tool (&asymp;270 tokens) and phrased as negation.</td></tr>
+<tr><td class="m">Reality check</td><td>"rather than assuming the contradictory spec"</td><td><span class="tag lo">LOW</span> Single and well scoped.</td></tr>
+</tbody></table></div>
+<h3>3.4 Task-Yield vs. Question Budget vs. default RLHF (historical)</h3>
+<div class="callout">The Task-Yield rule, the Question Budget (default 0) and the telemetry gate question were all removed by OBS-ONB-009. <b>Today no Strand-owned text tells Model A how many clarifying questions to ask, or when to yield to a task.</b> The Bedrock's "direct, plain-spoken" and the reality check's "Clarify or challenge" are the only behavioural levers over conversational cadence. Default RLHF tendencies (follow-up offers, closing questions, hedging, heavy markdown) are <em>not</em> countered by any rule; the persona forbids only apologies and corporate filler, unless a learned <code>preference</code> row says otherwise.</div>
+<div class="wrap"><table style="min-width:760px">
+<thead><tr><th>Phase (as documented in OBS-ONB-008)</th><th>Rules that were active</th><th>Status in <code>src/</code></th></tr></thead>
+<tbody>
+<tr><td>Turn 1 (Day Zero)</td><td>Name-asking opening line, mission text, Intent Triage</td><td><span class="tag tX">removed</span></td></tr>
+<tr><td>Turns 2-3</td><td>Name capture ("Call me X", "Just X") plus Model B operator-name rules</td><td><span class="tag tX">removed</span>; <code>extractors.py</code> keeps only the generic "declared name, else User" wording</td></tr>
+<tr><td>Turns 4-5</td><td>Telemetry gate question; an affirmative answer got a one-sentence hostname/RAM/cores acknowledgement</td><td><span class="tag tX">removed</span>; the answer path survives as Model B's "Host telemetry preference" paragraph and <code>onboarding.telemetry_preference()</code></td></tr>
+<tr><td>Resolved / graduated</td><td><code>is_onboarding_completed</code> gate; Task-Yield plus Question Budget 0</td><td><span class="tag tX">removed</span>; replaced by the 4-plate setup wizard (ARCHITECTURE &sect;9)</td></tr>
+</tbody></table></div>
+<p class="mut">The turn map above comes from the OBS-ONB-008 and OBS-ONB-009 entries in <code>OBSERVATIONS.md</code>; I could not trace the original strings because they are gone from the tree. My grep of <code>src/</code> for the five symbol names returns only <code>BEDROCK_ID</code> hits, and the tests assert absence (<code>tests/test_proxy.py:275-288</code>, <code>tests/test_onboarding.py:154-158</code>).</p>
+
+<h3>3.5 Model B: permanence, deprecation, operator anchoring</h3>
+<details open><summary>How preference extraction behaves</summary>
+<ul>
+  <li><b>Permanence markers:</b> explicit list ("from now on", "always", "never", "stop doing X", "switch to Y", "going forward"). Transient steering ("right now", "just for this", "give me the diff") must return nothing and must not deprecate. Markerless corrections such as "actually, stop using diffs, send full files" are handled in a separate paragraph (<code>extractors.py:54-57</code>), which overlaps the permanence rule. The prompt does not say which paragraph wins for "actually" without a marker. <span class="tag md">ambiguity</span></li>
+  <li><b>Deprecation:</b> severs edges only and never deletes entities (<code>:68</code>). The exact (source, target, relation) must be reproduced. <code>ARCHITECTURE.md</code> also documents a heuristic fallback for basic negation in the distill layer (I did not read <code>distill.py</code> itself).</li>
+  <li><b>Biography guard:</b> past possessions become <em>active</em> <code>previously_owned</code> edges, never deprecations (<code>:36-41</code>). A strict boundary that costs many prompt tokens.</li>
+  <li><b>Operator anchoring:</b> rules attach to "the entity User" using <code>prefers</code> / <code>demands</code> / <code>enforces</code>. The prompt text itself says the <code>model_inferred</code> origin is applied automatically (<code>:66-67</code>). Compaction-inferred traits use <code>MODEL_CONFIDENCE = 0.6</code> and relations limited to <code>prefers|enforces</code> (<code>compactor.TRAIT_RELATIONS</code>), so they surface tagged [inferred].</li>
+  <li><b>Telemetry stance:</b> the provenance guard is in code (<code>onboarding.telemetry_preference</code>: Enabled needs <code>user_explicit</code> at confidence &ge; 1.0 on both edge and source). The prompt can only propose an edge, and a model-inferred Enabled edge cannot open telemetry. This is a good example of safety enforced outside the prompt.</li>
+</ul></details>
+<h2><span>04</span>Architectural Recommendations</h2>
+
+<h3>4.1 Consolidating prompt contracts into <code>src/strand/prompts.py</code></h3>
+<p>Analysis only. This audit is read-only and nothing was implemented.</p>
+<div class="grid g2">
+  <div class="card"><h4>Case for</h4>
+  <ul>
+    <li>9 prompt-bearing definitions sit in 6 modules; two are 1-5 KB string literals inside modules whose job is parsing and I/O.</li>
+    <li>Duplicated contracts have no shared constants: the archetype enum (<code>common.py</code> vs extractor prose), the telemetry entity names (<code>onboarding.py</code> vs extractor prose), and the "transient vs sustained" concept (extractor vs compactor).</li>
+    <li>One file makes token budgeting and prompt-change review a single-file job, and lets one test assert a global budget.</li>
+    <li><code>common.py</code> must not import other strand modules; a stdlib-only <code>prompts.py</code> at the same level adds no cycle risk.</li>
+  </ul></div>
+  <div class="card"><h4>Cost / risk</h4>
+  <ul>
+    <li>Tests reference <code>extractors.SYSTEM_PROMPT</code> and <code>compactor.SYSTEM_PROMPT</code> by name in places (I did not enumerate every reference). Re-exports keep them green; tests must not be loosened.</li>
+    <li>Moving prose verbatim is safe; any rewording changes SLM behaviour and needs extraction fixtures.</li>
+    <li>Tool descriptions interpolate handler constants (<code>MAX_READ_LINES</code> etc.), so they are better left beside their handlers or built from <code>prompts.py</code> with values passed in.</li>
+    <li>It adds a module but no dependency, consistent with the charter's "surgical, no frameworks" rule.</li>
+  </ul></div>
+</div>
+<details><summary>Suggested layout (sketch, not applied)</summary>
+<pre># src/strand/prompts.py  (stdlib only; no strand imports)
+# --- Model A: identity and cadence -------------------------------
+BEDROCK_INVARIANT        # moved from common.py (re-exported there)
+SECTION_TITLES           # [Persona Stance] ... [Working Memory]
+REALITY_CHECK_*          # header + imperative
+# --- Model B: extraction -----------------------------------------
+EXTRACTOR_SYSTEM_PROMPT  # composed from tiered parts
+COMPACTOR_SYSTEM_PROMPT
+# --- shared vocabulary -------------------------------------------
+ARCHETYPES               # single source for common.py + prompt text
+TELEMETRY_*              # single source for onboarding.py + prompt text
+PERMANENCE_MARKERS       # one definition for extractor + compactor
+# --- tool prose --------------------------------------------------
+SCOPE_NOTE               # emitted once, not 4x
+def prompt_budget() -> dict[str, int]   # for a test-enforced ceiling</pre></details>
+<h3>4.2 Preserving peer-level cadence and formatting restraint without stacking</h3>
+<div class="grid g2">
+  <div class="card"><h4>R1 &middot; Make the Bedrock's status explicit</h4>
+    <p>Decide whether the documented behaviour (always emitted) or the coded behaviour (conditional) is intended, then align code and docs. If it should always be emitted, queue <code>BEDROCK_ID</code> regardless of stance or anchor. A cold install currently gets no identity.</p></div>
+  <div class="card"><h4>R2 &middot; One positive cadence description</h4>
+    <p>Replace the stacked "Never apologize / Never use filler" with a positive description of the target register (answers first, uncertainty stated once, plain prose by default) and keep at most one hard prohibition. Positive anchors often generalise better than prohibition lists. That is a design hypothesis: validate it with before/after samples on the intended frontier models.</p></div>
+  <div class="card"><h4>R3 &middot; State precedence once, in the text</h4>
+    <p>One header line saying operator rules override defaults, and the client's system message governs task format only, would replace implicit ordering and resolve C2 explicitly. Cost: roughly 25 tokens, once per session.</p></div>
+  <div class="card"><h4>R4 &middot; One owner for formatting restraint</h4>
+    <p>Formatting restraint currently exists only as learned <code>preference</code> rows. If it is a product default it belongs in the Bedrock and the extractor should not re-learn it; if it is learned, keep it out of the Bedrock. Do not state it in both places.</p></div>
+  <div class="card"><h4>R5 &middot; Tier the extractor prompt</h4>
+    <p>Split the 769-word literal into (1) output schema, (2) a few decision rules, (3) short worked examples. Drop prose that code already enforces (container collapse, telemetry provenance). A shorter prompt for a small local model reduces gate collisions. Measure on a fixed extraction fixture set before and after.</p></div>
+  <div class="card"><h4>R6 &middot; Deduplicate tool boilerplate</h4>
+    <p><code>SCOPE_NOTE</code> is repeated on 4 tools (about 270 tokens per request). State it once, and resolve C8 by either injecting the host context it refers to or rewording the note.</p></div>
+  <div class="card"><h4>R7 &middot; Bound the always-on rule set</h4>
+    <p>Up to 20 personality nodes are injected on turn 1 regardless of relevance. A token-based cap plus a contradiction check (same relation family, different target) at injection time would reduce C5 without adding prompt prose.</p></div>
+  <div class="card"><h4>R8 &middot; Test budgets, not wording</h4>
+    <p>Add a budget test over the assembled envelope (Bedrock + 20 nodes + tool schemas under N tokens) instead of snapshotting prompt text. Existing tests stay intact and stacking is caught before it ships.</p></div>
+</div>
+
+<h3>4.3 Suggested priority</h3>
+<div class="wrap"><table style="min-width:640px">
+<thead><tr><th>#</th><th>Action</th><th>Effort</th><th>Impact</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Resolve Bedrock conditionality vs docs (R1, C3)</td><td>Tiny</td><td><span class="tag hi">HIGH</span></td></tr>
+<tr><td>2</td><td>Decide persona_prompt suppression semantics (C1)</td><td>Small</td><td><span class="tag hi">HIGH</span></td></tr>
+<tr><td>3</td><td>Tier and shorten the extractor prompt, with fixtures (R5)</td><td>Medium</td><td><span class="tag hi">HIGH</span></td></tr>
+<tr><td>4</td><td>Add the precedence line and a positive cadence sentence (R2, R3)</td><td>Tiny</td><td><span class="tag md">MED</span></td></tr>
+<tr><td>5</td><td>Create <code>prompts.py</code> with re-exports (4.1)</td><td>Small</td><td><span class="tag md">MED</span></td></tr>
+<tr><td>6</td><td>Dedupe SCOPE_NOTE, add a budget test (R6, R8)</td><td>Small</td><td><span class="tag lo">LOW</span></td></tr>
+</tbody></table></div>
+<h2><span>05</span>Method &amp; Limitations</h2>
+<ul>
+  <li>Static analysis only. I imported the prompt constants to measure character counts. I did not run the daemon, send requests, or call any model.</li>
+  <li>Token counts are chars/4 estimates and will differ by tokenizer (roughly &plusmn;25%).</li>
+  <li>The Model B negation count is a regex tally of selected words and is approximate.</li>
+  <li>Claims about model behaviour (negative-constraint fatigue, recency weighting) are common tendencies and were <b>not measured</b> on Strand's actual models.</li>
+  <li><code>ARCHITECTURE.md</code> was only partly visible (tool output truncated the middle). Resolver, proxy, session, extractor, compactor and config claims were verified directly in source.</li>
+  <li>Not audited in depth: <code>distill.py</code> internals, <code>ui/bridge.py</code> (a grep for system-role messages found none), and QML text.</li>
+</ul>
+
+<footer>Generated as a read-only audit. File: <code>docs/audit_persona_matrix.html</code>. No files under <code>src/</code>, <code>tests/</code> or <code>packaging/</code> were changed, and no git commands were run.</footer>
+</main>
+<script>
+(function(){
+  var rows=[].slice.call(document.querySelectorAll('#cat tbody tr')),mode='all',q='';
+  function apply(){rows.forEach(function(r){
+    var okM=mode==='all'||r.dataset.m===mode,okQ=!q||r.textContent.toLowerCase().indexOf(q)>-1;
+    r.classList.toggle('hide',!(okM&&okQ));});}
+  document.getElementById('q').addEventListener('input',function(e){q=e.target.value.toLowerCase();apply();});
+  [].forEach.call(document.querySelectorAll('.tools button'),function(b){
+    b.addEventListener('click',function(){
+      [].forEach.call(document.querySelectorAll('.tools button'),function(x){x.classList.remove('on');});
+      b.classList.add('on');mode=b.dataset.m;apply();});});
+})();
+</script>
+</body>
+</html>

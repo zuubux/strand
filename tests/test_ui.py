@@ -721,6 +721,38 @@ def test_qml_assistant_prose_bubble_hugs_content(qapp):
     assert 700 < long_ <= 1100 * 0.78
 
 
+def test_qml_assistant_prose_is_mouse_selectable(qapp):
+    """Assistant prose is a read-only TextEdit with mouse selection enabled."""
+    import time
+
+    from PySide6.QtCore import QMetaObject
+
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("Selectable **reply**.")))
+    engine, win = _load_window(b)
+    win.setWidth(1100)
+    win.setHeight(900)
+    win.show()
+    win.findChild(object, "messageInput").setProperty("text", "hi")
+    QMetaObject.invokeMethod(win, "send")
+    deadline = time.time() + 4
+    while time.time() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(0.01)
+
+    def walk(item):
+        for child in item.childItems():
+            yield child
+            yield from walk(child)
+
+    prose = [i for i in walk(win.contentItem()) if i.objectName() == "assistantProse"]
+    assert prose
+    for item in prose:
+        assert item.property("readOnly") is True
+        assert item.property("selectByMouse") is True
+    win.hide()
+    engine.deleteLater()
+
+
 def test_shutdown_cancels_hanging_stream_and_joins_worker(qapp):
     class Hang(httpx.AsyncByteStream):
         async def __aiter__(self):

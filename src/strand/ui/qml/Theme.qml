@@ -25,7 +25,8 @@ QtObject {
             modal: "#10141a", drawer: "#0d1117", card: "#0c0f14", field: "#090b0e",
             text: "#f1f5f9", textPrimary: "#E6E9ED", muted: "#94a3b8", dim: "#7F8A96", faint: "#8b949e",
             ink: Qt.rgba(1, 1, 1, 1), border: "#2C323A", panel: "#1E2228", code: "#e2e8f0",
-            backdrop: Qt.rgba(0, 0, 0, 0.55), onPrimary: "#0b0e12"
+            backdrop: Qt.rgba(0, 0, 0, 0.55), onPrimary: "#0b0e12",
+            selection: Qt.rgba(56 / 255, 189 / 255, 248 / 255, 0.28)
         },
         "graphite": {
             light: false, userFont: "jetbrains",
@@ -34,7 +35,8 @@ QtObject {
             modal: "#15181e", drawer: "#15181e", card: "#13161b", field: "#111317",
             text: "#f1f5f9", textPrimary: "#E6E9ED", muted: "#94a3b8", dim: "#7F8A96", faint: "#8b949e",
             ink: Qt.rgba(1, 1, 1, 1), border: "#2C323A", panel: "#1E2228", code: "#e2e8f0",
-            backdrop: Qt.rgba(0, 0, 0, 0.55), onPrimary: "#0b0e12"
+            backdrop: Qt.rgba(0, 0, 0, 0.55), onPrimary: "#0b0e12",
+            selection: Qt.rgba(56 / 255, 189 / 255, 248 / 255, 0.28)
         },
         "daylight": {
             light: true, userFont: "inter",
@@ -43,7 +45,8 @@ QtObject {
             modal: "#ffffff", drawer: "#f8fafc", card: "#f8fafc", field: "#ffffff",
             text: "#0f172a", textPrimary: "#0f172a", muted: "#475569", dim: "#475569", faint: "#64748b",
             ink: Qt.rgba(15 / 255, 23 / 255, 42 / 255, 1), border: "#cbd5e1", panel: "#ffffff", code: "#0f172a",
-            backdrop: Qt.rgba(15 / 255, 23 / 255, 42 / 255, 0.35), onPrimary: "#ffffff"
+            backdrop: Qt.rgba(15 / 255, 23 / 255, 42 / 255, 0.35), onPrimary: "#ffffff",
+            selection: Qt.rgba(2 / 255, 132 / 255, 199 / 255, 0.22)
         }
     })
     readonly property var themeTokens: themes[uiTheme] || themes["obsidian"]
@@ -71,6 +74,9 @@ QtObject {
 
     // Text
     readonly property color textPrimary: themeTokens.textPrimary
+    // Mouse text selection highlight (read-only TextEdit prose bubbles).
+    readonly property color selectionColor: themeTokens.selection
+    readonly property color selectedTextColor: textPrimary
     readonly property color textDim: themeTokens.dim
     readonly property color textFaint: themeTokens.faint
     readonly property color stanceText: isLight ? Qt.rgba(15 / 255, 23 / 255, 42 / 255, 0.85) : Qt.rgba(0.82, 0.85, 0.9, 0.85)
