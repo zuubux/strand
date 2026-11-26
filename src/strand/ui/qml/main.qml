@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Dialogs
+import QtQuick.Shapes
 
 ApplicationWindow {
     id: root
@@ -835,12 +836,38 @@ ApplicationWindow {
                 anchors.verticalCenter: parent.verticalCenter
                 width: 26
                 height: 26
-                Label {
+                readonly property string tip: active
+                    ? "Private items unlocked (Click to lock)"
+                    : "Private items protected (Click to unlock for this session)"
+                Shape {
                     id: lockGlyph
+                    objectName: "lockGlyph"
                     anchors.centerIn: parent
-                    text: lockButton.active ? "\uD83D\uDD13\uFE0E" : "\uD83D\uDD12\uFE0E"
-                    color: lockButton.active ? Theme.distillationAccent : Theme.placeholderText
-                    font.pixelSize: 13
+                    width: 20
+                    height: 20
+                    layer.enabled: true
+                    layer.samples: 4
+                    opacity: lockButton.active ? 1.0 : 0.75
+                    // Body (identical in both states) + shackle: closed = both legs seated; open = right leg lifted clear of the body.
+                    ShapePath {
+                        strokeColor: lockButton.active ? Theme.distillationAccent : Theme.successAccent
+                        strokeWidth: 1.8
+                        fillColor: lockButton.active ? Qt.rgba(245 / 255, 158 / 255, 11 / 255, 0.18) : Qt.rgba(52 / 255, 211 / 255, 153 / 255, 0.16)
+                        joinStyle: ShapePath.RoundJoin
+                        PathSvg { path: "M 4.5 9.5 L 15.5 9.5 L 15.5 17.5 L 4.5 17.5 Z" }
+                    }
+                    ShapePath {
+                        strokeColor: lockButton.active ? Theme.distillationAccent : Theme.successAccent
+                        strokeWidth: 1.8
+                        fillColor: "transparent"
+                        capStyle: ShapePath.RoundCap
+                        joinStyle: ShapePath.RoundJoin
+                        PathSvg {
+                            path: lockButton.active
+                                ? "M 6.8 9.5 L 6.8 6 A 3.2 3.2 0 0 1 13.2 6 L 13.2 3.5"
+                                : "M 6.8 9.5 L 6.8 6 A 3.2 3.2 0 0 1 13.2 6 L 13.2 9.5"
+                        }
+                    }
                 }
                 MouseArea {
                     id: lockMouse
@@ -850,9 +877,57 @@ ApplicationWindow {
                     onClicked: if (bridge) bridge.runCommand(bridge.privateMode ? "/private off" : "/private on")
                 }
                 ToolTip.visible: lockMouse.containsMouse
-                ToolTip.text: lockButton.active
-                    ? "\u26A0\uFE0F Private items unlocked (Click to keep local)"
-                    : "Private items protected (Click to include in prompt)"
+                ToolTip.text: lockButton.tip
+            }
+        }
+
+        Rectangle {
+            id: privateBanner
+            objectName: "privateBanner"
+            Layout.fillWidth: true
+            Layout.preferredHeight: 26
+            visible: bridge ? bridge.privateMode : false
+            color: Qt.rgba(245 / 255, 158 / 255, 11 / 255, 0.10)
+            Rectangle {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                height: 1
+                color: Qt.rgba(245 / 255, 158 / 255, 11 / 255, 0.25)
+            }
+            Label {
+                objectName: "privateBannerText"
+                anchors.left: parent.left
+                anchors.leftMargin: 16
+                anchors.right: bannerLock.left
+                anchors.rightMargin: 12
+                anchors.verticalCenter: parent.verticalCenter
+                elide: Text.ElideRight
+                text: "Private memory unlocked for this session \u2014 private nodes may be sent upstream"
+                color: Theme.distillationAccent
+                font.pixelSize: 11
+            }
+            Label {
+                id: bannerLock
+                objectName: "bannerLockButton"
+                anchors.right: parent.right
+                anchors.rightMargin: 16
+                anchors.verticalCenter: parent.verticalCenter
+                text: "Lock"
+                color: Theme.distillationAccent
+                font.pixelSize: 11
+                font.weight: Font.DemiBold
+                font.underline: bannerMouse.containsMouse
+                signal clicked()
+                onClicked: if (bridge) bridge.runCommand("/private off")
+                MouseArea {
+                    id: bannerMouse
+                    anchors.fill: parent
+                    anchors.margins: -4
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: bannerLock.clicked()
+                }
             }
         }
 

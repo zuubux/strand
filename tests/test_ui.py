@@ -2681,3 +2681,48 @@ def test_active_stance_hides_faded_inferred_nodes_under_permanent(qapp, home):
     b.refreshActiveStance()
     labels = {n["label"] for n in b.activeStanceNodes}
     assert labels == {"Fresh Trait", "Old Rule", "Touched Trait"}
+
+
+def test_qml_lock_button_and_unlocked_banner_follow_private_mode(qapp):
+    from PySide6.QtCore import QMetaObject
+
+    b = make_bridge(lambda r: httpx.Response(200, content=sse("ok")))
+    engine, win = _load_window(b)
+    lock = win.findChild(object, "lockButton")
+    glyph = win.findChild(object, "lockGlyph")
+    banner = win.findChild(object, "privateBanner")
+    text = win.findChild(object, "privateBannerText")
+    link = win.findChild(object, "bannerLockButton")
+    assert None not in (lock, glyph, banner, text, link)
+
+    # Protected (default): closed emerald padlock, no banner.
+    assert not b.privateMode
+    assert lock.property("active") is False
+    assert lock.property("tip") == "Private items protected (Click to unlock for this session)"
+    assert glyph.property("opacity") == pytest.approx(0.75)
+    assert banner.property("visible") is False
+
+    # Unlocked: open amber padlock plus the slim session strip.
+    assert b.runCommand("/private on") and b.privateMode
+    assert lock.property("active") is True
+    assert lock.property("tip") == "Private items unlocked (Click to lock)"
+    assert glyph.property("opacity") == pytest.approx(1.0)
+    assert banner.property("visible") is True
+    from strand.ui.app import MAIN_QML
+
+    qml = Path(MAIN_QML).read_text()
+    strip = qml[qml.index("id: privateBanner"):qml.index("id: list")]
+    assert "Layout.preferredHeight: 26" in strip  # slim strip; layout is not polished offscreen
+    assert banner.property("color").name() == "#f59e0b"
+    assert banner.property("color").alphaF() == pytest.approx(0.10, abs=0.01)
+    assert text.property("text") == (
+        "Private memory unlocked for this session \u2014 private nodes may be sent upstream"
+    )
+    assert text.property("font").pixelSize() == 11
+
+    # The inline Lock action runs /private off and the strip disappears again.
+    QMetaObject.invokeMethod(link, "clicked")
+    assert not b.privateMode
+    assert lock.property("active") is False
+    assert banner.property("visible") is False
+    engine.deleteLater()
