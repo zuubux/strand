@@ -288,3 +288,31 @@ This document tracks real-world friction points, visual bugs, design observation
 * **Symptom:** With 2+ attached images, the text hint asking for parallel `read_image` calls made `gemini-flash-lite-latest` (Google OpenAI-compat) return an empty 0-token completion, and the UI then claimed the tool iteration limit was hit.
 * **Resolution:** Attached images are validated through `read_image` and sent as `image_url` data-URI parts alongside the text part of the upstream user message. Non-image files keep the `[Attached files ...]` `read_file` header. `Bridge.history` stores only the prompt and metadata (no base64); `SessionLedger.compact_history` evicts the user `image_url` parts on turn 2+. No DDL; nothing enters `memory.db`. The empty-turn notice now reads "No response returned by upstream model."
 * **Tests:** `tests/test_ui.py` (`test_send_message_images_are_inline_multimodal_parts`, `test_compact_history_evicts_user_image_url_parts`, `test_attachment_preamble_lists_only_non_images`, `test_empty_turn_notice_is_upstream_accurate`).
+
+### `OBS-UI-019`: Tiered Session History & Graph-Distilled Continuity Recall
+- **Component:** `src/strand/ui/bridge.py`, `src/strand/ui/qml/main.qml`, `src/strand/proxy.py`, `src/strand/db.py`
+- **Symptom:** Typing `/new` (or `Ctrl+L`) discards the active UI transcript with no way to browse or switch back to concurrent workstreams[cite: 1, 2]. Storing unbounded verbatim transcripts in `memory.db` would violate the core invariant that SQLite remains a lean cognitive graph rather than a raw chat log[cite: 1, 10].
+- **Design Plan:**
+  - **Tier 1 (Hot Local Ring Buffer):** Maintain a client-side, capped ring buffer of the last 15–20 active sessions under `~/.local/share/strand/ui_sessions/` (`0700`/`0600`). Private turns (`/private on`) are never persisted to disk[cite: 1], and sessions aging past the cap are unlinked automatically so `memory.db` never stores raw message blobs[cite: 1, 10].
+  - **Tier 2 (Cold Graph Summary Card):** For aged sessions whose local transcript has rotated out (or older threads queried from `memory.db`'s `episodes` table)[cite: 8], opening the session in the history drawer restores the thread window pinned with a **Distilled Continuity Card** at the top—synthesizing the episode narrative alongside interactive chips for the entities and edges touched during that session[cite: 8].
+  - **Drawer UI:** Add a collapsible left session drawer in `main.qml` displaying recent and archived threads by date, derived title, and touched entities, rebinding `X-Session-Id` on selection[cite: 8].
+
+### `OBS-UI-020`: Slash-Command Autocomplete Popover (`/`)
+- **Component:** `src/strand/ui/qml/main.qml` (`inputDock`, `messageInput`)
+- **Symptom:** Operators have to invoke `/help` or rely on memory to recall available client slash commands (`/new`, `/model`, `/private`, `/onboard`) and their argument syntax.
+- **Design Plan:**
+  - When `messageInput.text` starts with `/` (prior to whitespace), float a compact, keyboard-navigable popover directly above `inputDock`.
+  - Populate the list from the registered client command table with live prefix filtering as the user types, single-line syntax/description hints, and `Up`/`Down` + `Tab`/`Enter` selection to complete or execute the command.
+
+  ### `OBS-POL-008`: Refocus `ACTIVE STANCE` on Organic Drift & Remove Directive Counter
+- **Component:** `src/strand/ui/qml/main.qml` (`stanceFooter`), `src/strand/ui/bridge.py` (`refreshActiveStance`), `src/strand/compactor.py`
+- **Symptom:** The `N Active Directives in Memory` footer counter reads like internal debug telemetry, and the `ACTIVE STANCE` card remains empty (`0 Active Directives`) during normal organic usage because `trait`/`preference` extraction currently only fires on explicit user steering commands rather than passive multi-session drift (`OBS-POL-005` Phase 2).
+- **Design Plan:**
+  - **UI Cleanup (`main.qml`):** Remove the `N Active Directives in Memory` counter (`stanceFooter`) from the `ACTIVE STANCE` card so the panel functions purely as a quiet, read-only mirror of learned style and behavioral traits. Explicit directives remain queryable directly in conversation or via the CLI (`strand list`).
+  - **Organic Drift Loop (`compactor.py`):** Implement the multi-episode background compaction pass that passively distills recurring communication preferences, register, and stylistic traits (`archetype: trait | preference`, `origin: model_inferred`) from ordinary conversation turns without requiring explicit command markers.
+
+  - **Status (implemented):** `stanceFooter` and `activeStanceCount` removed; `compaction_sweep` in `daemon.py` now runs `SessionCompactor.compact_all()` hourly in the background (fail-open, cancelled on shutdown), so passive compaction happens without the CLI. Tests: `tests/test_compactor.py`, `tests/test_ui.py`.
+
+### `OBS-POL-014`: Recent-First `ACTIVE STANCE` Feed with Provenance Tags
+- **Component:** `src/strand/ui/bridge.py` (`_read_stance`), `src/strand/ui/qml/main.qml` (`stanceList`)
+- **Change:** the card lists the 5 most recent active stance entries (`e.updated_at DESC, t.id DESC`) as `{text, kind}`; `kind` is `explicit` (amber pill) for `user_explicit` edges and `derived` (cyan pill) otherwise, so operators can tell stated directives from learned drift. No DDL.

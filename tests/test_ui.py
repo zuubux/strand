@@ -1623,11 +1623,17 @@ def _seed_stance(db_file, rows):
     conn = sqlite3.connect(db_file)
     conn.executescript(SCHEMA_SQL)
     op = conn.execute("INSERT INTO entities (name, archetype) VALUES ('Operator', 'person')").lastrowid
-    for name, archetype, weight in rows:
-        tid = conn.execute("INSERT INTO entities (name, archetype) VALUES (?, ?)", (name, archetype)).lastrowid
+    for i, row in enumerate(rows):
+        name, archetype, weight = row[:3]
+        origin = row[3] if len(row) > 3 else "user_explicit"
+        summary = row[4] if len(row) > 4 else ""
+        tid = conn.execute(
+            "INSERT INTO entities (name, archetype, summary) VALUES (?, ?, ?)", (name, archetype, summary)
+        ).lastrowid
         conn.execute(
-            "INSERT INTO edges (source_id, target_id, relation, weight) VALUES (?, ?, 'prefers', ?)",
-            (op, tid, weight),
+            "INSERT INTO edges (source_id, target_id, relation, weight, origin, updated_at) "
+            "VALUES (?, ?, 'prefers', ?, ?, ?)",
+            (op, tid, weight, origin, f"2026-01-01 00:00:{i:02d}"),
         )
     conn.commit()
     conn.close()
@@ -1644,7 +1650,7 @@ def test_active_stance_reads_memory_and_settings_card_is_read_only(qapp, home):
     assert win.findChild(object, "saveStance") is None
     QMetaObject.invokeMethod(win, "openSettings")
     assert win.findChild(object, "stancePlaceholder").property("visible") is True
-    assert win.findChild(object, "stanceFooter").property("text") == "0 Active Directives in Memory"
+    assert win.findChild(object, "stanceFooter") is None
     _seed_stance(
         db_file,
         [
@@ -1656,10 +1662,30 @@ def test_active_stance_reads_memory_and_settings_card_is_read_only(qapp, home):
         ],
     )
     QMetaObject.invokeMethod(win, "openSettings")
-    assert b.activeStanceNodes == ["Concise diffs", "Dry wit", "Tabs"]
+    assert b.activeStanceNodes == [
+        {"text": "Tabs", "kind": "explicit"},
+        {"text": "Dry wit", "kind": "explicit"},
+        {"text": "Concise diffs", "kind": "explicit"},
+    ]
     assert win.findChild(object, "stancePlaceholder").property("visible") is False
-    assert win.findChild(object, "stanceFooter").property("text") == "3 Active Directives in Memory"
+    assert win.findChild(object, "stanceFooter") is None
+    assert not hasattr(b, "activeStanceCount")
     engine.deleteLater()
+
+
+def test_active_stance_recency_cap_and_provenance(qapp, home):
+    db_file = home / "memory.db"
+    b = make_bridge(lambda r: httpx.Response(200, json={}), config=Config(db_path=str(db_file), upstream_api_key="k"))
+    rows = [(f"Rule {i}", "directive", 1.0) for i in range(5)]
+    rows.append(("Inferred", "trait", 0.7, "model_inferred", "Prefers terse answers"))
+    rows.append(("Newest", "preference", 1.0, "user_explicit", "Use tabs"))
+    _seed_stance(db_file, rows)
+    b.refreshActiveStance()
+    nodes = b.activeStanceNodes
+    assert len(nodes) == 5
+    assert nodes[0] == {"text": "Use tabs", "kind": "explicit"}
+    assert nodes[1] == {"text": "Prefers terse answers", "kind": "derived"}
+    assert [n["text"] for n in nodes[2:]] == ["Rule 4", "Rule 3", "Rule 2"]
 
 
 def test_tray_controller_toggle_menu_and_quit():
@@ -2447,7 +2473,7 @@ def test_qml_theme_token_switching(qapp, home):
     for name in ("stanceSelector", "stancePeer", "stanceMentor", "stanceOperator", "stanceDropdown", "stanceDescription"):
         assert win.findChild(object, name) is None
     assert win.findChild(object, "stanceTitle").property("text") == "ACTIVE STANCE"
-    assert win.findChild(object, "stanceFooter") is not None
+    assert win.findChild(object, "stanceFooter") is None
     # Ordering: decay pills, then whisper, then the THEME selector in its own card below.
     decay = win.findChild(object, "decayHorizon")
     horizon = win.findChild(object, "horizonWhisper")
@@ -2478,32 +2504,37 @@ def _pump(seconds):
         time.sleep(0.01)
 
 
-def test_qml_active_stance_counter_sits_in_bottom_right_footer(qapp, home):
+def test_qml_active_stance_renders_provenance_badges_without_counter(qapp, home):
     from PySide6.QtCore import QMetaObject
 
-    b = make_bridge(lambda r: httpx.Response(200, json={}))
+    db_file = home / "memory.db"
+    b = make_bridge(lambda r: httpx.Response(200, json={}), config=Config(db_path=str(db_file), upstream_api_key="k"))
+    _seed_stance(
+        db_file,
+        [("Old", "directive", 1.0, "user_explicit"), ("New", "trait", 1.0, "model_inferred")],
+    )
     engine, win = _load_window(b)
     win.setWidth(900)
     win.setHeight(640)
     win.show()
     QMetaObject.invokeMethod(win, "openSettings")
     _pump(0.2)
-    title = win.findChild(object, "stanceTitle")
-    counter = win.findChild(object, "stanceFooter")
-    assert win.findChild(object, "stanceDropdown") is None
-    assert win.findChild(object, "stanceDescription") is None
-    card = counter.parent().parent()  # footer label -> ColumnLayout -> card Rectangle
-    placeholder = win.findChild(object, "stancePlaceholder")
-    cy = counter.mapToItem(None, 0, 0).y()
-    assert cy > title.mapToItem(None, 0, 0).y() + 20  # not on the title's header line
-    assert cy > placeholder.mapToItem(None, 0, 0).y()  # below the body
-    assert win.findChild(object, "stanceHeader") is None
-    card_right = card.mapToItem(None, card.width(), 0).x()
-    assert counter.property("font").pixelSize() == 11
-    assert abs(counter.mapToItem(None, counter.width(), 0).x() - (card_right - 14)) < 3  # right edge
-    card_bottom = card.mapToItem(None, 0, card.height()).y()
-    assert card_bottom - (cy + counter.height()) < 24  # bottom footer
-    assert counter.property("truncated") is False
+    assert win.findChild(object, "stanceTitle") is not None
+    assert win.findChild(object, "stanceFooter") is None
+    assert win.findChild(object, "stancePlaceholder").property("visible") is False
+    labels = []
+
+    def walk(item):
+        for child in item.childItems():
+            if child.objectName() == "stanceBadgeLabel":
+                labels.append(child)
+            walk(child)
+
+    walk(win.findChild(object, "stanceList"))
+    assert [(l.property("text"), l.property("color").name()) for l in labels] == [
+        ("derived", "#38bdf8"),
+        ("explicit", "#f59e0b"),
+    ]
     win.hide()
     engine.deleteLater()
 

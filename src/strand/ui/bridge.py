@@ -459,7 +459,7 @@ def parse_sse_line(line: str) -> tuple[str, str]:
     return "skip", ""
 
 
-STANCE_LIMIT = 6  # active stance nodes mirrored in the Settings modal
+STANCE_LIMIT = 5  # recent stance entries mirrored in the Settings modal
 
 
 class Bridge(QObject):
@@ -552,8 +552,7 @@ class Bridge(QObject):
         self._upstreamModelsResult.connect(self._on_upstream_models_result)
         self._config = config if config is not None else load_config()
         self._operator_override = str(_read_file(default_config_path()).get("operator_name") or "").strip()
-        self._stance_nodes: list[str] = []
-        self._stance_count = 0
+        self._stance_nodes: list[dict[str, str]] = []
         self._model = resolve_model(self._config, explicit=model)
         self._session_id = f"ui-{uuid.uuid4().hex[:12]}"
         self._uds_path, self._base_url = resolve_endpoint(self._config)
@@ -579,14 +578,9 @@ class Bridge(QObject):
         self._staged: set[Path] = set()  # ephemeral copies this Bridge made in .strand_staging/
 
     @Property(list, notify=activeStanceNodesChanged)
-    def activeStanceNodes(self) -> list[str]:
-        """Top learned directive / preference / trait names (read-only mirror of memory.db)."""
-        return list(self._stance_nodes or [])
-
-    @Property(int, notify=activeStanceNodesChanged)
-    def activeStanceCount(self) -> int:
-        """Total active stance nodes in memory (the list above is capped)."""
-        return int(self._stance_count or 0)
+    def activeStanceNodes(self) -> list[dict[str, str]]:
+        """Most recent stance entries as {text, kind} maps (read-only mirror of memory.db)."""
+        return [dict(n) for n in (self._stance_nodes or [])]
 
     @Slot(str)
     def copyToClipboard(self, text: str) -> None:
@@ -599,32 +593,42 @@ class Bridge(QObject):
 
     @Slot()
     def refreshActiveStance(self) -> None:
-        """Re-read active stance nodes from memory.db (read-only connection; never writes)."""
-        nodes, count = self._read_stance()
-        if nodes != self._stance_nodes or count != self._stance_count:
-            self._stance_nodes, self._stance_count = nodes, count
+        """Re-read recent stance entries from memory.db (read-only connection; never writes)."""
+        nodes = self._read_stance()
+        if nodes != self._stance_nodes:
+            self._stance_nodes = nodes
             self.activeStanceNodesChanged.emit()
 
-    def _read_stance(self) -> tuple[list[str], int]:
+    def _read_stance(self) -> list[dict[str, str]]:
         path = Path(self._config.db_path).expanduser()
         if not path.is_file():
-            return [], 0
+            return []
         sql = (
-            "SELECT t.name, MAX(e.weight) AS w, MAX(e.confidence) AS c FROM edges e "
+            "SELECT t.id, t.name, t.summary, e.origin FROM edges e "
             "JOIN entities t ON t.id = e.target_id "
             "WHERE t.archetype IN ('directive', 'preference', 'trait') "
             "AND " + _ACTIVE.format(t="e") + " AND NOT " + PRIVATE_ENTITY_SQL.format(t="t") + " "
-            "GROUP BY t.id ORDER BY w DESC, c DESC, t.name ASC"
+            "ORDER BY e.updated_at DESC, t.id DESC"
         )
         try:
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
             try:
-                rows = [str(r[0]).strip() for r in conn.execute(sql).fetchall() if str(r[0]).strip()]
+                rows = conn.execute(sql).fetchall()
             finally:
                 conn.close()
         except sqlite3.Error:
-            return [], 0
-        return rows[:STANCE_LIMIT], len(rows)
+            return []
+        out: list[dict[str, str]] = []
+        seen: set[int] = set()
+        for tid, name, summary, origin in rows:
+            text = str(summary or "").strip() or str(name or "").strip()
+            if tid in seen or not text:
+                continue
+            seen.add(tid)
+            out.append({"text": text, "kind": "explicit" if origin == "user_explicit" else "derived"})
+            if len(out) >= STANCE_LIMIT:
+                break
+        return out
 
     # -- properties exposed to QML -------------------------------------------------
     @Property(str, notify=statusChanged)

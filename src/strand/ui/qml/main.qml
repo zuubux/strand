@@ -2206,14 +2206,37 @@ ApplicationWindow {
                                 visible: (bridge ? bridge.activeStanceNodes : []).length > 0
                                 Repeater {
                                     model: (bridge ? bridge.activeStanceNodes : [])
-                                    delegate: Label {
+                                    delegate: RowLayout {
+                                        id: stanceRow
                                         width: stanceList.width
-                                        text: "\u2022 " + modelData
-                                        wrapMode: Text.WordWrap
-                                        color: Theme.stanceText
-                                        lineHeight: 1.25
-                                        font.family: Theme.uiFontFamily
-                                        font.pixelSize: 12
+                                        spacing: 8
+                                        readonly property bool explicitKind: modelData.kind === "explicit"
+                                        Rectangle {
+                                            objectName: "stanceBadge"
+                                            Layout.alignment: Qt.AlignTop
+                                            implicitWidth: badgeLabel.implicitWidth + 12
+                                            implicitHeight: badgeLabel.implicitHeight + 4
+                                            radius: height / 2
+                                            color: stanceRow.explicitKind ? Qt.rgba(245 / 255, 158 / 255, 11 / 255, 0.14) : Qt.rgba(56 / 255, 189 / 255, 248 / 255, 0.14)
+                                            Label {
+                                                id: badgeLabel
+                                                objectName: "stanceBadgeLabel"
+                                                anchors.centerIn: parent
+                                                text: stanceRow.explicitKind ? "explicit" : "derived"
+                                                color: stanceRow.explicitKind ? "#f59e0b" : "#38bdf8"
+                                                font.family: Theme.uiFontFamily
+                                                font.pixelSize: 10
+                                            }
+                                        }
+                                        Label {
+                                            Layout.fillWidth: true
+                                            text: modelData.text
+                                            wrapMode: Text.WordWrap
+                                            color: Theme.stanceText
+                                            lineHeight: 1.25
+                                            font.family: Theme.uiFontFamily
+                                            font.pixelSize: 12
+                                        }
                                     }
                                 }
                             }
@@ -2231,15 +2254,6 @@ ApplicationWindow {
                                 font.pixelSize: 12
                                 font.italic: true
                                 lineHeight: 1.25
-                            }
-                            Label {
-                                objectName: "stanceFooter"
-                                Layout.fillWidth: true
-                                horizontalAlignment: Text.AlignRight
-                                text: (bridge ? bridge.activeStanceCount : 0) + " Active Directives in Memory"
-                                color: root.dim
-                                font.family: Theme.uiFontFamily
-                                font.pixelSize: 11
                             }
                         }
                     }

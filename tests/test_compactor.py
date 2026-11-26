@@ -559,3 +559,52 @@ def test_compaction_never_overwrites_private_entity_summaries(tmp_path):
     assert direct is False
     assert result["summaries_updated"] == 1 and nas == "Public rewrite."
     assert vault == "secret original" and diary == "diary original"
+
+
+def test_compaction_sweep_runs_and_cancels_cleanly():
+    from strand.daemon import compaction_sweep
+
+    class Fake:
+        calls = 0
+
+        async def compact_all(self):
+            Fake.calls += 1
+            if Fake.calls == 1:
+                raise RuntimeError("boom")  # fail-open: the loop must survive
+            return 0
+
+    async def scenario():
+        task = asyncio.create_task(compaction_sweep(Fake(), interval=0.01))
+        await asyncio.sleep(0.1)
+        alive = not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return alive, task.cancelled()
+
+    alive, cancelled = run(scenario())
+    assert alive and cancelled and Fake.calls >= 2
+
+
+def test_build_app_lifespan_starts_and_stops_sweep(tmp_path, monkeypatch):
+    from strand import daemon
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    seen = []
+
+    async def fake_sweep(compactor, interval=0):
+        seen.append("start")
+        try:
+            await asyncio.sleep(3600)
+        finally:
+            seen.append("stop")
+
+    monkeypatch.setattr(daemon, "compaction_sweep", fake_sweep)
+    app = daemon.build_app(Config(db_path=str(tmp_path / "d.db")))
+
+    async def scenario():
+        async with app.router.lifespan_context(app):
+            await asyncio.sleep(0)
+            assert seen == ["start"]
+
+    run(scenario())
+    assert seen == ["start", "stop"]

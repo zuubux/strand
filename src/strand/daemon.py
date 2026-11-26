@@ -11,11 +11,13 @@ import stat
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
 
+from .compactor import SessionCompactor
 from .config import Config, default_config_path, load_config
 from .db import DatabaseManager
 from .distill import DistillationEngine
@@ -26,6 +28,24 @@ from .perms import secure_parent_dir
 from .proxy import create_app
 from .resolver import ContextResolver
 from .session import SessionLedger
+
+
+COMPACTION_SWEEP_INTERVAL_S = 3600.0
+
+
+async def compaction_sweep(compactor: SessionCompactor, interval: float = COMPACTION_SWEEP_INTERVAL_S) -> None:
+    """Periodically compact idle sessions. Fail-open: errors are logged, never raised.
+    Runs until cancelled; sleeps first so startup is never delayed."""
+    log = get_logger("daemon")
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            count = await compactor.compact_all()
+            log.debug("compaction sweep: %d session(s) compacted", count)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("compaction sweep failed", exc_info=True)
 
 
 def build_app(config: Config):
@@ -54,7 +74,27 @@ def build_app(config: Config):
         dedup_distance_threshold=config.dedup_distance_threshold,
         ledger=resolver.ledger,
     )
-    return create_app(config, resolver, distill_engine=engine, config_path=default_config_path())
+    app = create_app(config, resolver, distill_engine=engine, config_path=default_config_path())
+    compactor = SessionCompactor(
+        db,
+        config.extractor_url or DEFAULT_EXTRACTOR_URL,
+        config.extractor_model,
+        threshold_hours=config.compaction_threshold_hours,
+    )
+    inner = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(a) -> AsyncIterator[None]:
+        async with inner(a):
+            task = asyncio.create_task(compaction_sweep(compactor), name="strand-compaction-sweep")
+            try:
+                yield
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    app.router.lifespan_context = lifespan
+    return app
 
 
 def notify_ready() -> None:
