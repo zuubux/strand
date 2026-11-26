@@ -2326,13 +2326,13 @@ ApplicationWindow {
                                 spacing: 6
                                 SegmentButton {
                                     objectName: "horizonSprint"
-                                    text: "Sprint (7d)"
+                                    text: "Sprint"
                                     selected: root.decayHorizon === "sprint"
                                     onClicked: root.selectHorizon("sprint")
                                 }
                                 SegmentButton {
                                     objectName: "horizonBalanced"
-                                    text: "Balanced (30d)"
+                                    text: "Balanced"
                                     selected: root.decayHorizon === "balanced"
                                     onClicked: root.selectHorizon("balanced")
                                 }
@@ -2352,9 +2352,9 @@ ApplicationWindow {
                                 color: root.dim
                                 font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
-                                text: root.decayHorizon === "sprint" ? "Aggressive pruning: unreferenced strands fade after 7 days."
-                                    : (root.decayHorizon === "balanced" ? "Standard working memory: unreferenced strands fade over 30 days."
-                                    : "Time is frozen: all strands retain permanent baseline weight.")
+                                text: root.decayHorizon === "sprint" ? "Fast-moving work: unreferenced strands drop from active recall after ~2–3 weeks."
+                                    : (root.decayHorizon === "balanced" ? "Standard working memory: unreferenced strands fade from active recall after ~2–3 months unless mentioned."
+                                    : "Static archive: time is paused and all strands keep their baseline weight indefinitely.")
                             }
                         }
                     }

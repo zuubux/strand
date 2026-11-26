@@ -977,9 +977,9 @@ def test_extractor_model_read_and_save(qapp, home):
 @pytest.mark.parametrize(
     ("segment", "enabled", "days", "whisper"),
     [
-        ("horizonSprint", True, 7.0, "Aggressive pruning: unreferenced strands fade after 7 days."),
-        ("horizonBalanced", True, 30.0, "Standard working memory: unreferenced strands fade over 30 days."),
-        ("horizonPermanent", False, None, "Time is frozen: all strands retain permanent baseline weight."),
+        ("horizonSprint", True, 7.0, "Fast-moving work: unreferenced strands drop from active recall after ~2–3 weeks."),
+        ("horizonBalanced", True, 30.0, "Standard working memory: unreferenced strands fade from active recall after ~2–3 months unless mentioned."),
+        ("horizonPermanent", False, None, "Static archive: time is paused and all strands keep their baseline weight indefinitely."),
     ],
 )
 def test_qml_decay_horizon_segments_persist(qapp, home, segment, enabled, days, whisper):
