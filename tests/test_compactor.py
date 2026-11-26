@@ -608,3 +608,14 @@ def test_build_app_lifespan_starts_and_stops_sweep(tmp_path, monkeypatch):
 
     run(scenario())
     assert seen == ["start", "stop"]
+
+
+def test_compaction_prompt_enforces_crisp_trait_names():
+    for token in ("2-4 word Title Case", "Direct Answers", "HOW the operator communicates", "entity_summaries"):
+        assert token in SYSTEM_PROMPT, token
+
+
+def test_extractor_prompt_requests_short_interaction_names():
+    from strand.prompts import EXTRACTOR_SYSTEM_PROMPT
+
+    assert EXTRACTOR_SYSTEM_PROMPT.count("2-4 word Title Case") >= 2

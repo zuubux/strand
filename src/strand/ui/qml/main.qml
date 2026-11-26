@@ -2196,47 +2196,47 @@ ApplicationWindow {
                                 font.family: Theme.uiFontFamily
                                 font.pixelSize: 11
                             }
-                            Column {
+                            Flow {
                                 id: stanceList
                                 objectName: "stanceList"
                                 Layout.fillWidth: true
                                 Layout.fillHeight: true
                                 Layout.topMargin: 6
                                 spacing: 6
+                                clip: true
                                 visible: (bridge ? bridge.activeStanceNodes : []).length > 0
                                 Repeater {
                                     model: (bridge ? bridge.activeStanceNodes : [])
-                                    delegate: RowLayout {
-                                        id: stanceRow
-                                        width: stanceList.width
-                                        spacing: 8
+                                    delegate: Rectangle {
+                                        id: stancePill
+                                        objectName: "stancePill"
                                         readonly property bool explicitKind: modelData.kind === "explicit"
-                                        Rectangle {
-                                            objectName: "stanceBadge"
-                                            Layout.alignment: Qt.AlignTop
-                                            implicitWidth: badgeLabel.implicitWidth + 12
-                                            implicitHeight: badgeLabel.implicitHeight + 4
-                                            radius: height / 2
-                                            color: stanceRow.explicitKind ? Qt.rgba(245 / 255, 158 / 255, 11 / 255, 0.14) : Qt.rgba(56 / 255, 189 / 255, 248 / 255, 0.14)
-                                            Label {
-                                                id: badgeLabel
-                                                objectName: "stanceBadgeLabel"
-                                                anchors.centerIn: parent
-                                                text: stanceRow.explicitKind ? "explicit" : "derived"
-                                                color: stanceRow.explicitKind ? "#f59e0b" : "#38bdf8"
-                                                font.family: Theme.uiFontFamily
-                                                font.pixelSize: 10
-                                            }
-                                        }
+                                        readonly property string fullSummary: modelData.summary
+                                        implicitWidth: Math.min(pillLabel.implicitWidth + 20, stanceList.width)
+                                        implicitHeight: pillLabel.implicitHeight + 8
+                                        radius: 11
+                                        color: explicitKind ? Qt.rgba(245 / 255, 158 / 255, 11 / 255, 0.14) : Qt.rgba(56 / 255, 189 / 255, 248 / 255, 0.14)
+                                        border.width: 1
+                                        border.color: explicitKind ? Qt.rgba(245 / 255, 158 / 255, 11 / 255, 0.28) : Qt.rgba(56 / 255, 189 / 255, 248 / 255, 0.28)
                                         Label {
-                                            Layout.fillWidth: true
-                                            text: modelData.text
-                                            wrapMode: Text.WordWrap
-                                            color: Theme.stanceText
-                                            lineHeight: 1.25
+                                            id: pillLabel
+                                            objectName: "stancePillLabel"
+                                            anchors.centerIn: parent
+                                            width: parent.width - 20
+                                            horizontalAlignment: Text.AlignHCenter
+                                            elide: Text.ElideRight
+                                            text: modelData.label
+                                            color: stancePill.explicitKind ? "#f59e0b" : "#38bdf8"
                                             font.family: Theme.uiFontFamily
-                                            font.pixelSize: 12
+                                            font.pixelSize: 11
+                                            font.weight: Font.Medium
                                         }
+                                        HoverHandler {
+                                            id: pillHover
+                                        }
+                                        ToolTip.visible: pillHover.hovered && modelData.summary !== modelData.label
+                                        ToolTip.delay: 300
+                                        ToolTip.text: modelData.summary
                                     }
                                 }
                             }

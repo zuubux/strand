@@ -1663,9 +1663,9 @@ def test_active_stance_reads_memory_and_settings_card_is_read_only(qapp, home):
     )
     QMetaObject.invokeMethod(win, "openSettings")
     assert b.activeStanceNodes == [
-        {"text": "Tabs", "kind": "explicit"},
-        {"text": "Dry wit", "kind": "explicit"},
-        {"text": "Concise diffs", "kind": "explicit"},
+        {"label": "Tabs", "summary": "Tabs", "kind": "explicit"},
+        {"label": "Dry wit", "summary": "Dry wit", "kind": "explicit"},
+        {"label": "Concise diffs", "summary": "Concise diffs", "kind": "explicit"},
     ]
     assert win.findChild(object, "stancePlaceholder").property("visible") is False
     assert win.findChild(object, "stanceFooter") is None
@@ -1676,16 +1676,16 @@ def test_active_stance_reads_memory_and_settings_card_is_read_only(qapp, home):
 def test_active_stance_recency_cap_and_provenance(qapp, home):
     db_file = home / "memory.db"
     b = make_bridge(lambda r: httpx.Response(200, json={}), config=Config(db_path=str(db_file), upstream_api_key="k"))
-    rows = [(f"Rule {i}", "directive", 1.0) for i in range(5)]
+    rows = [(f"Rule {i}", "directive", 1.0) for i in range(10)]
     rows.append(("Inferred", "trait", 0.7, "model_inferred", "Prefers terse answers"))
     rows.append(("Newest", "preference", 1.0, "user_explicit", "Use tabs"))
     _seed_stance(db_file, rows)
     b.refreshActiveStance()
     nodes = b.activeStanceNodes
-    assert len(nodes) == 5
-    assert nodes[0] == {"text": "Use tabs", "kind": "explicit"}
-    assert nodes[1] == {"text": "Prefers terse answers", "kind": "derived"}
-    assert [n["text"] for n in nodes[2:]] == ["Rule 4", "Rule 3", "Rule 2"]
+    assert len(nodes) == 10
+    assert nodes[0] == {"label": "Newest", "summary": "Use tabs", "kind": "explicit"}
+    assert nodes[1] == {"label": "Inferred", "summary": "Prefers terse answers", "kind": "derived"}
+    assert [n["label"] for n in nodes[2:]] == [f"Rule {i}" for i in range(9, 1, -1)]
 
 
 def test_tray_controller_toggle_menu_and_quit():
@@ -2504,15 +2504,14 @@ def _pump(seconds):
         time.sleep(0.01)
 
 
-def test_qml_active_stance_renders_provenance_badges_without_counter(qapp, home):
+def test_qml_active_stance_renders_wrapping_pill_cloud(qapp, home):
     from PySide6.QtCore import QMetaObject
 
     db_file = home / "memory.db"
     b = make_bridge(lambda r: httpx.Response(200, json={}), config=Config(db_path=str(db_file), upstream_api_key="k"))
-    _seed_stance(
-        db_file,
-        [("Old", "directive", 1.0, "user_explicit"), ("New", "trait", 1.0, "model_inferred")],
-    )
+    rows = [("Old Rule", "directive", 1.0, "user_explicit", "A long explanatory sentence.")]
+    rows += [(f"Trait {i}", "trait", 1.0, "model_inferred") for i in range(11)]
+    _seed_stance(db_file, rows)
     engine, win = _load_window(b)
     win.setWidth(900)
     win.setHeight(640)
@@ -2526,19 +2525,45 @@ def test_qml_active_stance_renders_provenance_badges_without_counter(qapp, home)
 
     def walk(item):
         for child in item.childItems():
-            if child.objectName() == "stanceBadgeLabel":
+            if child.objectName() == "stancePillLabel":
                 labels.append(child)
             walk(child)
 
-    walk(win.findChild(object, "stanceList"))
+    flow = win.findChild(object, "stanceList")
+    assert flow.property("clip") is True
+    walk(flow)
+    assert len(labels) == 10
     assert [(l.property("text"), l.property("color").name()) for l in labels] == [
-        ("derived", "#38bdf8"),
-        ("explicit", "#f59e0b"),
+        (f"Trait {i}", "#38bdf8") for i in range(10, 0, -1)
     ]
+    assert len({round(l.mapToItem(flow, 0, 0).y()) for l in labels}) >= 1
     win.hide()
     engine.deleteLater()
 
 
+def test_qml_active_stance_explicit_pill_is_amber(qapp, home):
+    from PySide6.QtCore import QMetaObject
+
+    db_file = home / "memory.db"
+    b = make_bridge(lambda r: httpx.Response(200, json={}), config=Config(db_path=str(db_file), upstream_api_key="k"))
+    _seed_stance(db_file, [("Tabs", "preference", 1.0, "user_explicit", "Always use tabs.")])
+    engine, win = _load_window(b)
+    win.show()
+    QMetaObject.invokeMethod(win, "openSettings")
+    _pump(0.2)
+    labels = []
+
+    def walk(item):
+        for child in item.childItems():
+            if child.objectName() == "stancePillLabel":
+                labels.append(child)
+            walk(child)
+
+    walk(win.findChild(object, "stanceList"))
+    (label,) = labels
+    assert (label.property("text"), label.property("color").name()) == ("Tabs", "#f59e0b")
+    win.hide()
+    engine.deleteLater()
 
 
 def _run_upstream_probe(handler, url, key="", config=None):

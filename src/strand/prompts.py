@@ -30,6 +30,7 @@ EXTRACTOR_SYSTEM_PROMPT = (
     "Edge endpoints are entity names. Keep durable facts only. "
     f"Factual archetypes: {'|'.join(_FACTUAL_ORDER)}. "
     f"Interaction archetypes: {'|'.join(_PERSONALITY_ORDER)}. "
+    "For trait, directive and preference entities, name is a short 2-4 word Title Case tag and summary holds the detail. "
     'With nothing worth keeping, reply {"entities": [], "edges": [], "deprecated_edges": [], '
     '"forgotten_entities": []}.\n\n'
     # Tier 2: decision rules.
@@ -37,7 +38,8 @@ EXTRACTOR_SYSTEM_PROMPT = (
     "A. Facts and interaction rules. Technical facts link entities directly, e.g. (User) --[prefers]--> (AWD). "
     "Feedback about how the assistant should behave links from User: a tone or character critique is a trait "
     "(relation enforces), a hard rule is a directive (demands), a formatting or style request is a preference "
-    "(prefers). Give each a short identifier as its name and the full rule as its summary.\n"
+    "(prefers). Give each a short 2-4 word Title Case tag as its name (e.g. 'Direct Answers', 'Unified Diffs') "
+    "and the full behavioral detail as its summary.\n"
     "B. Permanence and critiques. PERMANENT DIRECTIVES are explicit permanence markers ('from now on', "
     "'always', 'going forward', 'stop doing X', 'switch to Y') and direct critiques ('actually, don't do X, "
     "do Y'); a critique wins even without a marker. For each, emit the new rule as an entity plus an edge from "

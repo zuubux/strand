@@ -47,8 +47,11 @@ SYSTEM_PROMPT = (
     "discovered_aliases: recurring nicknames or conversational shorthand that refer to a known entity "
     '(e.g. "KK" for "Karen", "the box" for a host or server); canonical_name must be a provided entity. '
     "operator_profile.focus_summary: a concise one or two sentence rolling summary of the operator's "
-    "recent work and topics. operator_profile.inferred_traits: sustained interaction preferences "
-    "(e.g. terse diffs, specific test flags, a technical tone). Ignore one-off conversational steering "
+    "recent work and topics. operator_profile.inferred_traits: sustained interaction preferences that capture "
+    "HOW the operator communicates or works (communication style, preferred format, workflow habit), never "
+    "general topical interests, which belong in entity_summaries. Each inferred_traits name must be a concise "
+    '2-4 word Title Case tag (e.g. "Direct Answers", "Unified Diffs", "Technical Depth", "Dry Humor"); '
+    "put the detailed one-sentence explanation in summary. Ignore one-off conversational steering "
     "and transient requests; only emit a trait or preference that reflects a sustained pattern across "
     "the provided episodes. "
     'If nothing is worth keeping return {"entity_summaries": [], "session_summary": "", '

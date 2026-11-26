@@ -459,7 +459,7 @@ def parse_sse_line(line: str) -> tuple[str, str]:
     return "skip", ""
 
 
-STANCE_LIMIT = 5  # recent stance entries mirrored in the Settings modal
+STANCE_LIMIT = 10  # recent stance entries mirrored in the Settings modal
 
 
 class Bridge(QObject):
@@ -621,11 +621,17 @@ class Bridge(QObject):
         out: list[dict[str, str]] = []
         seen: set[int] = set()
         for tid, name, summary, origin in rows:
-            text = str(summary or "").strip() or str(name or "").strip()
-            if tid in seen or not text:
+            label = str(name or "").strip()
+            if tid in seen or not label:
                 continue
             seen.add(tid)
-            out.append({"text": text, "kind": "explicit" if origin == "user_explicit" else "derived"})
+            out.append(
+                {
+                    "label": label,
+                    "summary": str(summary or "").strip() or label,
+                    "kind": "explicit" if origin == "user_explicit" else "derived",
+                }
+            )
             if len(out) >= STANCE_LIMIT:
                 break
         return out

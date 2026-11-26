@@ -316,3 +316,8 @@ This document tracks real-world friction points, visual bugs, design observation
 ### `OBS-POL-014`: Recent-First `ACTIVE STANCE` Feed with Provenance Tags
 - **Component:** `src/strand/ui/bridge.py` (`_read_stance`), `src/strand/ui/qml/main.qml` (`stanceList`)
 - **Change:** the card lists the 5 most recent active stance entries (`e.updated_at DESC, t.id DESC`) as `{text, kind}`; `kind` is `explicit` (amber pill) for `user_explicit` edges and `derived` (cyan pill) otherwise, so operators can tell stated directives from learned drift. No DDL.
+
+### `OBS-POL-015`: Wrapping Provenance Pill Cloud & Crisp 2-4 Word Trait Names — **Resolved**
+- **Component:** `src/strand/ui/qml/main.qml` (`stanceList`), `src/strand/ui/bridge.py` (`_read_stance`, `STANCE_LIMIT`), `src/strand/compactor.py`, `src/strand/prompts.py`
+- **Symptom:** `ACTIVE STANCE` rendered each full `summary` sentence vertically; long compactor sentences wrapped and overflowed onto `FIBER RETENTION & BOUNDARIES`.
+- **Resolution:** dual layer. `entities.summary` stays rich (for `[Persona Stance]` injection and hover tooltips) while `entities.name` is a 2-4 word Title Case label shown in a clipped wrapping `Flow` of up to 10 pills (cyan `derived`, amber `explicit`), tooltip = full summary when different. `activeStanceNodes` now returns `{label, summary, kind}` (the old `text` key is removed; tests updated). Prompts instruct crisp names and that inferred traits describe how the operator communicates, not topics. Supersedes the row layout of `OBS-POL-014`. No DDL. 844 tests pass with `-W error`.
