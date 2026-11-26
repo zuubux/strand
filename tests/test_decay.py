@@ -361,3 +361,57 @@ def test_prune_decayed_edges_atomic_and_dry_run(tmp_path):
     assert real == (1, 1) and left == list(kept)
     assert names == ["Hub", "Warm", "Busy"]  # orphaned model_inferred entity swept, others kept
     assert again == (0, 0)
+
+
+# --- Permanent horizon: slow 90-day decay of model_inferred personality nodes ------------
+
+
+async def _seed_permanent(db):
+    ids = {}
+    for name, archetype, origin, conf in (
+        ("Old Inferred Fact", "concept", "model_inferred", 0.6),
+        ("Old Explicit Rule", "directive", "user_explicit", 1.0),
+        ("Stale Trait", "trait", "model_inferred", 0.6),
+        ("Stale Preference", "preference", "model_inferred", 0.6),
+        ("Recent Trait", "trait", "model_inferred", 0.6),
+    ):
+        ids[name] = await db.upsert_entity(name, archetype, f"{name} summary", origin=origin, confidence=conf)
+    for name, days in (("Old Inferred Fact", 400), ("Old Explicit Rule", 400), ("Stale Trait", 200),
+                       ("Stale Preference", 200), ("Recent Trait", 100)):
+        await _age(db, name, days)
+    return ids
+
+
+def test_permanent_inferred_personality_decays_but_facts_and_explicit_do_not(db_path):
+    async def scenario():
+        async with DatabaseManager(db_path) as db:
+            await _seed_permanent(db)
+            r = _resolver(db, decay_enabled=False)
+            return {e.name for e in await r.personality_entities()}
+
+    assert run(scenario()) == {"Old Explicit Rule", "Recent Trait"}
+
+
+def test_permanent_fact_and_explicit_keep_full_priority():
+    old = _ts(400)
+    for archetype, origin in (("concept", "model_inferred"), ("directive", "user_explicit")):
+        assert effective_priority(0.6, 1.0, 0, None, old, now=NOW) == pytest.approx(0.6), (archetype, origin)
+    derived = effective_priority(0.6, 1.0, 0, None, _ts(180), now=NOW, derived_permanent=True)
+    assert derived == pytest.approx(0.15)
+    assert effective_priority(0.6, 1.0, 0, None, _ts(200), now=NOW, derived_permanent=True) < 0.15
+
+
+def test_permanent_stale_inferred_trait_excluded_from_turn_one_and_touch_reinforces(db_path):
+    async def scenario():
+        async with DatabaseManager(db_path) as db:
+            ids = await _seed_permanent(db)
+            r = _resolver(db, decay_enabled=False)
+            before = await r.resolve("hello there", "s1")
+            await db.touch_access([ids["Stale Trait"]], [])
+            after = await _resolver(db, decay_enabled=False).resolve("hello there", "s2")
+            return before, after
+
+    before, after = run(scenario())
+    assert "Stale Trait summary" not in before and "Stale Preference summary" not in before
+    assert "Old Explicit Rule summary" in before and "Recent Trait summary" in before
+    assert "Stale Trait summary" in after and "Stale Preference summary" not in after

@@ -2654,3 +2654,30 @@ def test_qml_upstream_routing_order_and_model_dropdown(qapp, home):
     ys = [i.mapToItem(None, 0, 0).y() for i in (url, key, model, status)]
     assert ys[0] < ys[1] < ys[2] < ys[3]
     engine.deleteLater()
+
+
+def test_active_stance_hides_faded_inferred_nodes_under_permanent(qapp, home):
+    import sqlite3
+
+    db_file = home / "memory.db"
+    rows = [
+        ("Stale Trait", "trait", 1.0, "model_inferred", "stale"),
+        ("Stale Pref", "preference", 1.0, "model_inferred", "stale"),
+        ("Fresh Trait", "trait", 1.0, "model_inferred", "fresh"),
+        ("Old Rule", "directive", 1.0, "user_explicit", "old"),
+        ("Touched Trait", "trait", 1.0, "model_inferred", "touched"),
+    ]
+    _seed_stance(db_file, rows)
+    conn = sqlite3.connect(db_file)
+    conn.execute("UPDATE entities SET origin = 'model_inferred', confidence = 0.6 WHERE name LIKE '%Trait' OR name = 'Stale Pref'")
+    conn.execute("UPDATE entities SET created_at = datetime('now', '-200 days') WHERE name IN ('Stale Trait', 'Stale Pref', 'Old Rule', 'Touched Trait')")
+    conn.execute("UPDATE entities SET last_accessed_at = datetime('now', '-1 days') WHERE name = 'Touched Trait'")
+    conn.commit()
+    conn.close()
+    b = make_bridge(
+        lambda r: httpx.Response(200, json={}),
+        config=Config(db_path=str(db_file), upstream_api_key="k", decay_enabled=False),
+    )
+    b.refreshActiveStance()
+    labels = {n["label"] for n in b.activeStanceNodes}
+    assert labels == {"Fresh Trait", "Old Rule", "Touched Trait"}

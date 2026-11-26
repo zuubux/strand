@@ -57,7 +57,14 @@ def safe_exc(exc: BaseException) -> str:
 VALID_ARCHETYPES = FACTUAL_ARCHETYPES | PERSONALITY_ARCHETYPES
 MIN_EDGE_CONFIDENCE = 0.2  # edges below this are treated as deprecated and never recalled
 MODEL_CONFIDENCE = 0.6  # default confidence for facts the assistant (not the user) asserted
+DECAY_PRIORITY_FLOOR = 0.15  # candidates whose effective priority falls below this are pruned from recall
+DERIVED_PERMANENT_HALF_LIFE_DAYS = 90.0  # slow decay of model_inferred personality nodes under Permanent
 MAX_SUMMARY_LEN = 300
+
+
+def is_derived_personality(archetype: str, origin: str) -> bool:
+    """True for a `model_inferred` trait/directive/preference (a behavioral hypothesis, not a fact)."""
+    return archetype in PERSONALITY_ARCHETYPES and origin == "model_inferred"
 MAX_NARRATIVE_LEN = 600  # hard ceiling for episodes.narrative (SEC-MEM-008)
 # Tight L2 cutoff (~cosine similarity 0.90) for merging near-duplicate entities on ingestion.
 DEFAULT_DEDUP_DISTANCE_THRESHOLD = 0.45

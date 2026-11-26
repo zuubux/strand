@@ -13,10 +13,13 @@ from strand.common import (
     BEDROCK_INVARIANT,
     DEFAULT_CONTINUITY_HORIZON_DAYS,
     DEFAULT_CONTINUITY_MAX_EPISODES,
+    DECAY_PRIORITY_FLOOR,
+    DERIVED_PERMANENT_HALF_LIFE_DAYS,
     MIN_EDGE_CONFIDENCE,
     PERSONALITY_ARCHETYPES,
     aliases_of,
     clean_text,
+    is_derived_personality,
     is_private,
     load_metadata,
 )
@@ -30,7 +33,7 @@ MAX_HOPS_LIMIT = 2
 MIN_TOKEN_LENGTH = 3  # shortest whole-word token allowed in the token-overlap fallback
 _HEADER = "## Strand Memory"
 ESTABLISHED_CONFIDENCE = 0.8  # facts at or above this are presented as established
-MIN_EFFECTIVE_PRIORITY = 0.15  # with decay enabled, candidates below this are pruned
+MIN_EFFECTIVE_PRIORITY = DECAY_PRIORITY_FLOOR  # with decay enabled, candidates below this are pruned
 MAX_FREQUENCY_FACTOR = 1.5  # cap on the access-frequency boost
 FREQUENCY_STEP = 0.05  # boost per recorded access
 MAX_PERSONALITY_ENTITIES = 20  # cap on always-on personality nodes recalled per turn
@@ -120,15 +123,19 @@ def effective_priority(
     now: datetime,
     decay_enabled: bool = False,
     half_life_days: float = 30.0,
+    derived_permanent: bool = False,
 ) -> float:
     """Retrieval priority of a fact.
 
     Without decay: `confidence * weight`. With decay, additionally multiplied by
     `2 ** (-max(0, days_since_reference) / half_life_days)` (reference = last access, else
     creation) and `min(1.5, 1 + 0.05 * access_count)`. A fact with no usable timestamp is
-    treated as fresh.
+    treated as fresh. `derived_permanent` (a `model_inferred` personality node) keeps decaying
+    under Permanent (`decay_enabled=False`) on the `DERIVED_PERMANENT_HALF_LIFE_DAYS` half-life.
     """
     base = confidence * weight
+    if derived_permanent and not decay_enabled:
+        decay_enabled, half_life_days = True, DERIVED_PERMANENT_HALF_LIFE_DAYS
     try:
         half_life_ok = math.isfinite(half_life_days) and half_life_days > 0
     except TypeError:
@@ -519,6 +526,7 @@ class ContextResolver:
             now=now,
             decay_enabled=self.decay_enabled,
             half_life_days=self.decay_half_life_days,
+            derived_permanent=isinstance(item, Entity) and is_derived_personality(item.archetype, item.origin),
         )
 
     async def match_entities(self, query: str, allow_private: bool = False) -> list[Entity]:
@@ -734,7 +742,16 @@ class ContextResolver:
                 if active:
                     live.add(end)
         keep = [r for r in rows if r["id"] not in has_edge or r["id"] in live]
-        return [_entity_from_row(r) for r in keep[:MAX_PERSONALITY_ENTITIES]]
+        entities = [_entity_from_row(r) for r in keep]
+        # Unreinforced model_inferred traits fade (90-day half-life under Permanent); user_explicit stays.
+        now = self._clock()
+        entities = [
+            e
+            for e in entities
+            if not is_derived_personality(e.archetype, e.origin)
+            or self._priority(e, now) >= MIN_EFFECTIVE_PRIORITY
+        ]
+        return entities[:MAX_PERSONALITY_ENTITIES]
 
     async def resolve(
         self,

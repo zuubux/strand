@@ -23,6 +23,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -44,7 +45,9 @@ from strand.config import (
     load_config,
     save_config,
 )
+from strand.common import DECAY_PRIORITY_FLOOR, is_derived_personality
 from strand.db import _ACTIVE, PRIVATE_ENTITY_SQL, DatabaseManager
+from strand.resolver import effective_priority
 from strand.host import get_host_context
 from strand.perms import secure_parent_dir
 from strand.tools.workspace import (
@@ -604,7 +607,8 @@ class Bridge(QObject):
         if not path.is_file():
             return []
         sql = (
-            "SELECT t.id, t.name, t.summary, e.origin FROM edges e "
+            "SELECT t.id, t.name, t.summary, e.origin, t.archetype, t.origin, t.confidence, "
+            "t.access_count, t.last_accessed_at, t.created_at FROM edges e "
             "JOIN entities t ON t.id = e.target_id "
             "WHERE t.archetype IN ('directive', 'preference', 'trait') "
             "AND " + _ACTIVE.format(t="e") + " AND NOT " + PRIVATE_ENTITY_SQL.format(t="t") + " "
@@ -620,9 +624,24 @@ class Bridge(QObject):
             return []
         out: list[dict[str, str]] = []
         seen: set[int] = set()
-        for tid, name, summary, origin in rows:
+        now = datetime.now(UTC)
+        for tid, name, summary, origin, archetype, t_origin, conf, accesses, accessed, created in rows:
             label = str(name or "").strip()
             if tid in seen or not label:
+                continue
+            # Pills age off with Turn 1 recall: a faded model_inferred node (90-day half-life under
+            # Permanent, the configured one with decay on) is hidden; user_explicit is exempt.
+            if is_derived_personality(archetype, t_origin) and effective_priority(
+                conf,
+                1.0,
+                accesses,
+                accessed,
+                created,
+                now=now,
+                decay_enabled=bool(self._config.decay_enabled),
+                half_life_days=self._config.decay_half_life_days,
+                derived_permanent=True,
+            ) < DECAY_PRIORITY_FLOOR:
                 continue
             seen.add(tid)
             out.append(
